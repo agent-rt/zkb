@@ -204,6 +204,31 @@ pub const Stmt = struct {
         if (c.sqlite3_bind_null(self.stmt, idx) != c.SQLITE_OK) return error.SqliteBind;
     }
 
+    /// 1-based index of a named parameter (`:days`), or null if the statement
+    /// has no such parameter. Needed to bind by name rather than by position:
+    /// a saved query's parameters are written by a human in whatever order,
+    /// and matching them positionally would silently pair the wrong values.
+    pub fn parameterIndex(self: *Stmt, name: []const u8) ?c_int {
+        var buf: [128]u8 = undefined;
+        if (name.len + 2 > buf.len) return null;
+        buf[0] = ':';
+        @memcpy(buf[1 .. name.len + 1], name);
+        buf[name.len + 1] = 0;
+        const idx = c.sqlite3_bind_parameter_index(self.stmt, &buf);
+        return if (idx == 0) null else idx;
+    }
+
+    /// Number of parameters the statement declares.
+    pub fn parameterCount(self: *Stmt) c_int {
+        return c.sqlite3_bind_parameter_count(self.stmt);
+    }
+
+    /// Name of the i-th parameter (1-based), including its `:` prefix.
+    pub fn parameterName(self: *Stmt, i: c_int) ?[]const u8 {
+        const p = c.sqlite3_bind_parameter_name(self.stmt, i) orelse return null;
+        return std.mem.span(p);
+    }
+
     /// True = a row is available, false = done.
     pub fn step(self: *Stmt) Error!bool {
         return switch (c.sqlite3_step(self.stmt)) {

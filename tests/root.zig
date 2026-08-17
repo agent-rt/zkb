@@ -20,6 +20,7 @@ test {
     _ = @import("records_test.zig");
     _ = @import("paths_test.zig");
     _ = @import("utf8_test.zig");
+    _ = @import("saved_sql_test.zig");
 }
 
 // ---------------------------------------------------------------------------

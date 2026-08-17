@@ -23,6 +23,7 @@ pub const memory = @import("memory.zig");
 pub const recall = @import("recall.zig");
 pub const records = @import("records.zig");
 pub const expr = @import("query/expr.zig");
+pub const saved_sql = @import("query/saved.zig");
 pub const embed_queue = @import("embed/queue.zig");
 pub const proto = @import("ipc/proto.zig");
 pub const ipc_client = @import("ipc/client.zig");
@@ -37,7 +38,7 @@ pub const build_options = @import("build_options");
 pub const model_registry = @import("embed/registry.zig");
 pub const embed = if (build_options.llama) @import("embed/llama.zig") else struct {};
 
-pub const version = "0.0.5";
+pub const version = "0.0.6";
 
 test {
     @import("std").testing.refAllDecls(@This());

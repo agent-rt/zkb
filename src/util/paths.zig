@@ -33,6 +33,9 @@ pub const Layout = struct {
     data: []const u8,
     memory: []const u8,
     facts: []const u8,
+    /// Named SQL queries. In data/ on purpose: they are written by hand and
+    /// `zkb index` must not be able to delete them.
+    queries: []const u8,
 
     // ---- everything below is derived and disposable
     index_dir: []const u8,
@@ -44,12 +47,16 @@ pub const Layout = struct {
     log: []const u8,
     /// Retrieval trace, written only when $ZKB_TRACE=1.
     trace: []const u8,
+    /// Ad-hoc `zkb sql` statements, newest last. Disposable: it exists so a
+    /// query worth keeping can be found again and promoted into queries/.
+    sql_history: []const u8,
 
     pub fn deinit(self: *Layout, gpa: std.mem.Allocator) void {
         gpa.free(self.root);
         gpa.free(self.data);
         gpa.free(self.memory);
         gpa.free(self.facts);
+        gpa.free(self.queries);
         gpa.free(self.index_dir);
         gpa.free(self.db);
         gpa.free(self.models);
@@ -58,6 +65,7 @@ pub const Layout = struct {
         gpa.free(self.pid);
         gpa.free(self.log);
         gpa.free(self.trace);
+        gpa.free(self.sql_history);
         self.* = undefined;
     }
 
@@ -65,7 +73,7 @@ pub const Layout = struct {
     /// writes, because a missing directory is not an error worth surfacing to
     /// someone who just ran `zkb remember`.
     pub fn ensureDirs(self: *const Layout, io: std.Io) !void {
-        for ([_][]const u8{ self.root, self.data, self.index_dir, self.models, self.run_dir }) |d| {
+        for ([_][]const u8{ self.root, self.data, self.queries, self.index_dir, self.models, self.run_dir }) |d| {
             std.Io.Dir.createDirPath(.cwd(), io, d) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -109,6 +117,7 @@ pub fn resolve(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Erro
         .data = data,
         .memory = try std.fmt.allocPrint(gpa, "{s}/memory", .{data}),
         .facts = try std.fmt.allocPrint(gpa, "{s}/facts.csv", .{data}),
+        .queries = try std.fmt.allocPrint(gpa, "{s}/queries", .{data}),
         .index_dir = index_dir,
         .db = try std.fmt.allocPrint(gpa, "{s}/zkb.db", .{index_dir}),
         .models = try std.fmt.allocPrint(gpa, "{s}/models", .{root}),
@@ -117,6 +126,7 @@ pub fn resolve(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Erro
         .pid = try std.fmt.allocPrint(gpa, "{s}/zkb.pid", .{run_dir}),
         .log = try std.fmt.allocPrint(gpa, "{s}/zkb.log", .{run_dir}),
         .trace = try std.fmt.allocPrint(gpa, "{s}/trace.jsonl", .{run_dir}),
+        .sql_history = try std.fmt.allocPrint(gpa, "{s}/sql-history.jsonl", .{run_dir}),
     };
 }
 

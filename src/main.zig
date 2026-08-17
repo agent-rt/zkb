@@ -353,10 +353,30 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, cmd, "sql")) {
         var query: ?[]const u8 = null;
-        var json = false;
+        var opts: records_cmd.SqlOptions = .{};
+        var want_list = false;
+        var want_history = false;
+        var limit: usize = 20;
+        // `k=v` pairs for a saved query. Collected rather than substituted: they
+        // are bound through sqlite, so a value containing a quote is a value,
+        // not a second statement.
+        var kvs: std.ArrayList([2][]const u8) = .empty;
+        defer kvs.deinit(gpa);
+
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--json")) {
-                json = true;
+                opts.json = true;
+            } else if (std.mem.eql(u8, a, "--list")) {
+                want_list = true;
+            } else if (std.mem.eql(u8, a, "--history")) {
+                want_history = true;
+            } else if (std.mem.eql(u8, a, "-n")) {
+                limit = std.fmt.parseInt(usize, args.next() orelse "20", 10) catch 20;
+            } else if (query != null and std.mem.indexOfScalar(u8, a, '=') != null and
+                !std.mem.startsWith(u8, a, "-"))
+            {
+                const eq = std.mem.indexOfScalar(u8, a, '=').?;
+                try kvs.append(gpa, .{ a[0..eq], a[eq + 1 ..] });
             } else if (query == null) {
                 query = a;
             } else {
@@ -364,11 +384,22 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
         }
+
+        if (want_list) return records_cmd.sqlList(gpa, init.io, init.environ_map, w);
+        if (want_history) return records_cmd.sqlHistory(gpa, init.io, init.environ_map, w, limit);
+
         const q = query orelse {
-            try w.writeAll("usage: zkb sql \"select ...\" [--json]\n");
+            try w.writeAll(
+                \\usage: zkb sql "select ..." [--json]
+                \\       zkb sql @<name> [key=value ...] [--json]   run a saved query
+                \\       zkb sql --list                             saved queries
+                \\       zkb sql --history [-n N]                   statements typed before
+                \\
+            );
             return 2;
         };
-        return records_cmd.sqlCmd(gpa, init.environ_map, w, q, json);
+        opts.args = kvs.items;
+        return records_cmd.sqlCmd(gpa, init.io, init.environ_map, w, q, opts);
     }
 
     if (std.mem.eql(u8, cmd, "skill")) {

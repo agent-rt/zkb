@@ -261,5 +261,13 @@ fn writeMcp(w: *Writer) !void {
         \\joins across record types, window functions. See `docs/recipes.md` in the
         \\zkb repository for worked examples.
         \\
+        \\**Check `zkb sql --list` before writing one.** A query worth keeping is a
+        \\`.sql` file under `data/queries/`, run as `zkb sql @<name> [key=value ...]`.
+        \\Its parameters are bound by sqlite, so prefer a saved query over building
+        \\a statement out of user input — and never paste a value into sql text.
+        \\
+        \\`zkb sql --history` lists statements typed before this one. If you find
+        \\yourself writing the same thing twice, save it as a file instead.
+        \\
     );
 }

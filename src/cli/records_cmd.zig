@@ -473,14 +473,48 @@ fn tableIdent(gpa: std.mem.Allocator, schema: *const zkb.records.Schema) ![]u8 {
 /// statement must read like a query, and SQLite itself must agree it writes
 /// nothing. The residual risk is an agent misreading its own results, which is
 /// not a risk this program can do anything about (SPEC §16.6).
+pub const SqlOptions = struct {
+    json: bool = false,
+    /// `k=v` pairs for a saved query's parameters.
+    args: []const [2][]const u8 = &.{},
+};
+
 pub fn sqlCmd(
     gpa: std.mem.Allocator,
+    io: std.Io,
     env: *const std.process.Environ.Map,
     w: *Writer,
     query: []const u8,
-    json: bool,
+    opts: SqlOptions,
 ) !u8 {
-    const trimmed = std.mem.trim(u8, query, " \t\r\n;");
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    // `@name` runs a saved query. Everything else is a statement typed on the
+    // spot, which is what gets appended to the history.
+    var loaded: ?zkb.saved_sql.Query = null;
+    defer if (loaded) |*q| q.deinit(gpa);
+    var statement = query;
+    if (std.mem.startsWith(u8, query, "@")) {
+        const name = query[1..];
+        loaded = zkb.saved_sql.load(gpa, io, layout.queries, name) catch |err| {
+            switch (err) {
+                error.NotFound => {
+                    try w.print("no saved query named {s}\n", .{name});
+                    try w.print("looked in: {s}\n", .{layout.queries});
+                    try w.writeAll("list them: zkb sql --list\n");
+                },
+                error.Empty => try w.print("{s}.sql has no statement\n", .{name}),
+                error.NotSelect => try w.print("{s}.sql is not a SELECT / WITH / EXPLAIN\n", .{name}),
+                error.MultipleStatements => try w.print("{s}.sql has more than one statement\n", .{name}),
+                else => return err,
+            }
+            return 2;
+        };
+        statement = loaded.?.sql;
+    }
+
+    const trimmed = std.mem.trim(u8, statement, " \t\r\n;");
     if (!std.ascii.startsWithIgnoreCase(trimmed, "select") and
         !std.ascii.startsWithIgnoreCase(trimmed, "with") and
         !std.ascii.startsWithIgnoreCase(trimmed, "explain"))
@@ -495,8 +529,6 @@ pub fn sqlCmd(
         return 2;
     }
 
-    var layout = try zkb.paths.resolve(gpa, env);
-    defer layout.deinit(gpa);
     const db_path = try gpa.dupeZ(u8, layout.db);
     defer gpa.free(db_path);
 
@@ -522,11 +554,32 @@ pub fn sqlCmd(
         return 2;
     }
 
+    if (loaded) |*q| {
+        var missing: ?[]const u8 = null;
+        zkb.saved_sql.bindArgs(&st, q, opts.args, &missing) catch |err| switch (err) {
+            error.MissingParameter => {
+                try w.print("{s} needs a value for {s}\n", .{ q.name, missing.? });
+                try w.print("run: zkb sql @{s} {s}=<value>\n", .{ q.name, missing.? });
+                return 2;
+            },
+            error.UndeclaredParameter => {
+                // Binding nothing would leave it null and return no rows, which
+                // reads as "no results" rather than as a mistake in the file.
+                try w.print("{s}.sql uses :{s} but never declares it\n", .{ q.name, missing.? });
+                try w.print("add to the file: -- param: {s} = <default>\n", .{missing.?});
+                return 2;
+            },
+            else => return err,
+        };
+    } else {
+        appendHistory(gpa, io, layout.sql_history, trimmed);
+    }
+
     const n_cols = st.columnCount();
-    if (json) try w.writeAll("[");
+    if (opts.json) try w.writeAll("[");
     var rows: usize = 0;
     while (try st.step()) {
-        if (json) {
+        if (opts.json) {
             if (rows != 0) try w.writeAll(",");
             try w.writeAll("{");
             var i: i32 = 0;
@@ -555,6 +608,161 @@ pub fn sqlCmd(
         }
         rows += 1;
     }
-    if (json) try w.writeAll("]\n") else if (rows == 0) try w.writeAll("(no rows)\n");
+    if (opts.json) try w.writeAll("]\n") else if (rows == 0) try w.writeAll("(no rows)\n");
     return 0;
+}
+
+/// Cap on the history file. It is disposable, but a file that grows without
+/// bound is still a file someone has to notice.
+const history_max_bytes: u64 = 4 * 1024 * 1024;
+
+/// Append one ad-hoc statement. Never fails the query it is recording: a
+/// history that can break `zkb sql` is worse than no history.
+fn appendHistory(gpa: std.mem.Allocator, io: std.Io, path: []const u8, sql: []const u8) void {
+    tryAppendHistory(gpa, io, path, sql) catch {};
+}
+
+fn tryAppendHistory(gpa: std.mem.Allocator, io: std.Io, path: []const u8, sql: []const u8) !void {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    var ts_buf: [32]u8 = undefined;
+    try line.appendSlice(gpa, "{\"at\":");
+    try appendJsonString(gpa, &line, try isoStamp(&ts_buf, io));
+    try line.appendSlice(gpa, ",\"sql\":");
+    try appendJsonString(gpa, &line, sql);
+    try line.appendSlice(gpa, "}\n");
+
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false });
+    defer file.close(io);
+    const end = (try file.stat(io)).size;
+    if (end >= history_max_bytes) return;
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    fw.pos = end;
+    try fw.interface.writeAll(line.items);
+    try fw.interface.flush();
+}
+
+/// Same shape as the trace writer: a fixed buffer so a long statement cannot
+/// allocate unboundedly, and a marker instead of dropping the line.
+fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: []const u8) !void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    std.json.Stringify.value(v, .{}, &w) catch {
+        try out.appendSlice(gpa, "\"(too long)\"");
+        return;
+    };
+    try out.appendSlice(gpa, w.buffered());
+}
+
+fn isoStamp(buf: []u8, io: std.Io) ![]const u8 {
+    const secs: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(secs) };
+    const yd = epoch.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year,               md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(),  ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    });
+}
+
+/// `zkb sql --list`
+pub fn sqlList(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, w: *Writer) !u8 {
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    const names = try zkb.saved_sql.list(gpa, io, layout.queries);
+    defer {
+        for (names) |n| gpa.free(n);
+        gpa.free(names);
+    }
+
+    if (names.len == 0) {
+        try w.print("no saved queries in {s}\n", .{layout.queries});
+        try w.writeAll(
+            \\
+            \\a saved query is a .sql file there:
+            \\
+            \\  -- what it answers
+            \\  -- param: days = 7
+            \\  SELECT ... WHERE ... :days ...
+            \\
+            \\then: zkb sql @<name> [key=value ...]
+            \\
+        );
+        return 0;
+    }
+
+    for (names) |n| {
+        var q = zkb.saved_sql.load(gpa, io, layout.queries, n) catch {
+            try w.print("{s}\t(unreadable)\n", .{n});
+            continue;
+        };
+        defer q.deinit(gpa);
+        try w.print("{s}\t{s}", .{ q.name, q.description });
+        if (q.params.len != 0) {
+            try w.writeAll("\t[");
+            for (q.params, 0..) |p, i| {
+                if (i != 0) try w.writeAll(" ");
+                if (p.default) |d| try w.print("{s}={s}", .{ p.name, d }) else try w.print("{s}!", .{p.name});
+            }
+            try w.writeAll("]");
+        }
+        try w.writeAll("\n");
+    }
+    return 0;
+}
+
+/// `zkb sql --history [-n N]`
+pub fn sqlHistory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *Writer,
+    limit: usize,
+) !u8 {
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    const file = std.Io.Dir.openFileAbsolute(io, layout.sql_history, .{}) catch {
+        try w.writeAll("no history yet\n");
+        return 0;
+    };
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    const body = try gpa.alloc(u8, @intCast(size));
+    defer gpa.free(body);
+    var rbuf: [8192]u8 = undefined;
+    var r = file.readerStreaming(io, &rbuf);
+    try r.interface.readSliceAll(body);
+
+    // Newest last in the file, so collect the tail and print it oldest-first —
+    // the useful order for spotting a statement you have now typed three times.
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |l| if (std.mem.trim(u8, l, " \t\r").len != 0) try lines.append(gpa, l);
+
+    const start = if (lines.items.len > limit) lines.items.len - limit else 0;
+    for (lines.items[start..]) |l| {
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, l, .{}) catch continue;
+        defer parsed.deinit();
+        const at = jsonStr(parsed.value, "at");
+        const sql = jsonStr(parsed.value, "sql");
+        try w.print("{s}\t{s}\n", .{ at, sql });
+    }
+    if (lines.items.len == 0) try w.writeAll("no history yet\n");
+    return 0;
+}
+
+fn jsonStr(v: std.json.Value, key: []const u8) []const u8 {
+    const o = switch (v) {
+        .object => |o| o,
+        else => return "",
+    };
+    return switch (o.get(key) orelse return "") {
+        .string => |s| s,
+        else => "",
+    };
 }
