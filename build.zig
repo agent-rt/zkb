@@ -36,6 +36,9 @@ pub fn build(b: *std.Build) void {
         "-DSQLITE_ENABLE_MATH_FUNCTIONS",
         "-DSQLITE_MAX_EXPR_DEPTH=0",
         "-Wno-everything",
+        // See the note on sqlite-vec.c below: this applies to sqlite3.c for
+        // the same reason, and for many more call sites.
+        "-fno-sanitize=function",
     };
 
     const sqlite_lib = b.addLibrary(.{
@@ -53,9 +56,29 @@ pub fn build(b: *std.Build) void {
     });
     // SQLITE_CORE makes sqlite-vec link against sqlite3 directly instead of
     // going through the loadable-extension api routines.
+    //
+    // `-fno-sanitize=function` is load-bearing in ReleaseSafe. Zig turns on the
+    // C undefined-behaviour sanitizer in trap mode there, and its `function`
+    // check requires a call through a function pointer to match the callee's
+    // prototype exactly. C libraries do not work that way: sqlite-vec stores
+    // `fvec_cleanup_noop`, a `void(f32*)`, in a `void(void*)` slot and calls it
+    // through the latter. That is ABI-identical on every target zkb builds for,
+    // but it is a prototype mismatch, so the check fires — silently, as `brk`,
+    // with no panic message.
+    //
+    // It is not one site. A ReleaseSafe build carries 412 of these traps, all
+    // in vendored C, any of which could fire at runtime. Disabling one check on
+    // code we do not own is the honest scope; every other UB check stays on
+    // here, and our own C below keeps the full set.
     sqlite_lib.root_module.addCSourceFile(.{
         .file = b.path("third_party/sqlite-vec/sqlite-vec.c"),
-        .flags = &.{ "-std=c11", "-DSQLITE_CORE=1", "-DSQLITE_VEC_STATIC=1", "-Wno-everything" },
+        .flags = &.{
+            "-std=c11",
+            "-DSQLITE_CORE=1",
+            "-DSQLITE_VEC_STATIC=1",
+            "-Wno-everything",
+            "-fno-sanitize=function",
+        },
     });
     sqlite_lib.root_module.addCSourceFile(.{
         .file = b.path("src/db/sqlite_helpers.c"),
