@@ -18,6 +18,8 @@ const embed = @import("../embed/llama.zig");
 const maintain = @import("../maintain.zig");
 const memory = @import("../memory.zig");
 const factsmod = @import("../facts.zig");
+const recordsmod = @import("../records.zig");
+const csvmod = @import("csv.zig");
 
 pub const Stats = struct {
     docs_indexed: usize = 0,
@@ -154,7 +156,7 @@ fn indexOne(
     // A .csv in any collection is facts/records, not prose: one row per chunk so
     // structured filtering has something to join against.
     if (std.mem.endsWith(u8, doc.rel_path, ".csv")) {
-        return indexCsv(gpa, s, backend, dim, collection_id, doc, source, now_ms, stats);
+        return indexCsv(gpa, io, s, backend, dim, collection_id, root, doc, source, now_ms, stats);
     }
 
     var parsed = try markdown.scan(gpa, source);
@@ -221,23 +223,28 @@ fn indexOne(
 /// space adds noise without adding an answer (SPEC §16.4).
 fn indexCsv(
     gpa: std.mem.Allocator,
+    io: std.Io,
     s: *store.Store,
     backend: Backend,
     dim: usize,
     collection_id: i64,
+    root: []const u8,
     doc: store.Store.PendingDoc,
     source: []const u8,
     now_ms: i64,
     stats: *Stats,
 ) !void {
-    const is_facts = std.mem.endsWith(u8, doc.rel_path, "facts.csv");
-    if (!is_facts) {
-        // records/*.csv materialization is M5; index nothing rather than index
-        // it wrongly as prose.
+    if (recordsmod.typeOf(doc.rel_path)) |type_name| {
+        return indexRecords(gpa, io, s, backend, dim, collection_id, root, type_name, doc, source, now_ms, stats);
+    }
+    if (!std.mem.endsWith(u8, doc.rel_path, "facts.csv")) {
+        // A csv that is neither facts nor under records/ has no declared shape.
+        // Recorded as an error rather than indexed as prose: guessing would put
+        // rows in the semantic space that nothing can ever usefully retrieve.
         try s.begin();
         errdefer s.rollback();
         try s.deleteChunks(doc.id);
-        try s.markIndexed(doc.id, 0, now_ms);
+        try s.markFailed(doc.id, "csv outside records/ and not facts.csv");
         try s.commit();
         return;
     }
@@ -293,6 +300,152 @@ fn indexCsv(
     stats.chunks_written += parsed.facts.len;
 }
 
+/// A `records/` csv: infer the schema, rebuild the materialized table if the
+/// header changed, then write one chunk plus one materialized row per csv row.
+///
+/// The schema is inferred per *file* but stored per *type*. Two files of one
+/// type that disagree on their header is a real error worth reporting — the
+/// alternative is one of them silently determining the table shape and the other
+/// losing columns, which nothing downstream could detect.
+fn indexRecords(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    s: *store.Store,
+    backend: Backend,
+    dim: usize,
+    collection_id: i64,
+    root: []const u8,
+    type_name: []const u8,
+    doc: store.Store.PendingDoc,
+    source: []const u8,
+    now_ms: i64,
+    stats: *Stats,
+) !void {
+    var table = try csvmod.parse(gpa, source);
+    defer table.deinit(gpa);
+
+    if (table.header.len == 0) {
+        try s.begin();
+        errdefer s.rollback();
+        try s.deleteChunks(doc.id);
+        try s.markFailed(doc.id, "no header row");
+        try s.commit();
+        return;
+    }
+
+    // Inference reads every file of the type, not just this one: the schema is a
+    // property of the type, and making it depend on which file was indexed last
+    // would make the result depend on scan order.
+    var sample = try recordsmod.collectSample(gpa, io, root, type_name);
+    defer sample.deinit(gpa);
+
+    if (sample.mismatch) |other| {
+        try s.begin();
+        errdefer s.rollback();
+        try s.deleteChunks(doc.id);
+        var buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(
+            &buf,
+            "header differs from other files of type '{s}' (e.g. {s})",
+            .{ type_name, other },
+        );
+        try s.markFailed(doc.id, msg);
+        try s.commit();
+        return;
+    }
+
+    var rec_schema = try recordsmod.infer(gpa, type_name, &sample.table);
+    defer rec_schema.deinit(gpa);
+
+    // `_schema.json` sits beside the data, so it travels with the files it
+    // describes and is versioned with them.
+    if (try readSchemaOverride(gpa, io, root, type_name)) |override| {
+        defer gpa.free(override);
+        try recordsmod.applyOverrides(gpa, &rec_schema, override);
+    }
+
+    const vectors = try gpa.alloc(f32, table.rows.len * dim);
+    defer gpa.free(vectors);
+    var texts: std.ArrayList([]u8) = .empty;
+    defer {
+        for (texts.items) |t| gpa.free(t);
+        texts.deinit(gpa);
+    }
+    var labels: std.ArrayList([]u8) = .empty;
+    defer {
+        for (labels.items) |t| gpa.free(t);
+        labels.deinit(gpa);
+    }
+
+    // Rows whose rendered text is unchanged keep the vector already on disk.
+    // Appending one row to a csv would otherwise re-embed every row in it.
+    var cache = recordsmod.loadVectors(gpa, s.db, doc.id, dim) catch recordsmod.VectorCache{};
+    defer cache.deinit(gpa);
+
+    for (table.rows, 0..) |row, i| {
+        const text = try recordsmod.renderForEmbedding(gpa, &rec_schema, row);
+        try texts.append(gpa, text);
+        try labels.append(gpa, try recordsmod.rowLabel(gpa, &rec_schema, row));
+
+        const slot = vectors[i * dim ..][0..dim];
+        if (cache.get(text)) |cached| {
+            @memcpy(slot, cached);
+            continue;
+        }
+        const t0 = nowNs(io);
+        try backend.embedDoc("", text, slot);
+        stats.embed_ns += @intCast(nowNs(io) - t0);
+        stats.embed_calls += 1;
+    }
+
+    try s.begin();
+    errdefer s.rollback();
+
+    try recordsmod.ensureTable(gpa, s.db, &rec_schema);
+    try s.deleteChunks(doc.id);
+
+    var chunk_ids: std.ArrayList(i64) = .empty;
+    defer chunk_ids.deinit(gpa);
+    for (table.rows, 0..) |_, i| {
+        const id = try s.insertChunk(collection_id, doc.id, .{
+            .idx = @intCast(i),
+            .heading_path = labels.items[i],
+            .byte_start = @intCast(i),
+            .byte_end = @intCast(i + 1),
+            .n_tokens = 24,
+            .text = texts.items[i],
+        }, vectors[i * dim ..][0..dim]);
+        try chunk_ids.append(gpa, id);
+    }
+    try recordsmod.replaceFor(gpa, s.db, &rec_schema, doc.id, chunk_ids.items, &table);
+
+    if (table.bad_rows.len != 0) {
+        var buf: [128]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{d} malformed row(s), first at line {d}", .{
+            table.bad_rows.len, table.bad_rows[0],
+        });
+        try s.markFailed(doc.id, msg);
+    } else {
+        try s.markIndexed(doc.id, @intCast(table.rows.len), now_ms);
+    }
+    try s.commit();
+    stats.chunks_written += table.rows.len;
+}
+
+/// `records/<type>/_schema.json`, or null when there is none — which is the
+/// normal case. The override file exists for the columns inference gets wrong,
+/// not as a required declaration.
+fn readSchemaOverride(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    type_name: []const u8,
+) !?[]u8 {
+    const path = try std.fmt.allocPrint(gpa, "{s}/records/{s}/_schema.json", .{ root, type_name });
+    defer gpa.free(path);
+    return readFile(gpa, io, path) catch null;
+}
+
 /// Monotonic nanoseconds. Zig 0.16 has no ambient Timer: clocks come from Io,
 /// and `.awake` is the monotonic one (excludes time the machine was suspended).
 fn nowNs(io: std.Io) i96 {
@@ -323,6 +476,8 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, abs: []const u8) ![]u8 {
 pub fn indexOneQueued(
     daemon_state: anytype,
     s: *store.Store,
+    collection_id: i64,
+    root: []const u8,
     doc: store.Store.PendingDoc,
     now_ms: i64,
 ) !void {
@@ -359,8 +514,8 @@ pub fn indexOneQueued(
         s,
         qb.backend(),
         dim,
-        daemon_state.collection_id,
-        daemon_state.root,
+        collection_id,
+        root,
         doc,
         now_ms,
         .{},

@@ -7,6 +7,7 @@ const search_cmd = @import("cli/search_cmd.zig");
 const daemon_cmd = @import("cli/daemon_cmd.zig");
 const query_cmd = @import("cli/query_cmd.zig");
 const memory_cmd = @import("cli/memory_cmd.zig");
+const records_cmd = @import("cli/records_cmd.zig");
 const mcp = @import("mcp/server.zig");
 
 const usage =
@@ -27,6 +28,9 @@ const usage =
     \\  forget <memory-file>
     \\  facts [key] [--history]
     \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
+    \\  records [type] [--where EXPR] [--search TEXT] [--agg EXPR]
+    \\                 [--schema] [-n N] [--json]
+    \\  sql <select ...> [--json]
     \\
     \\  status
     \\  maintain [--since last] [--check NAME] [--all] [--json]
@@ -311,6 +315,56 @@ pub fn main(init: std.process.Init) !u8 {
             at,
             note,
         );
+    }
+
+    if (std.mem.eql(u8, cmd, "records")) {
+        var opts: records_cmd.Options = .{};
+        while (args.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "-")) {
+                if (opts.type_name == null) opts.type_name = a else {
+                    try w.print("unexpected extra argument: {s}\n", .{a});
+                    return 2;
+                }
+            } else if (std.mem.eql(u8, a, "--where")) {
+                opts.where = args.next();
+            } else if (std.mem.eql(u8, a, "--search")) {
+                opts.search = args.next();
+            } else if (std.mem.eql(u8, a, "--agg")) {
+                opts.agg = args.next();
+            } else if (std.mem.eql(u8, a, "--schema")) {
+                opts.show_schema = true;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                opts.json = true;
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else if (std.mem.eql(u8, a, "-n")) {
+                opts.limit = std.fmt.parseInt(usize, args.next() orelse "50", 10) catch 50;
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        return records_cmd.run(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "sql")) {
+        var query: ?[]const u8 = null;
+        var json = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (query == null) {
+                query = a;
+            } else {
+                try w.writeAll("quote the whole statement as one argument\n");
+                return 2;
+            }
+        }
+        const q = query orelse {
+            try w.writeAll("usage: zkb sql \"select ...\" [--json]\n");
+            return 2;
+        };
+        return records_cmd.sqlCmd(gpa, init.environ_map, w, q, json);
     }
 
     if (std.mem.eql(u8, cmd, "status")) {

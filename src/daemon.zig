@@ -32,7 +32,9 @@ const proto = @import("ipc/proto.zig");
 const paths = @import("util/paths.zig");
 const maintain = @import("maintain.zig");
 const recallmod = @import("recall.zig");
-const facts = @import("facts.zig");
+const records = @import("records.zig");
+const memorymod = @import("memory.zig");
+const factsmod = @import("facts.zig");
 
 pub const max_conns: usize = 8;
 
@@ -83,6 +85,18 @@ pub const State = struct {
     /// several searches in a row. Index freshness can wait a second; the person
     /// cannot.
     last_interactive_ms: std.atomic.Value(i64) = .init(0),
+
+    /// True from the moment a rescan is requested until the pass that follows
+    /// it has finished. Without it a client cannot tell "nothing pending because
+    /// everything is indexed" from "nothing pending because the scan that would
+    /// have queued the work has not run yet" — and it always polls fast enough
+    /// to hit the second case.
+    scanning: std.atomic.Value(bool) = .init(true),
+
+    /// Set by an `index` request. The ingest loop wakes early instead of
+    /// waiting out the interval, which is the difference between "appended a row
+    /// and it is queryable" taking under a second and taking up to 30.
+    rescan: std.atomic.Value(bool) = .init(false),
 
     running: std.atomic.Value(bool) = .init(true),
     started_ms: i64 = 0,
@@ -202,6 +216,10 @@ fn embedderThread(st: *State) void {
     }
 }
 
+/// Granularity of the ingest loop's sleep, and so the upper bound on how long a
+/// rescan request waits before anything happens.
+pub const rescan_tick_ms: u64 = 100;
+
 /// How long the ingest loop stays out of the way after an interactive request.
 pub const ingest_backoff_ms: i64 = 1_500;
 
@@ -220,45 +238,110 @@ fn ingestThread(st: *State) void {
     checkModelIdentity(st, &db) catch {};
 
     while (!st.shuttingDown()) {
-        _ = scan.reconcile(st.gpa, st.io, &s, st.collection_id, st.root, .{}, nowMs(st.io)) catch {};
+        st.rescan.store(false, .release);
+        st.scanning.store(true, .release);
 
-        if (st.degraded() == null) {
-            drainPending(st, &s) catch {};
+        // Every root zkb knows about, not just the documents one. The kb roots
+        // were previously scanned only by `zkb index`, which meant a records csv
+        // an agent appended to was never picked up by the running daemon.
+        for (ingestRoots(st)) |r| {
+            const cid = s.ensureCollectionKind(r.name, r.path, r.kind, nowMs(st.io)) catch continue;
+            std.Io.Dir.accessAbsolute(st.io, r.path, .{}) catch continue;
+            _ = scan.reconcile(st.gpa, st.io, &s, cid, r.path, r.filters, nowMs(st.io)) catch {};
+            if (r.kind == .records) {
+                _ = records.reconcileOverrides(st.gpa, st.io, &db, r.path) catch 0;
+            }
+            if (st.degraded() == null) {
+                // Repeated because a records rebuild requeues the type's other
+                // files, and those are not in the pass's own pending list.
+                var pass: usize = 0;
+                while (pass < 3) : (pass += 1) {
+                    const did = drainPending(st, &s, cid, r.path) catch break;
+                    if (did == 0) break;
+                }
+            }
         }
+
         // After the pass, never during it: a document can link to one not yet
         // indexed, and resolving inline would call those broken depending on
         // filesystem iteration order.
         _ = maintain.resolveLinks(st.gpa, &db) catch 0;
+        st.scanning.store(false, .release);
 
-        // Sleep in short slices so shutdown does not wait a whole interval.
+        // Sleep in short slices so neither shutdown nor an explicit rescan
+        // request waits a whole interval.
+        //
+        // The slice is what bounds how fast an appended row becomes queryable:
+        // at one second it dominated the whole append-to-query time, which was
+        // otherwise down to the write. Ten atomic loads a second cost nothing.
+        const ticks = st.opts.scan_interval_s * (std.time.ms_per_s / rescan_tick_ms);
         var slept: u64 = 0;
-        while (slept < st.opts.scan_interval_s and !st.shuttingDown()) : (slept += 1) {
-            std.Io.sleep(st.io, .{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
+        while (slept < ticks and !st.shuttingDown() and
+            !st.rescan.load(.acquire)) : (slept += 1)
+        {
+            std.Io.sleep(st.io, .{ .nanoseconds = rescan_tick_ms * std.time.ns_per_ms }, .awake) catch {};
         }
     }
 }
 
+/// The roots the ingest thread reconciles, in priority order.
+///
+/// Documents first because they are the bulk; memory and records after, because
+/// they are small and change a few times a session.
+fn ingestRoots(st: *State) [3]IngestRoot {
+    return .{
+        .{
+            .name = st.opts.collection,
+            .path = st.root,
+            .kind = .documents,
+            .filters = .{},
+        },
+        .{
+            .name = "memory",
+            .path = st.layout.memory,
+            .kind = .memory,
+            .filters = memorymod.scan_filters,
+        },
+        .{
+            .name = "kb",
+            .path = st.layout.kb,
+            .kind = .records,
+            .filters = factsmod.scan_filters,
+        },
+    };
+}
+
+const IngestRoot = struct {
+    name: []const u8,
+    path: []const u8,
+    kind: store.Store.Kind,
+    filters: scan.Filters,
+};
+
 /// Embed and write pending documents one at a time, re-checking shutdown between
 /// documents so a stop request does not wait for the whole backlog.
-fn drainPending(st: *State, s: *store.Store) !void {
+fn drainPending(st: *State, s: *store.Store, collection_id: i64, root: []const u8) !usize {
+    var done: usize = 0;
     while (!st.shuttingDown()) {
         st.waitWhileInteractive();
-        if (st.shuttingDown()) return;
+        if (st.shuttingDown()) return done;
 
         var arena_state = std.heap.ArenaAllocator.init(st.gpa);
         defer arena_state.deinit();
-        const pending = try s.listPending(arena_state.allocator(), st.collection_id, 1);
-        if (pending.items.len == 0) return;
+        const pending = try s.listPending(arena_state.allocator(), collection_id, 1);
+        if (pending.items.len == 0) return done;
 
         const doc = pending.items[0];
-        indexer.indexOneQueued(st, s, doc, nowMs(st.io)) catch |err| {
+        indexer.indexOneQueued(st, s, collection_id, root, doc, nowMs(st.io)) catch |err| {
             s.rollback();
             s.deleteChunks(doc.id) catch {};
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "{t}", .{err}) catch "unknown error";
             s.markFailed(doc.id, msg) catch {};
         };
+        done += 1;
     }
+    return done;
 }
 
 fn checkModelIdentity(st: *State, db: *sqlite.Db) !void {
@@ -373,13 +456,15 @@ fn handleStats(st: *State, db: *sqlite.Db, w: *std.Io.Writer, id: i64) !void {
     try w.print(
         "{{\"docs\":{d},\"chunks\":{d},\"pending\":{d},\"failed\":{d}," ++
             "\"fts_rows\":{d},\"vec_rows\":{d},\"drift\":{}," ++
-            "\"served_interactive\":{d},\"served_ingest\":{d},\"max_preempted\":{d}}}",
+            "\"served_interactive\":{d},\"served_ingest\":{d},\"max_preempted\":{d}," ++
+            "\"scanning\":{}}}",
         .{
             c.docs,                                           c.chunks,
             c.pending,                                        c.failed,
             c.fts_rows,                                       c.vec_rows,
             c.chunks != c.fts_rows or c.chunks != c.vec_rows, st.queue.served_interactive,
             st.queue.served_ingest,                           st.queue.max_preempted,
+            st.scanning.load(.acquire),
         },
     );
     try proto.finishOk(w);
@@ -445,7 +530,7 @@ fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
 
     // Facts come from `facts.csv`, not from the index: the index can be stale or
     // mid-rebuild, and a stale salary reads exactly like a current one.
-    const current = facts.currentAll(st.gpa, st.io, st.layout.facts) catch &.{};
+    const current = factsmod.currentAll(st.gpa, st.io, st.layout.facts) catch &.{};
     defer {
         for (current) |f| f.deinit(st.gpa);
         st.gpa.free(current);
@@ -485,12 +570,18 @@ fn handleMaintain(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const pro
     try proto.finishOk(w);
 }
 
-fn handleIndex(_: *State, w: *std.Io.Writer, id: i64) !void {
-    // The ingest thread owns the only write connection and rescans on its own
-    // schedule. A second writer here would break the single-writer invariant that
-    // makes SQLITE_BUSY a non-issue, so this only acknowledges.
+fn handleIndex(st: *State, w: *std.Io.Writer, id: i64) !void {
+    // Still no writing from this thread — the ingest thread owns the only write
+    // connection, and a second writer would break the single-writer invariant
+    // that keeps SQLITE_BUSY off the table. What this does is wake it, which
+    // turns "queryable within the scan interval" into "queryable in about a
+    // second" without touching that invariant.
+    // Both set before replying, so a client that polls immediately cannot
+    // observe the gap between "asked for a scan" and "scan started".
+    st.scanning.store(true, .release);
+    st.rescan.store(true, .release);
     try proto.beginOk(w, id);
-    try w.writeAll("{\"queued\":true,\"note\":\"the ingest thread rescans on its own interval\"}");
+    try w.writeAll("{\"queued\":true,\"note\":\"ingest thread woken\"}");
     try proto.finishOk(w);
 }
 

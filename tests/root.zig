@@ -17,6 +17,7 @@ test {
     _ = @import("maintain_test.zig");
     _ = @import("csv_test.zig");
     _ = @import("memory_test.zig");
+    _ = @import("records_test.zig");
 }
 
 // ---------------------------------------------------------------------------

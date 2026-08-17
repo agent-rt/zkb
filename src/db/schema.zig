@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 4;
+pub const schema_version: i64 = 5;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -165,6 +165,27 @@ const ddl_v4 =
     \\CREATE INDEX rec_memory_status  ON rec_memory(status, created DESC);
 ;
 
+/// v5: the inferred schema of each records type.
+///
+/// The `rec_<type>` tables themselves are **not** created here — their columns
+/// come from a csv header, so they are built at index time and rebuilt whenever
+/// the header changes (SPEC §16.3). This table is what makes that inference
+/// inspectable: `zkb records <type> --schema` reads it, and inference you cannot
+/// look at is inference you cannot debug when it guesses wrong.
+const ddl_v5 =
+    \\CREATE TABLE rec_meta (
+    \\  type       TEXT NOT NULL,
+    \\  field      TEXT NOT NULL,
+    \\  kind       TEXT NOT NULL,
+    \\  indexed    INTEGER NOT NULL,
+    \\  vectorized INTEGER NOT NULL,
+    \\  ord        INTEGER NOT NULL,
+    \\  overridden INTEGER NOT NULL DEFAULT 0,
+    \\  src_col    INTEGER NOT NULL DEFAULT 0,
+    \\  PRIMARY KEY (type, field)
+    \\) STRICT;
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -182,6 +203,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v1);
         try db.exec(ddl_v3);
         try db.exec(ddl_v4);
+        try db.exec(ddl_v5);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -194,6 +216,19 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have == 1) try migrateV1ToV2(db);
     if (have < 3) try migrateToV3(db);
     if (have < 4) try migrateToV4(db);
+    if (have < 5) try migrateToV5(db);
+}
+
+/// v4 -> v5: the records schema registry.
+///
+/// Existing `rec_<type>` tables, if any, are left alone: they are keyed by a
+/// header that has not changed, and index time rebuilds them anyway when it has.
+fn migrateToV5(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v5);
+    try setMetaInt(db, "schema_version", 5);
+    try db.exec("COMMIT;");
 }
 
 /// v3 -> v4: collection kinds, facts, memory metadata.

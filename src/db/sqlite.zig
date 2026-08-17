@@ -233,6 +233,27 @@ pub const Stmt = struct {
         return p[0..n];
     }
 
+    pub fn columnCount(self: *Stmt) c_int {
+        return c.sqlite3_column_count(self.stmt);
+    }
+
+    /// The name SQLite gives the result column — the alias if there is one, the
+    /// expression text otherwise. Only meaningful for a header row.
+    pub fn columnName(self: *Stmt, idx: c_int) []const u8 {
+        const p = c.sqlite3_column_name(self.stmt, idx);
+        if (p == null) return &.{};
+        return std.mem.span(p);
+    }
+
+    /// SQLite's own verdict on whether this statement writes anything.
+    ///
+    /// Used by `zkb sql` as a second gate behind the read-only connection: a
+    /// keyword check on the source text can be fooled, and this cannot — it is
+    /// derived from the compiled program, not from how the SQL was spelled.
+    pub fn isReadOnly(self: *Stmt) bool {
+        return c.sqlite3_stmt_readonly(self.stmt) != 0;
+    }
+
     /// Valid until the next step()/reset()/finalize() on this statement.
     pub fn columnBlob(self: *Stmt, idx: c_int) []const u8 {
         const p = c.sqlite3_column_blob(self.stmt, idx);

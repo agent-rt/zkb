@@ -25,6 +25,15 @@ pub fn run(
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
+    // With a daemon running, the ingest thread already owns the only write
+    // connection. Opening a second writer here would work — SQLite would
+    // serialize it — but it would abandon the invariant the daemon is designed
+    // around, and for no gain: the daemon has the model resident and this
+    // process would have to load its own.
+    if (!opts.force) {
+        if (try viaDaemon(gpa, io, layout.sock, w)) |code| return code;
+    }
+
     const root = opts.root orelse blk: {
         const home = env.get("HOME") orelse return error.NoHomeDirectory;
         break :blk try std.fmt.allocPrint(gpa, "{s}/docs", .{home});
@@ -145,6 +154,63 @@ pub fn run(
     return 0;
 }
 
+/// Ask the running daemon to rescan, then wait until it has nothing pending.
+///
+/// Returns null when no daemon is listening, so the caller falls back to doing
+/// the work in this process. `--force` also takes the local path: re-embedding
+/// everything is a deliberate, long operation whose progress the user wants to
+/// watch, not something to hand to a background thread.
+fn viaDaemon(gpa: std.mem.Allocator, io: std.Io, sock: []const u8, w: *Writer) !?u8 {
+    var c = zkb.ipc_client.Client.connect(io, sock) catch return null;
+    defer c.close();
+
+    {
+        var resp = c.call(gpa, .index, "{}") catch return null;
+        defer resp.deinit(gpa);
+        if (!resp.ok) return null;
+    }
+    try w.writeAll("daemon rescanning ...\n");
+    try w.flush();
+
+    // Poll rather than wait for a push: the protocol is request/response, and a
+    // rescan of a large corpus can take minutes, which no reasonable request
+    // timeout would cover.
+    var waited_ms: u64 = 0;
+    while (waited_ms < 120_000) : (waited_ms += 200) {
+        std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+
+        var resp = c.call(gpa, .stats, "{}") catch break;
+        defer resp.deinit(gpa);
+        if (!resp.ok) break;
+        const obj = (resp.result orelse break).object;
+        // Both conditions: pending alone is zero in the window between asking
+        // for a scan and the scan queueing anything.
+        if (intOf(obj, "scanning") != 0) continue;
+        if (intOf(obj, "pending") != 0) continue;
+
+        try w.print("  {d} docs, {d} chunks, {d} failed\n", .{
+            intOf(obj, "docs"), intOf(obj, "chunks"), intOf(obj, "failed"),
+        });
+        if (intOf(obj, "drift") != 0) {
+            try w.writeAll("  WARNING index drift — run: zkb daemon stop && zkb index\n");
+            return 1;
+        }
+        return 0;
+    }
+    try w.writeAll("still indexing; check: zkb status\n");
+    return 0;
+}
+
+fn intOf(o: std.json.ObjectMap, key: []const u8) i64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        .bool => |b| @intFromBool(b),
+        else => 0,
+    };
+}
+
 /// What zkb itself writes: `~/kb/memory/*.md` and `~/kb/*.csv`.
 ///
 /// Two collections over nested roots, told apart only by extension — the memory
@@ -197,9 +263,31 @@ fn reconcileKb(
         const report = try zkb.scan.reconcile(gpa, io, s, r.cid, r.path, r.filters, now_ms);
         r.pending = report.queued;
         total += report.queued;
+
+        // A `_schema.json` edit changes a type's shape without touching any csv,
+        // so the scanner cannot see it. Checked here, where the result can still
+        // affect this run's pending count.
+        if (r.kind == .records) {
+            const requeued = zkb.records.reconcileOverrides(gpa, io, s.db, r.path) catch 0;
+            if (requeued != 0) {
+                const again = try zkb.scan.reconcile(gpa, io, s, r.cid, r.path, r.filters, now_ms);
+                _ = again;
+                r.pending += 1;
+                total += 1;
+            }
+        }
     }
     return total;
 }
+
+/// Indexing a records type can requeue its sibling files: a changed header means
+/// the materialized table is rebuilt, which discards every file's rows, so they
+/// all have to be read again (`records.ensureTable`). The pending list for a pass
+/// is taken before that happens, so one pass is not enough — hence the loop.
+///
+/// It terminates because the rebuild only fires when the stored shape differs
+/// from the inferred one, and after the first pass they agree.
+const max_kb_passes: usize = 3;
 
 fn indexKb(
     gpa: std.mem.Allocator,
@@ -212,9 +300,22 @@ fn indexKb(
 ) !void {
     for (roots) |r| {
         if (r.cid == 0 or r.pending == 0) continue;
-        const st = try zkb.indexer.indexPending(gpa, io, s, embedder, r.cid, r.path, now_ms, .{});
-        try w.print("  {s}: {d} doc(s), {d} chunk(s)", .{ r.name, st.docs_indexed, st.chunks_written });
-        if (st.docs_failed != 0) try w.print(", {d} FAILED", .{st.docs_failed});
+
+        var docs: usize = 0;
+        var chunks: usize = 0;
+        var failed: usize = 0;
+        var pass: usize = 0;
+        while (pass < max_kb_passes) : (pass += 1) {
+            const st = try zkb.indexer.indexPending(gpa, io, s, embedder, r.cid, r.path, now_ms, .{});
+            docs += st.docs_indexed;
+            chunks += st.chunks_written;
+            failed += st.docs_failed;
+            if (st.docs_indexed == 0) break;
+        }
+
+        try w.print("  {s}: {d} doc(s), {d} chunk(s)", .{ r.name, docs, chunks });
+        if (pass > 1) try w.print(" in {d} passes", .{pass});
+        if (failed != 0) try w.print(", {d} FAILED", .{failed});
         try w.writeAll("\n");
         try w.flush();
     }
