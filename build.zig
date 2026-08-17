@@ -146,6 +146,27 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
 
+    // The suite above is rooted at tests/root.zig, which can only reach what the
+    // `zkb` module exports. Everything on the cli side — main.zig, cli/*, mcp/* —
+    // imports `zkb` rather than being part of it, so no test there was ever
+    // compiled, let alone run. A `test` block in src/mcp/server.zig passed by
+    // never executing, which is how a malformed tools/list payload shipped in
+    // 0.0.1.
+    //
+    // Rooting a second artifact at main.zig covers the cli side, since every
+    // file there is reachable from it.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zkb", .module = zkb_mod }},
+        }),
+    });
+    if (want_llama) addLlamaLinks(b, cli_tests.root_module, is_apple);
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+
     // ---------------------------------------------------------- experiments
     // M0's blocking geology checks (SPEC §10). Separate binaries rather than
     // unit tests: they need a 639MB model on disk, which no test should.

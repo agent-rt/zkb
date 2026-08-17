@@ -148,9 +148,9 @@ fn handleToolsList(w: *Writer, id: std.json.Value) !void {
         \\ "description":"Query the user's structured data (expenses, weight logs, any csv under records/). Exact filtering and aggregation over real columns — use this for numbers, not zkb_search. Call with no arguments to list the available types and their columns. Output is TSV.",
         \\ "inputSchema":{"type":"object","properties":{
         \\   "type":{"type":"string","description":"Record type, e.g. 'expenses'. Omit to list all types and their inferred schemas."},
-        \\   "where":{"type":"string","description":"Filter, e.g. \\"amount > 1000 AND category = 'food'\\". Operators: = != < <= > >= LIKE IN, IS NULL; AND/OR and parentheses. Field names must match the schema."},
-        \\   "agg":{"type":"string","description":"Aggregate, e.g. \\"sum(amount) by category\\". Functions: sum avg min max count."},
-        \\   "window":{"type":"string","description":"Moving aggregate, e.g. \\"avg(kg) over 7 by date\\" for a 7-row moving average. Optional trailing 'partition <field>'."},
+        \\   "where":{"type":"string","description":"Filter, e.g. \"amount > 1000 AND category = 'food'\". Operators: = != < <= > >= LIKE IN, IS NULL; AND/OR and parentheses. Field names must match the schema."},
+        \\   "agg":{"type":"string","description":"Aggregate, e.g. \"sum(amount) by category\". Functions: sum avg min max count."},
+        \\   "window":{"type":"string","description":"Moving aggregate, e.g. \"avg(kg) over 7 by date\" for a 7-row moving average. Optional trailing 'partition <field>'."},
         \\   "limit":{"type":"integer","description":"Max rows for a plain listing (default 50)."},
         \\   "schema":{"type":"boolean","description":"Show the inferred column kinds (date/number/enum/id/string) instead of rows."}}}}
         \\]}
@@ -547,4 +547,54 @@ fn jsonInt(o: std.json.ObjectMap, key: []const u8) i64 {
         .float => |f| @intFromFloat(f),
         else => 0,
     };
+}
+
+// ---------------------------------------------------------------------- tests
+
+/// The tool and resource descriptors are hand-written JSON inside Zig multiline
+/// string literals, which do no escape processing: a `\"` there is already the
+/// two bytes JSON wants, and writing `\\"` — the form a normal quoted literal
+/// would need — emits an escaped backslash followed by a quote that closes the
+/// string early. That shipped in 0.0.1 and made `tools/list` unparseable, which
+/// takes the whole MCP surface down, since every client calls it during startup.
+///
+/// Nothing in the type system prevents it, so the guard is to parse what we
+/// actually emit.
+fn renderToJson(gpa: std.mem.Allocator, comptime handler: anytype) !std.json.Parsed(std.json.Value) {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try handler(&out.writer, .{ .integer = 1 });
+    return std.json.parseFromSlice(std.json.Value, gpa, out.written(), .{});
+}
+
+test "tools/list emits parseable json" {
+    const gpa = std.testing.allocator;
+    var parsed = try renderToJson(gpa, handleToolsList);
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 4), tools.items.len);
+
+    // Every tool needs the three fields a client reads, and the descriptions are
+    // where the quoting goes wrong, so assert one round-trips with its quotes.
+    for (tools.items) |t| {
+        try std.testing.expect(t.object.get("name").?.string.len > 0);
+        try std.testing.expect(t.object.get("description").?.string.len > 0);
+        _ = t.object.get("inputSchema").?.object;
+    }
+    const records = tools.items[3].object.get("inputSchema").?.object
+        .get("properties").?.object.get("where").?.object.get("description").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, records, "\"amount > 1000 AND category = 'food'\"") != null);
+}
+
+test "resources/list emits parseable json" {
+    const gpa = std.testing.allocator;
+    var parsed = try renderToJson(gpa, handleResourcesList);
+    defer parsed.deinit();
+
+    const resources = parsed.value.object.get("result").?.object.get("resources").?.array;
+    try std.testing.expectEqual(@as(usize, 2), resources.items.len);
+    for (resources.items) |r| {
+        try std.testing.expect(std.mem.startsWith(u8, r.object.get("uri").?.string, "zkb://"));
+    }
 }

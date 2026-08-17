@@ -637,3 +637,22 @@ fn maintainCmd(
     try zkb.maintain.record(gpa, &db, &report, checks, now_ms);
     return 0;
 }
+
+// Pull every cli-side file into the test build.
+//
+// Zig only collects tests from the root source file; other files need an
+// explicit reference like this one, which is why tests/root.zig has the same
+// block. Without it a `test` in any file here compiles to nothing and passes by
+// not existing.
+test {
+    _ = @import("mcp/server.zig");
+    _ = @import("cli/doctor.zig");
+    _ = @import("cli/model.zig");
+    _ = @import("cli/index_cmd.zig");
+    _ = @import("cli/search_cmd.zig");
+    _ = @import("cli/daemon_cmd.zig");
+    _ = @import("cli/query_cmd.zig");
+    _ = @import("cli/memory_cmd.zig");
+    _ = @import("cli/records_cmd.zig");
+    _ = @import("cli/skill_cmd.zig");
+}
