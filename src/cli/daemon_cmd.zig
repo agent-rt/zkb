@@ -111,7 +111,9 @@ pub fn stop(
     defer layout.deinit(gpa);
 
     var c = client.Client.connect(io, layout.sock) catch |err| switch (err) {
-        error.DaemonNotRunning => {
+        // See the note in status: a stale socket file means the daemon died
+        // without cleaning up, which is still "not running".
+        error.DaemonNotRunning, error.ConnectFailed => {
             try w.writeAll("daemon is not running\n");
             return 0;
         },
@@ -155,7 +157,13 @@ pub fn status(
     defer layout.deinit(gpa);
 
     var c = client.Client.connect(io, layout.sock) catch |err| switch (err) {
-        error.DaemonNotRunning => {
+        // Two ways to not be running, and only one of them removes the socket
+        // file. A daemon that was killed rather than asked to stop — SIGKILL,
+        // `launchctl bootout`, a crash — leaves the file behind, so connecting
+        // fails instead of finding nothing. isRunning has always handled both;
+        // here only the first was covered, which turned the command you reach
+        // for to diagnose a dead daemon into `error: ConnectFailed`.
+        error.DaemonNotRunning, error.ConnectFailed => {
             try client.reportNotRunning(w, layout.sock);
             return 3;
         },
