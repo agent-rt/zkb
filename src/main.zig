@@ -5,6 +5,8 @@ const model = @import("cli/model.zig");
 const index_cmd = @import("cli/index_cmd.zig");
 const search_cmd = @import("cli/search_cmd.zig");
 const daemon_cmd = @import("cli/daemon_cmd.zig");
+const query_cmd = @import("cli/query_cmd.zig");
+const mcp = @import("mcp/server.zig");
 
 const usage =
     \\zkb — Agent memory + personal knowledge base
@@ -16,7 +18,10 @@ const usage =
     \\  index [--root DIR] [--collection NAME] [--force] [--model PATH]
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--json] [--full] [--model PATH]
+    \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
     \\  status
+    \\  maintain [--since last] [--check NAME] [--all] [--json]
+    \\  mcp                          stdio MCP server (for Claude Code etc.)
     \\  doctor [--model PATH]
     \\  model pull [--quant q8_0|f16]
     \\  version
@@ -146,8 +151,88 @@ pub fn main(init: std.process.Init) !u8 {
         return search_cmd.run(gpa, init.io, init.environ_map, w, opts);
     }
 
+    if (std.mem.eql(u8, cmd, "query")) {
+        var question: ?[]const u8 = null;
+        var opts: query_cmd.Options = .{ .query = "" };
+        while (args.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "-")) {
+                if (question == null) question = a else {
+                    try w.print("unexpected extra argument: {s}\n(quote a multi-word question)\n", .{a});
+                    return 2;
+                }
+            } else if (std.mem.eql(u8, a, "--budget")) {
+                opts.budget = std.fmt.parseInt(usize, args.next() orelse "8000", 10) catch 8000;
+            } else if (std.mem.eql(u8, a, "--neighbors")) {
+                opts.neighbors = std.fmt.parseInt(i64, args.next() orelse "1", 10) catch 1;
+            } else if (std.mem.eql(u8, a, "--candidates")) {
+                opts.candidates = std.fmt.parseInt(usize, args.next() orelse "30", 10) catch 30;
+            } else if (std.mem.eql(u8, a, "--format")) {
+                const v = args.next() orelse "markdown";
+                opts.format = std.meta.stringToEnum(query_cmd.Format, v) orelse {
+                    try w.print("unknown format: {s} (markdown|json)\n", .{v});
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        opts.query = question orelse {
+            try w.writeAll("usage: zkb query <question> [--budget N] [--format markdown|json]\n");
+            return 2;
+        };
+        return query_cmd.run(gpa, init.io, init.environ_map, w, opts);
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         return status(gpa, init.io, init.environ_map, w);
+    }
+
+    if (std.mem.eql(u8, cmd, "maintain")) {
+        var since_last = false;
+        var as_json = false;
+        var selected: [8]zkb.maintain.Check = undefined;
+        var n_selected: usize = 0;
+        var use_all = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--since")) {
+                const v = args.next() orelse "last";
+                since_last = std.mem.eql(u8, v, "last");
+            } else if (std.mem.eql(u8, a, "--json")) {
+                as_json = true;
+            } else if (std.mem.eql(u8, a, "--all")) {
+                use_all = true;
+            } else if (std.mem.eql(u8, a, "--check")) {
+                const v = args.next() orelse "";
+                const c = zkb.maintain.Check.parse(v) orelse {
+                    try w.print("unknown check: {s}\n", .{v});
+                    return 2;
+                };
+                if (n_selected < selected.len) {
+                    selected[n_selected] = c;
+                    n_selected += 1;
+                }
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        const checks: []const zkb.maintain.Check = if (n_selected != 0)
+            selected[0..n_selected]
+        else if (use_all)
+            zkb.maintain.Check.all()
+        else
+            zkb.maintain.Check.default();
+        return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks);
+    }
+
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        // stdout is the protocol channel from here on; nothing else may write to
+        // it. Flush what the CLI已 buffered before handing it over.
+        try w.flush();
+        return mcp.run(gpa, init.io, init.environ_map);
     }
 
     if (std.mem.eql(u8, cmd, "doctor")) {
@@ -268,5 +353,98 @@ fn status(
         });
         return 1;
     }
+    return 0;
+}
+
+/// `zkb maintain` runs against the database directly rather than through the
+/// daemon: it is a read-only sweep, and recording the run needs a write the
+/// daemon's single-writer invariant would otherwise have to arbitrate.
+fn maintainCmd(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *std.Io.Writer,
+    since_last: bool,
+    as_json: bool,
+    checks: []const zkb.maintain.Check,
+) !u8 {
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    std.Io.Dir.accessAbsolute(io, layout.db, .{}) catch {
+        try w.print("no index at {s}\nrun: zkb index\n", .{layout.db});
+        return 3;
+    };
+    const db_path = try gpa.dupeZ(u8, layout.db);
+    defer gpa.free(db_path);
+    var db = zkb.store.open(db_path, .read_write) catch |err| switch (err) {
+        error.SchemaStale => {
+            try w.writeAll("index schema is out of date\nrun: zkb index\n");
+            return 3;
+        },
+        else => return err,
+    };
+    defer db.close();
+
+    var report = try zkb.maintain.run(gpa, &db, .{ .checks = checks });
+    defer report.deinit(gpa);
+
+    if (as_json) {
+        try w.writeAll("{\"findings\":[");
+        for (report.findings, 0..) |f, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{{\"check\":\"{t}\",\"path\":", .{f.check});
+            try std.json.Stringify.value(f.path, .{}, w);
+            try w.writeAll(",\"detail\":");
+            try std.json.Stringify.value(f.detail, .{}, w);
+            try w.writeAll("}");
+        }
+        try w.writeAll("]}\n");
+        return 0;
+    }
+
+    if (report.link_graph_empty) {
+        // Otherwise every document looks unlinked and the report is a lie.
+        try w.writeAll(
+            "note: the link graph is empty, so link checks were skipped.\n" ++
+                "      run `zkb index --force` once to populate it.\n\n",
+        );
+    }
+
+    if (since_last) {
+        var diff = try zkb.maintain.diffAgainstLast(gpa, &db, &report);
+        defer diff.deinit(gpa);
+        try w.print("new ({d})\n", .{diff.new_keys.len});
+        for (report.findings) |f| {
+            for (diff.new_keys) |k| if (std.mem.eql(u8, k, f.key)) {
+                try w.print("  {t:<16} {s}  {s}\n", .{ f.check, f.path, f.detail });
+            };
+        }
+        if (diff.resolved_keys.len != 0) {
+            try w.print("\nresolved ({d})\n", .{diff.resolved_keys.len});
+            for (diff.resolved_keys) |k| try w.print("  {s}\n", .{k});
+        }
+        try w.print("\nunchanged: {d}\n", .{diff.unchanged});
+    } else {
+        for (checks) |c| {
+            const n = report.count(c);
+            if (n == 0) continue;
+            try w.print("\n{t} ({d})\n", .{ c, n });
+            var shown: usize = 0;
+            for (report.findings) |f| {
+                if (f.check != c) continue;
+                if (shown == 15) {
+                    try w.print("  ... {d} more\n", .{n - shown});
+                    break;
+                }
+                try w.print("  {s}  {s}\n", .{ f.path, f.detail });
+                shown += 1;
+            }
+        }
+        if (report.findings.len == 0) try w.writeAll("no findings\n");
+    }
+
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+    try zkb.maintain.record(gpa, &db, &report, now_ms);
     return 0;
 }

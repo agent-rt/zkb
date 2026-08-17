@@ -13,6 +13,8 @@ test {
     _ = @import("search_test.zig");
     _ = @import("tokenizer_test.zig");
     _ = @import("queue_test.zig");
+    _ = @import("pack_test.zig");
+    _ = @import("maintain_test.zig");
 }
 
 // ---------------------------------------------------------------------------

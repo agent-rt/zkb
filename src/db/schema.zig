@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 2;
+pub const schema_version: i64 = 3;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -107,6 +107,30 @@ pub fn verify(db: *sqlite.Db) Error!void {
     try checkDimension(db);
 }
 
+/// v3 adds the link graph and the maintenance history. Both are pure derived
+/// data — links are re-extracted on every index, and the history is a log — so
+/// this migration only has to create the shape.
+const ddl_v3 =
+    \\CREATE TABLE links (
+    \\  id            INTEGER PRIMARY KEY,
+    \\  doc_id        INTEGER NOT NULL REFERENCES docs(id),
+    \\  chunk_id      INTEGER,
+    \\  kind          TEXT NOT NULL,
+    \\  raw           TEXT NOT NULL,
+    \\  target_doc_id INTEGER
+    \\) STRICT;
+    \\
+    \\CREATE INDEX links_doc    ON links(doc_id);
+    \\CREATE INDEX links_target ON links(target_doc_id);
+    \\
+    \\CREATE TABLE maintenance_runs (
+    \\  id         INTEGER PRIMARY KEY,
+    \\  started_at INTEGER NOT NULL,
+    \\  checks     TEXT NOT NULL,
+    \\  report     TEXT NOT NULL
+    \\) STRICT;
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -122,6 +146,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec("BEGIN IMMEDIATE;");
         errdefer db.exec("ROLLBACK;") catch {};
         try db.exec(ddl_v1);
+        try db.exec(ddl_v3);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -132,6 +157,23 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     }
 
     if (have == 1) try migrateV1ToV2(db);
+    if (have < 3) try migrateToV3(db);
+}
+
+/// v2 -> v3: add the link graph and the maintenance history.
+///
+/// The link graph starts empty and fills in as documents are re-parsed. It does
+/// not backfill: extracting links needs the source text, and the indexer only
+/// re-reads a document when its content hash changes. So on an existing index the
+/// graph stays empty until documents change, or until `zkb index --force`.
+/// Stated rather than hidden — a maintenance report over an empty graph would
+/// otherwise claim every document is unlinked.
+fn migrateToV3(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v3);
+    try setMetaInt(db, "schema_version", 3);
+    try db.exec("COMMIT;");
 }
 
 /// v1 -> v2: swap the FTS tokenizer from `trigram` to `zkb_cjk`.
@@ -151,7 +193,9 @@ fn migrateV1ToV2(db: *sqlite.Db) Error!void {
         \\INSERT INTO fts_chunks(rowid, text, heading_path)
         \\SELECT id, text, COALESCE(heading_path, '') FROM chunks;
     );
-    try setMetaInt(db, "schema_version", schema_version);
+    // Only its own target: setting the latest version here would mark the
+    // database as v3 without v3's tables if the next step failed.
+    try setMetaInt(db, "schema_version", 2);
 
     try db.exec("COMMIT;");
 }

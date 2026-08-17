@@ -16,7 +16,9 @@ pub const Method = enum {
     health,
     stats,
     search,
+    query,
     index,
+    maintain,
     shutdown,
 
     pub fn parse(s: []const u8) ?Method {

@@ -15,6 +15,7 @@ const schema = @import("../db/schema.zig");
 const markdown = @import("markdown.zig");
 const chunk = @import("chunk.zig");
 const embed = @import("../embed/llama.zig");
+const maintain = @import("../maintain.zig");
 
 pub const Stats = struct {
     docs_indexed: usize = 0,
@@ -171,6 +172,12 @@ fn indexOne(
 
     try s.deleteChunks(doc.id);
     try s.setDocMeta(doc.id, parsed.title, parsed.frontmatter);
+
+    // Links go in the same transaction as the chunks they came from, so the
+    // graph can never describe a version of the document that is not stored.
+    const links = try markdown.extractLinks(gpa, source, &parsed);
+    defer gpa.free(links);
+    try maintain.replaceLinks(s.db, doc.id, links);
     for (chunks.items, 0..) |c, i| {
         _ = try s.insertChunk(collection_id, doc.id, .{
             .idx = @intCast(c.idx),

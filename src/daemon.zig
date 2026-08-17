@@ -25,10 +25,12 @@ const schema = @import("db/schema.zig");
 const scan = @import("ingest/scan.zig");
 const indexer = @import("ingest/indexer.zig");
 const hybrid = @import("search/hybrid.zig");
+const packmod = @import("search/pack.zig");
 const embed = @import("embed/llama.zig");
 const equeue = @import("embed/queue.zig");
 const proto = @import("ipc/proto.zig");
 const paths = @import("util/paths.zig");
+const maintain = @import("maintain.zig");
 
 pub const max_conns: usize = 8;
 
@@ -221,6 +223,10 @@ fn ingestThread(st: *State) void {
         if (st.degraded() == null) {
             drainPending(st, &s) catch {};
         }
+        // After the pass, never during it: a document can link to one not yet
+        // indexed, and resolving inline would call those broken depending on
+        // filesystem iteration order.
+        _ = maintain.resolveLinks(st.gpa, &db) catch 0;
 
         // Sleep in short slices so shutdown does not wait a whole interval.
         var slept: u64 = 0;
@@ -328,7 +334,9 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
         .health => try handleHealth(st, w, req.id),
         .stats => try handleStats(st, db, w, req.id),
         .search => try handleSearch(st, db, w, &req),
+        .query => try handleQuery(st, db, w, &req),
         .index => try handleIndex(st, w, req.id),
+        .maintain => try handleMaintain(st, db, w, &req),
         .shutdown => {
             try proto.beginOk(w, req.id);
             try w.writeAll("{\"stopping\":true}");
@@ -371,6 +379,67 @@ fn handleStats(st: *State, db: *sqlite.Db, w: *std.Io.Writer, id: i64) !void {
             st.queue.served_ingest,                           st.queue.max_preempted,
         },
     );
+    try proto.finishOk(w);
+}
+
+fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.Request) !void {
+    const query = req.str("query") orelse
+        return proto.writeError(w, req.id, .bad_request, "query requires a query", null);
+    var cfg: packmod.Config = .{};
+    if (req.int("budget")) |b| cfg.budget_tokens = @intCast(@max(0, b));
+    if (req.int("neighbors")) |n| cfg.neighbors = @max(0, n);
+    if (req.int("candidates")) |c| cfg.candidates = @intCast(@max(1, c));
+
+    var mode: hybrid.Mode = .hybrid;
+    var vec: ?[]f32 = null;
+    defer if (vec) |v| st.gpa.free(v);
+
+    if (st.degraded()) |_| {
+        mode = .keyword;
+    } else {
+        const dim: usize = @intCast(schema.embedding_dim);
+        const buf = try st.gpa.alloc(f32, dim);
+        if (st.embedText(.interactive, .query, "", query, buf)) |_| {
+            vec = buf;
+        } else |_| {
+            st.gpa.free(buf);
+            mode = .keyword;
+        }
+    }
+
+    var results = hybrid.search(st.gpa, db, mode, query, vec, null, .{
+        .top_k = cfg.candidates,
+        .candidates = @max(50, cfg.candidates),
+    }) catch return proto.writeError(w, req.id, .internal, "search failed", null);
+    defer results.deinit(st.gpa);
+
+    var p = packmod.assemble(st.gpa, db, query, &results, cfg) catch
+        return proto.writeError(w, req.id, .internal, "pack assembly failed", null);
+    defer p.deinit(st.gpa);
+
+    try proto.beginOk(w, req.id);
+    try packmod.renderJson(w, &p);
+    try proto.finishOk(w);
+}
+
+fn handleMaintain(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.Request) !void {
+    var report = maintain.run(st.gpa, db, .{}) catch
+        return proto.writeError(w, req.id, .internal, "maintenance failed", null);
+    defer report.deinit(st.gpa);
+
+    try proto.beginOk(w, req.id);
+    try w.print("{{\"link_graph_empty\":{},\"findings\":[", .{report.link_graph_empty});
+    for (report.findings, 0..) |f, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.print("{{\"check\":\"{t}\",\"key\":", .{f.check});
+        try std.json.Stringify.value(f.key, .{}, w);
+        try w.writeAll(",\"path\":");
+        try std.json.Stringify.value(f.path, .{}, w);
+        try w.writeAll(",\"detail\":");
+        try std.json.Stringify.value(f.detail, .{}, w);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
     try proto.finishOk(w);
 }
 

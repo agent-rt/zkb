@@ -327,3 +327,221 @@ fn findClosingFrontmatter(source: []const u8, from: usize) ?FrontmatterClose {
     // swallowing the document.
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// link extraction
+// ---------------------------------------------------------------------------
+
+pub const LinkKind = enum {
+    /// [text](target)
+    md,
+    /// [[wikilink]]
+    wiki,
+    /// kb:// URI
+    lore,
+    /// depends_on / related_to / part_of in frontmatter
+    frontmatter,
+    /// Any scheme:// — recorded but never resolved. zkb does not go online, and
+    /// a file:// URL is an absolute machine path, not a collection-relative one.
+    external,
+    /// A target that exists as a file but is not an indexed document (.json,
+    /// images, PDFs). Distinct from broken: the file is there, it is simply not
+    /// something zkb has an entry for, and reporting it as missing would be wrong.
+    asset,
+};
+
+pub const Link = struct {
+    kind: LinkKind,
+    /// Raw target as written. Resolution happens later, against the full
+    /// document set.
+    raw: []const u8,
+    byte_offset: usize,
+};
+
+/// Extract links from `source`, using `doc.blocks` to skip fenced code.
+///
+/// Code blocks are excluded deliberately: a path inside a shell snippet or a
+/// sample config is not a reference, and counting it produces broken-link noise
+/// for something nobody intended as a link.
+pub fn extractLinks(
+    gpa: std.mem.Allocator,
+    source: []const u8,
+    doc: *const Document,
+) std.mem.Allocator.Error![]Link {
+    var out: std.ArrayList(Link) = .empty;
+    errdefer out.deinit(gpa);
+
+    if (doc.frontmatter) |fm| try extractFrontmatterLinks(gpa, &out, fm, source);
+
+    for (doc.blocks) |b| {
+        if (b.kind == .code) continue;
+        try extractInline(gpa, &out, source, b.byte_start, b.byte_end);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// YAML list items under depends_on / related_to / part_of. Deliberately not a
+/// YAML parser: only these three keys matter, and only their `- item` entries.
+fn extractFrontmatterLinks(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(Link),
+    fm: []const u8,
+    source: []const u8,
+) !void {
+    const keys = [_][]const u8{ "depends_on:", "related_to:", "part_of:" };
+    var lines = std.mem.splitScalar(u8, fm, '\n');
+    var in_list = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        var is_key = false;
+        for (keys) |k| {
+            if (std.mem.startsWith(u8, trimmed, k)) {
+                is_key = true;
+                // `depends_on: [a, b]` inline form.
+                const rest = std.mem.trim(u8, trimmed[k.len..], " \t[]");
+                if (rest.len != 0) {
+                    var items = std.mem.splitScalar(u8, rest, ',');
+                    while (items.next()) |it| {
+                        const v = std.mem.trim(u8, it, " \t\"'");
+                        if (v.len != 0) try out.append(gpa, .{
+                            .kind = .frontmatter,
+                            .raw = v,
+                            .byte_offset = offsetOf(source, v),
+                        });
+                    }
+                    in_list = false;
+                } else in_list = true;
+                break;
+            }
+        }
+        if (is_key) continue;
+        if (in_list) {
+            if (std.mem.startsWith(u8, trimmed, "- ")) {
+                const v = std.mem.trim(u8, trimmed[2..], " \t\"'");
+                if (v.len != 0) try out.append(gpa, .{
+                    .kind = .frontmatter,
+                    .raw = v,
+                    .byte_offset = offsetOf(source, v),
+                });
+            } else if (trimmed.len != 0 and !std.mem.startsWith(u8, trimmed, "#")) {
+                // A new key ends the list.
+                in_list = false;
+            }
+        }
+    }
+}
+
+fn offsetOf(source: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    // `needle` points into `source` when it came from a slice of it.
+    const base = @intFromPtr(source.ptr);
+    const at = @intFromPtr(needle.ptr);
+    return if (at >= base and at < base + source.len) at - base else 0;
+}
+
+fn extractInline(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(Link),
+    source: []const u8,
+    start: usize,
+    end: usize,
+) !void {
+    var i = start;
+    while (i < end) {
+        // Inline code is skipped for the same reason fenced code is: documentation
+        // that explains link syntax writes `[text](path)` and `[[wikilink]]` as
+        // illustrations. Measured on ~/docs, treating those as real links produced
+        // a steady stream of phantom broken links pointing at "path" and "url".
+        if (source[i] == '`') {
+            var ticks: usize = 0;
+            while (i + ticks < end and source[i + ticks] == '`') ticks += 1;
+            const fence = source[i .. i + ticks];
+            if (std.mem.indexOfPos(u8, source[0..end], i + ticks, fence)) |close| {
+                i = close + ticks;
+                continue;
+            }
+            // Unterminated: treat the backtick as ordinary text.
+            i += ticks;
+            continue;
+        }
+        // [[wikilink]]
+        if (i + 1 < end and source[i] == '[' and source[i + 1] == '[') {
+            if (std.mem.indexOfPos(u8, source[0..end], i + 2, "]]")) |close| {
+                const raw = std.mem.trim(u8, source[i + 2 .. close], " \t");
+                if (raw.len != 0) try out.append(gpa, .{
+                    .kind = .wiki,
+                    .raw = raw,
+                    .byte_offset = i,
+                });
+                i = close + 2;
+                continue;
+            }
+        }
+        // [text](target)
+        if (source[i] == '[') {
+            if (std.mem.indexOfScalarPos(u8, source[0..end], i, ']')) |rb| {
+                if (rb + 1 < end and source[rb + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, source[0..end], rb + 2, ')')) |rp| {
+                        var raw = std.mem.trim(u8, source[rb + 2 .. rp], " \t");
+                        // Strip an optional "title" after the target.
+                        if (std.mem.indexOfScalar(u8, raw, ' ')) |sp| raw = raw[0..sp];
+                        // A pure anchor is navigation inside the same document,
+                        // not a reference to another one. Recording it would make
+                        // it permanently unresolvable and therefore permanently
+                        // "broken" in every report.
+                        if (raw.len != 0 and raw[0] != '#') {
+                            try out.append(gpa, .{
+                                .kind = classify(raw),
+                                .raw = raw,
+                                .byte_offset = rb + 2,
+                            });
+                        }
+                        i = rp + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Bare kb:// URI outside any markdown link syntax.
+        if (source[i] == 'l' and std.mem.startsWith(u8, source[i..end], "kb://")) {
+            var j = i;
+            while (j < end and !std.ascii.isWhitespace(source[j]) and
+                source[j] != ')' and source[j] != ']' and source[j] != '`') j += 1;
+            const raw = source[i..j];
+            // A bare "kb://" is prose naming the scheme, not a reference to
+            // anything. Recording it guarantees a permanently broken link.
+            if (raw.len > "kb://".len) {
+                try out.append(gpa, .{ .kind = classify(raw), .raw = raw, .byte_offset = i });
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Extensions zkb indexes. A link to anything else is an asset reference.
+const document_exts = [_][]const u8{ ".md", ".txt", ".mdx" };
+
+fn classify(raw: []const u8) LinkKind {
+    if (std.mem.startsWith(u8, raw, "kb://")) {
+        return if (isAsset(raw)) .asset else .lore;
+    }
+    // Any scheme is external, not just http: file:// in particular is an absolute
+    // machine path that must never be joined onto a document's directory.
+    if (std.mem.indexOf(u8, raw, "://") != null) return .external;
+    if (std.mem.startsWith(u8, raw, "mailto:")) return .external;
+    if (isAsset(raw)) return .asset;
+    return .md;
+}
+
+fn isAsset(raw: []const u8) bool {
+    var t = raw;
+    if (std.mem.indexOfScalar(u8, t, '#')) |h| t = t[0..h];
+    const base = std.fs.path.basename(t);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return false;
+    const ext = base[dot..];
+    for (document_exts) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return false;
+    // No extension at all is a wikilink-style stem, not an asset.
+    return ext.len > 1;
+}

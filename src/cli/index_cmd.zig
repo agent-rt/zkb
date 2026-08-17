@@ -63,6 +63,12 @@ pub fn run(
     try w.writeAll("\n");
     try w.flush();
 
+    // Resolution is about the link graph, not about ingestion: it must run even
+    // when nothing needed indexing. The graph can be left unresolved by an
+    // interrupted run or by an index written before a resolution fix, and
+    // "nothing to index" is exactly when that goes unnoticed.
+    try resolveAndReport(gpa, &db, w);
+
     const pending_before = (try s.counts()).pending;
     if (pending_before == 0) {
         try w.writeAll("nothing to index\n");
@@ -93,6 +99,7 @@ pub fn run(
     try w.flush();
 
     const stats = try zkb.indexer.indexPending(gpa, io, &s, &embedder, cid, root, now_ms, .{});
+    try resolveAndReport(gpa, &db, w);
 
     const c = try s.counts();
     try w.print("\nindexed {d} doc(s), {d} chunk(s)", .{ stats.docs_indexed, stats.chunks_written });
@@ -127,6 +134,17 @@ pub fn run(
         return 1;
     }
     return 0;
+}
+
+/// Resolve pending links after a pass, never during one: a document can link to
+/// one that has not been indexed yet, and resolving inline would call those
+/// broken depending on filesystem iteration order.
+fn resolveAndReport(gpa: std.mem.Allocator, db: *zkb.sqlite.Db, w: *Writer) !void {
+    const resolved = zkb.maintain.resolveLinks(gpa, db) catch return;
+    if (resolved != 0) {
+        try w.print("  resolved {d} link(s)\n", .{resolved});
+        try w.flush();
+    }
 }
 
 /// "<file>@<sha16>+task:<sha8>" — see SPEC §3.3. The query task is part of the
