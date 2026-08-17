@@ -53,10 +53,8 @@ jobs:
           # Report a missing index as exit 3 with something to act on, rather
           # than failing or pretending to succeed.
           for cmd in records status; do
-            if out=$("$bin" "$cmd" 2>&1); then
-              echo "expected $cmd to exit 3 without an index, got 0"; exit 1
-            elif [ $? -ne 3 ]; then
-              echo "expected $cmd to exit 3, got $?"; exit 1
-            fi
-            grep -q 'zkb index' <<<"$out" || { echo "$cmd should say what to run"; exit 1; }
+            rc=0
+            out=$("$bin" "$cmd" 2>&1) || rc=$?
+            [ "$rc" -eq 3 ] || { echo "FAIL: $cmd expected exit 3, got $rc"; exit 1; }
+            grep -q 'zkb index' <<<"$out" || { echo "FAIL: $cmd should say what to run"; exit 1; }
           done
