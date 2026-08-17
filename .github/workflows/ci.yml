@@ -32,11 +32,31 @@ jobs:
       - name: zig build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
 
-      # No model in CI: 609 MiB per run is not worth it, so this covers the
-      # paths that must work without one.
+      # No model and no index in CI: 609 MiB per run is not worth it. This
+      # covers the paths that must work on a machine that has neither, and
+      # asserts the exit codes those paths promise — "no index yet" is a
+      # distinct, actionable outcome, not a crash and not success.
       - name: smoke
+        env:
+          ZKB_HOME: ${{ runner.temp }}/zkb-smoke
         run: |
-          ./zig-out/bin/zkb version
-          ./zig-out/bin/zkb --help > /dev/null || true
-          ./zig-out/bin/zkb records > /dev/null
-          ./zig-out/bin/zkb skill | head -1 | grep -q '^---$'
+          set -u
+          bin=./zig-out/bin/zkb
+
+          "$bin" version | grep -q '^zkb '
+
+          # Work without any state at all.
+          "$bin" skill | head -1 | grep -q '^---$'
+          "$bin" facts  > /dev/null
+          "$bin" doctor > /dev/null
+
+          # Report a missing index as exit 3 with something to act on, rather
+          # than failing or pretending to succeed.
+          for cmd in records status; do
+            if out=$("$bin" "$cmd" 2>&1); then
+              echo "expected $cmd to exit 3 without an index, got 0"; exit 1
+            elif [ $? -ne 3 ]; then
+              echo "expected $cmd to exit 3, got $?"; exit 1
+            fi
+            grep -q 'zkb index' <<<"$out" || { echo "$cmd should say what to run"; exit 1; }
+          done
