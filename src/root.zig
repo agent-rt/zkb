@@ -38,7 +38,7 @@ pub const build_options = @import("build_options");
 pub const model_registry = @import("embed/registry.zig");
 pub const embed = if (build_options.llama) @import("embed/llama.zig") else struct {};
 
-pub const version = "0.0.6";
+pub const version = "0.0.7";
 
 test {
     @import("std").testing.refAllDecls(@This());

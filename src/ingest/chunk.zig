@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const markdown = @import("markdown.zig");
+const utf8 = @import("../util/utf8.zig");
 
 pub const Config = struct {
     target_tokens: usize = 800,
@@ -153,9 +154,27 @@ fn emit(
     });
 }
 
-/// One block larger than max_tokens — in practice a long code block or table.
+/// One block larger than max_tokens — in practice a long code block, a long
+/// table, or a single unbroken paragraph.
+///
 /// Split on line boundaries so the pieces stay readable, and mark the
 /// continuations in the heading path so a hit is not mistaken for a whole unit.
+///
+/// Two cases the line loop alone gets wrong, both found on a real corpus:
+///
+///  - **A table loses its header.** Only the first piece carries
+///    `| path | content | when |`; every later piece is rows with no column
+///    names, which is close to meaningless both to a reader and to the
+///    embedding. The header is carried in the heading path instead of the text,
+///    because chunk text is a slice of the source — the heading path is already
+///    owned, and is already prepended to the text at embed time.
+///  - **A line can be longer than the limit.** Then there is nothing left to
+///    split on, and the old code emitted it whole: 2 of 2470 chunks on the real
+///    corpus came out over max_tokens, up to 1318. That silently spends the
+///    context margin that `n_ctx` was sized against, so a long enough line would
+///    reach ContextTooSmall. Cutting inside the line is the last resort — it
+///    breaks mid-sentence, which is worse to read but not worse than being
+///    truncated by the model.
 fn emitOversized(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(Chunk),
@@ -169,6 +188,15 @@ fn emitOversized(
     const base_path = try doc.headingPathAt(gpa, source, block_index);
     defer gpa.free(base_path);
 
+    // The header row of a table, as `[a | b | c]`. Kept to one line so the
+    // heading path stays readable in search output; the delimiter row carries
+    // no information and is dropped.
+    var header_buf: [512]u8 = undefined;
+    const table_header: ?[]const u8 = if (b.kind == .table)
+        tableHeader(source[b.byte_start..b.byte_end], &header_buf)
+    else
+        null;
+
     var part: usize = 0;
     var pos = b.byte_start;
     while (pos < b.byte_end) {
@@ -178,7 +206,12 @@ fn emitOversized(
             const nl = std.mem.indexOfScalarPos(u8, source, end, '\n') orelse b.byte_end;
             const line_end = @min(nl + 1, b.byte_end);
             const lt = try counter.count(source[end..line_end]);
-            if (tokens + lt > cfg.max_tokens and end > pos) break;
+            if (tokens + lt > cfg.max_tokens) {
+                if (end > pos) break;
+                // The first line alone is over the limit: cut inside it.
+                end = try cutLine(source, pos, line_end, counter, cfg.max_tokens);
+                break;
+            }
             tokens += lt;
             end = line_end;
             if (end >= b.byte_end) break;
@@ -187,10 +220,7 @@ fn emitOversized(
 
         const text = std.mem.trim(u8, source[pos..end], " \t\r\n");
         if (text.len != 0) {
-            const path = if (part == 0)
-                try gpa.dupe(u8, base_path)
-            else
-                try std.fmt.allocPrint(gpa, "{s} (cont. {d})", .{ base_path, part });
+            const path = try continuationPath(gpa, base_path, part, table_header);
             errdefer gpa.free(path);
             try out.append(gpa, .{
                 .idx = out.items.len,
@@ -204,6 +234,94 @@ fn emitOversized(
         }
         pos = end;
     }
+}
+
+/// `base`, plus `(cont. N)` after the first piece, plus a table's column names.
+fn continuationPath(
+    gpa: std.mem.Allocator,
+    base: []const u8,
+    part: usize,
+    table_header: ?[]const u8,
+) ![]u8 {
+    if (part == 0) {
+        // The first piece already contains the header row in its own text.
+        return gpa.dupe(u8, base);
+    }
+    if (table_header) |h| {
+        return std.fmt.allocPrint(gpa, "{s} (cont. {d}) {s}", .{ base, part, h });
+    }
+    return std.fmt.allocPrint(gpa, "{s} (cont. {d})", .{ base, part });
+}
+
+/// Column names of a markdown table, as `[a | b | c]`, or null if the first line
+/// does not look like a header. Truncated to fit `buf`.
+fn tableHeader(table: []const u8, buf: []u8) ?[]const u8 {
+    const nl = std.mem.indexOfScalar(u8, table, '\n') orelse table.len;
+    const line = std.mem.trim(u8, table[0..nl], " \t\r|");
+    if (line.len == 0) return null;
+
+    var w: usize = 0;
+    if (w + 1 > buf.len) return null;
+    buf[w] = '[';
+    w += 1;
+
+    var first = true;
+    var it = std.mem.splitScalar(u8, line, '|');
+    while (it.next()) |raw| {
+        const cell = std.mem.trim(u8, raw, " \t");
+        if (cell.len == 0) continue;
+        const sep: []const u8 = if (first) "" else " | ";
+        if (w + sep.len + cell.len + 1 > buf.len) break;
+        @memcpy(buf[w..][0..sep.len], sep);
+        w += sep.len;
+        @memcpy(buf[w..][0..cell.len], cell);
+        w += cell.len;
+        first = false;
+    }
+    if (first) return null; // no cells
+    if (w + 1 > buf.len) return null;
+    buf[w] = ']';
+    w += 1;
+    return buf[0..w];
+}
+
+/// Largest end offset in `source[pos..limit]` whose token count fits `max`,
+/// always on a UTF-8 character boundary and always past `pos`.
+///
+/// Walks forward in byte steps rather than binary searching: each step is one
+/// tokenizer call, and stepping is easier to reason about than a search whose
+/// invariant depends on token counts being monotonic in length (they are, but
+/// not obviously so for a BPE tokenizer).
+fn cutLine(
+    source: []const u8,
+    pos: usize,
+    limit: usize,
+    counter: TokenCounter,
+    max: usize,
+) !usize {
+    const step = 256;
+    var end = pos;
+    while (true) {
+        // Never cut a character in half: the piece is stored and embedded as
+        // text, and invalid UTF-8 in an FTS column is its own failure.
+        //
+        // truncate() must be given the whole remaining text and a byte budget —
+        // handing it a slice whose length already equals the budget makes it a
+        // no-op, which is how the first version of this cut mid-character.
+        const budget = @min(end + step - pos, limit - pos);
+        const next = pos + utf8.truncate(source[pos..limit], budget);
+        if (next <= end) break;
+        if (try counter.count(source[pos..next]) > max) break;
+        end = next;
+        if (end >= limit) break;
+    }
+    if (end > pos) return end;
+
+    // Even one step is too many: take the smallest whole-character prefix so
+    // the loop in the caller still advances.
+    var n = @min(step, limit - pos);
+    while (n > 1 and utf8.truncate(source[pos..], n) != n) n -= 1;
+    return pos + @max(n, 1);
 }
 
 // ---------------------------------------------------------------------------

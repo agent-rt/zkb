@@ -289,3 +289,71 @@ test "empty and whitespace-only documents produce no chunks" {
         try testing.expectEqual(@as(usize, 0), chunks.items.len);
     }
 }
+
+test "一行超过上限时按字符边界切开，不整行发出" {
+    // 一段没有任何换行的长文本。按行切到这里就没得切了，旧实现整行发出，
+    // 结果是 chunk 超过 max_tokens——真实语料上出现过 2 个，最大 1318。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "# Doc\n\n");
+    // 中日文，一个字三字节：确认切点落在字符边界上，而不是把字劈开。
+    for (0..2000) |_| try buf.appendSlice(gpa, "这是一段很长的中文内容");
+    try buf.appendSlice(gpa, "\n");
+
+    var doc = try scan(buf.items);
+    defer doc.deinit(gpa);
+
+    var bc: chunk.ByteCounter = .{};
+    var chunks = try chunk.split(gpa, buf.items, &doc, bc.counter(), .{});
+    defer chunks.deinit(gpa);
+
+    try testing.expect(chunks.items.len > 1);
+    for (chunks.items) |c| {
+        try testing.expect(c.n_tokens <= 1024);
+        // 切点必须是合法 UTF-8，否则写进 FTS 列就是另一个故障。
+        try testing.expect(std.unicode.utf8ValidateSlice(c.text));
+        try testing.expect(c.byte_end > c.byte_start);
+    }
+
+    // 覆盖率：分段应当基本铺满源文本，只差首尾修剪掉的空白。
+    var covered: usize = 0;
+    for (chunks.items) |c| covered += c.byte_end - c.byte_start;
+    try testing.expect(covered + 64 >= buf.items.len);
+}
+
+test "被切开的表格，续块的标题路径带上列名" {
+    // 表头只在第一段里。续段是一堆没有列名的行——对读者和 embedding 都近乎无意义。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "# Doc\n\n## 现行\n\n| 路径 | 内容 | 何时该读 |\n|---|---|---|\n");
+    for (0..200) |i| {
+        try buf.print(gpa, "| path/to/file-{d}.md | 这一行的说明足够长，用来把表格推过分块上限 | 需要的时候 |\n", .{i});
+    }
+
+    var doc = try scan(buf.items);
+    defer doc.deinit(gpa);
+
+    var bc: chunk.ByteCounter = .{};
+    var chunks = try chunk.split(gpa, buf.items, &doc, bc.counter(), .{});
+    defer chunks.deinit(gpa);
+
+    var conts: usize = 0;
+    for (chunks.items) |c| {
+        if (std.mem.indexOf(u8, c.heading_path, "(cont.") == null) continue;
+        conts += 1;
+        // 列名必须在标题路径里——它在嵌入时会被前置到文本前面。
+        try testing.expect(std.mem.indexOf(u8, c.heading_path, "路径 | 内容 | 何时该读") != null);
+        // 分隔行不带信息，不该出现。
+        try testing.expect(std.mem.indexOf(u8, c.heading_path, "---") == null);
+        // 仍然要能看出它属于哪个小节。
+        try testing.expect(std.mem.indexOf(u8, c.heading_path, "现行") != null);
+    }
+    try testing.expect(conts > 0);
+
+    // 第一段自己就含表头，不该重复。
+    for (chunks.items) |c| {
+        if (std.mem.indexOf(u8, c.heading_path, "(cont.") != null) continue;
+        if (std.mem.indexOf(u8, c.text, "| 路径 |") == null) continue;
+        try testing.expect(std.mem.indexOf(u8, c.heading_path, "路径 | 内容") == null);
+    }
+}
