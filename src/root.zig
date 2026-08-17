@@ -7,6 +7,7 @@ pub const sqlite = @import("db/sqlite.zig");
 pub const schema = @import("db/schema.zig");
 pub const store = @import("db/store.zig");
 pub const markdown = @import("ingest/markdown.zig");
+pub const md4c = @import("ingest/md4c.zig");
 pub const chunk = @import("ingest/chunk.zig");
 pub const scan = @import("ingest/scan.zig");
 pub const csv = @import("ingest/csv.zig");
@@ -38,7 +39,7 @@ pub const build_options = @import("build_options");
 pub const model_registry = @import("embed/registry.zig");
 pub const embed = if (build_options.llama) @import("embed/llama.zig") else struct {};
 
-pub const version = "0.0.7";
+pub const version = "0.0.8";
 
 test {
     @import("std").testing.refAllDecls(@This());

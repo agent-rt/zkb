@@ -12,6 +12,7 @@
 //!   - byte offsets, so a hit can be traced back to the source file
 
 const std = @import("std");
+const md4c = @import("md4c.zig");
 
 pub const BlockKind = enum {
     heading,
@@ -107,6 +108,8 @@ pub fn scan(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
             pos = close.next_line;
         }
     }
+
+    const body_offset = pos;
 
     while (pos < source.len) {
         const line_end = lineEnd(source, pos);
@@ -215,12 +218,134 @@ pub fn scan(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         }
     }
 
+    const out_blocks = try blocks.toOwnedSlice(gpa);
+    errdefer gpa.free(out_blocks);
+    var out_headings = try headings.toOwnedSlice(gpa);
+    errdefer gpa.free(out_headings);
+
+    // 标题栈改由 md4c 给出。行扫描器只认顶格的 ATX，在 CommonMark 官方测试集上标题
+    // 只对 37%：setext、缩进 1-3 空格的 ATX 全部漏掉，而 HTML 块里的 `#` 被当成标题还
+    // 会重置标题路径，让后面的段落挂到一个不存在的标题下。
+    //
+    // 块仍由扫描器切分——它对段落、围栏、表格的判断是好的，装箱也只需要边界。md4c 在
+    // 这里只负责回答「此处生效的标题栈是什么」，那是 heading_path 的唯一来源。
+    //
+    // 喂进去的是 frontmatter 之后的正文：`node_type: wiki` 紧跟 `---` 按 CommonMark 是
+    // 一个 setext H2，整库 84 个 frontmatter 会各自变出一个假标题。
+    if (rebuildHeadings(gpa, source, body_offset, out_blocks)) |rebuilt| {
+        gpa.free(out_headings);
+        out_headings = rebuilt;
+        title = null;
+        for (out_headings) |h| {
+            if (h.level == 1) {
+                title = std.mem.trim(u8, source[h.text_start..h.text_end], " \t");
+                break;
+            }
+        }
+    } else |_| {
+        // md4c 只在分配失败时会失败。退回扫描器自己的标题：标题栈差一点，比整篇文档
+        // 索引不了好。
+    }
+
     return .{
         .frontmatter = frontmatter,
         .title = title,
-        .blocks = try blocks.toOwnedSlice(gpa),
-        .headings = try headings.toOwnedSlice(gpa),
+        .blocks = out_blocks,
+        .headings = out_headings,
     };
+}
+
+/// md4c 的标题映射成 Document.Heading。
+///
+/// 引用块里的标题不计入：`> # 注意` 是被引用的内容，不是这篇文档的结构，让它改变后续
+/// 段落的标题路径是错的。md4c 给了 quote_depth，所以这是一个明写的决定，而不是碰巧。
+fn rebuildHeadings(
+    gpa: std.mem.Allocator,
+    source: []const u8,
+    body_offset: usize,
+    blocks: []const Block,
+) ![]Document.Heading {
+    const hs = try md4c.headings(gpa, source[body_offset..]);
+    defer gpa.free(hs);
+
+    var out: std.ArrayList(Document.Heading) = .empty;
+    errdefer out.deinit(gpa);
+
+    for (hs) |h| {
+        if (h.quote_depth != 0) continue;
+        const at = body_offset + h.byte_offset;
+        const text = headingSpan(source, at);
+        try out.append(gpa, .{
+            .level = h.level,
+            .text_start = text.start,
+            .text_end = text.end,
+            .block_index = blockIndexAt(blocks, at),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// 标题正文的绝对区间。`at` 是标题起始行的行首。
+///
+/// ATX 去掉前导 `#` 与尾部的收尾 `#`。setext 的正文**可以跨多行**——正文一直延续到全为
+/// `=` 或 `-` 的下划线行为止，只取第一行会把 `Foo\nbar` 这样的标题截成一半。
+fn headingSpan(source: []const u8, at: usize) struct { start: usize, end: usize } {
+    const first_end = lineEnd(source, at);
+    const line = trimEol(source[at..first_end]);
+
+    var i: usize = 0;
+    while (i < line.len and i < 3 and line[i] == ' ') i += 1;
+    var hashes: usize = 0;
+    while (i + hashes < line.len and line[i + hashes] == '#') hashes += 1;
+
+    if (hashes != 0 and hashes <= 6) {
+        var start = i + hashes;
+        while (start < line.len and (line[start] == ' ' or line[start] == '\t')) start += 1;
+        var end = line.len;
+        while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
+        // 收尾序列：`## foo ##` 的正文是 foo，但 `# foo#` 的正文是 foo# —— 只有前面隔着
+        // 空白才算收尾。
+        var trailing = end;
+        while (trailing > start and line[trailing - 1] == '#') trailing -= 1;
+        if (trailing != end and trailing > start and
+            (line[trailing - 1] == ' ' or line[trailing - 1] == '\t'))
+        {
+            end = trailing;
+            while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
+        } else if (trailing == start) {
+            end = start; // 整行都是 `#`
+        }
+        return .{ .start = at + start, .end = at + end };
+    }
+
+    // setext：往下走到下划线行，正文是它之前的全部。
+    var text_end = at + line.len;
+    var p = if (first_end < source.len) first_end + 1 else source.len;
+    while (p < source.len) {
+        const le = lineEnd(source, p);
+        const l = std.mem.trim(u8, trimEol(source[p..le]), " \t");
+        if (l.len != 0 and (allOf(l, '=') or allOf(l, '-'))) break;
+        if (l.len == 0) break;
+        text_end = p + trimEol(source[p..le]).len;
+        p = if (le < source.len) le + 1 else source.len;
+    }
+    const start = at + (std.mem.indexOfNone(u8, source[at..text_end], " \t") orelse 0);
+    return .{ .start = start, .end = text_end };
+}
+
+fn allOf(s: []const u8, ch: u8) bool {
+    for (s) |c| if (c != ch) return false;
+    return s.len != 0;
+}
+
+/// 含 `at` 的块下标，没有就取最后一个起点不晚于它的块。
+fn blockIndexAt(blocks: []const Block, at: usize) usize {
+    var best: usize = 0;
+    for (blocks, 0..) |b, i| {
+        if (b.byte_start > at) break;
+        best = i;
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------

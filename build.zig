@@ -93,6 +93,30 @@ pub fn build(b: *std.Build) void {
     sqlite_lib.root_module.addIncludePath(b.path("third_party/sqlite"));
     sqlite_lib.root_module.addIncludePath(b.path("third_party/sqlite-vec"));
 
+    // ---------------------------------------------------------------- md4c
+    // A CommonMark parser, used for one job: the heading structure. The
+    // hand-written line scanner in src/ingest/markdown.zig gets that right on
+    // 37% of CommonMark's own test suite — it cannot see setext headings,
+    // indented ATX headings, or that a `#` inside an HTML block is not one.
+    // Block packing stays with the scanner, which is fine at it.
+    //
+    // 7.7k lines in two files, MIT. Kept separate from the sqlite library so a
+    // problem in either is obvious from which artifact fails to build.
+    const md4c_lib = b.addLibrary(.{
+        .name = "zkb_md4c",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    md4c_lib.root_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/md4c.c"),
+        .flags = &.{ "-std=c99", "-Wno-everything" },
+    });
+    md4c_lib.root_module.addIncludePath(b.path("third_party/md4c"));
+
     // ------------------------------------------------------------ zkb module
     const zkb_mod = b.addModule("zkb", .{
         .root_source_file = b.path("src/root.zig"),
@@ -109,6 +133,8 @@ pub fn build(b: *std.Build) void {
     zkb_mod.addCMacro("SQLITE_CORE", "1");
     zkb_mod.addCMacro("SQLITE_VEC_STATIC", "1");
     zkb_mod.linkLibrary(sqlite_lib);
+    zkb_mod.addIncludePath(b.path("third_party/md4c"));
+    zkb_mod.linkLibrary(md4c_lib);
     if (want_llama) addLlamaBindings(b, zkb_mod);
 
     // ----------------------------------------------------------- executable
