@@ -31,7 +31,7 @@ pub fn run(
     // around, and for no gain: the daemon has the model resident and this
     // process would have to load its own.
     if (!opts.force) {
-        if (try viaDaemon(gpa, io, layout.sock, w)) |code| return code;
+        if (try viaDaemon(gpa, io, &layout, w)) |code| return code;
     }
 
     const root = opts.root orelse blk: {
@@ -135,7 +135,10 @@ pub fn run(
         return 1;
     }
 
-    if (stats.docs_failed != 0) {
+    // `stats` 只覆盖 docs 集合；kb 集合（记忆与 records）的失败由 indexKb 产生，只体现在
+    // `c.failed` 里。按 stats 判断会漏掉整整一类——一个列不一致的 csv 就是这样只留下
+    // 一个孤零零的计数，而原因明明已经写进 docs.index_error 了。
+    if (c.failed != 0) {
         try w.writeAll("\nfailed documents:\n");
         var st = try db.prepare(
             "SELECT rel_path, index_error FROM docs WHERE index_error IS NOT NULL LIMIT 20",
@@ -155,8 +158,8 @@ pub fn run(
 /// the work in this process. `--force` also takes the local path: re-embedding
 /// everything is a deliberate, long operation whose progress the user wants to
 /// watch, not something to hand to a background thread.
-fn viaDaemon(gpa: std.mem.Allocator, io: std.Io, sock: []const u8, w: *Writer) !?u8 {
-    var c = zkb.ipc_client.Client.connect(io, sock) catch return null;
+fn viaDaemon(gpa: std.mem.Allocator, io: std.Io, layout: *const zkb.paths.Layout, w: *Writer) !?u8 {
+    var c = zkb.ipc_client.Client.connect(io, layout.sock) catch return null;
     defer c.close();
 
     {
@@ -183,9 +186,14 @@ fn viaDaemon(gpa: std.mem.Allocator, io: std.Io, sock: []const u8, w: *Writer) !
         if (intOf(obj, "scanning") != 0) continue;
         if (intOf(obj, "pending") != 0) continue;
 
+        const failed = intOf(obj, "failed");
         try w.print("  {d} docs, {d} chunks, {d} failed\n", .{
-            intOf(obj, "docs"), intOf(obj, "chunks"), intOf(obj, "failed"),
+            intOf(obj, "docs"), intOf(obj, "chunks"), failed,
         });
+        // 单机路径会把失败文档和原因一起打印；走 daemon 时只回了计数，于是同一条命令
+        // 有没有 daemon 决定你看不看得到解释。原因一直写在 docs.index_error 里，这里
+        // 只是把它接回来——一个孤零零的 `3 failed` 会让人以为是自己没建对。
+        if (failed != 0) try printFailedDocs(gpa, layout, w);
         if (intOf(obj, "drift") != 0) {
             try w.writeAll("  WARNING index drift — run: zkb daemon stop && zkb index\n");
             return 1;
@@ -338,4 +346,23 @@ fn modelId(gpa: std.mem.Allocator, io: std.Io, model_path: []const u8) ![]u8 {
         digest[0..16],
         task_digest[0..8],
     });
+}
+
+
+/// 失败文档及原因，读自索引。daemon 路径用它补上单机路径本来就有的输出。
+fn printFailedDocs(gpa: std.mem.Allocator, layout: *const zkb.paths.Layout, w: *Writer) !void {
+    const db_path = gpa.dupeZ(u8, layout.db) catch return;
+    defer gpa.free(db_path);
+    var db = zkb.store.open(db_path, .read_only) catch return;
+    defer db.close();
+
+    var st = db.prepare(
+        "SELECT rel_path, index_error FROM docs WHERE index_error IS NOT NULL LIMIT 20",
+    ) catch return;
+    defer st.finalize();
+
+    try w.writeAll("\nfailed documents:\n");
+    while (st.step() catch false) {
+        try w.print("  {s}: {s}\n", .{ st.columnText(0), st.columnText(1) });
+    }
 }

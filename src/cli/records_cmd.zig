@@ -85,6 +85,24 @@ fn listTypes(gpa: std.mem.Allocator, db: *zkb.sqlite.Db, w: *Writer) !u8 {
         gpa.free(types);
     }
     if (types.len == 0) {
+        // 「还没有类型」和「建了但没索引进去」需要完全不同的建议，而后者更常见也更难查：
+        // csv 明明在那儿，路径也对，却被告知去创建它。失败原因一直写在 docs.index_error
+        // 里，只是没有一条命令把它接到这里——只有 `zkb maintain` 会报，而遇到这种情况的
+        // 人不会先想到去跑维护检查。
+        const failed = try failedRecordFiles(gpa, db);
+        defer {
+            for (failed) |f| {
+                gpa.free(f.path);
+                gpa.free(f.reason);
+            }
+            gpa.free(failed);
+        }
+        if (failed.len != 0) {
+            try w.print("{d} 个 csv 没能索引进来：\n\n", .{failed.len});
+            for (failed) |f| try w.print("  {s}\n    {s}\n", .{ f.path, f.reason });
+            try w.writeAll("\n修好之后：zkb index\n");
+            return 3;
+        }
         try w.writeAll("no records types yet\n");
         try w.writeAll("create one: ~/.zkb/data/records/<type>/<file>.csv, then: zkb index\n");
         return 0;
@@ -765,4 +783,70 @@ fn jsonStr(v: std.json.Value, key: []const u8) []const u8 {
         .string => |s| s,
         else => "",
     };
+}
+
+
+pub const FailedFile = struct { path: []u8, reason: []u8 };
+
+/// records/ 下索引失败的 csv 及原因。原因由索引器写进 docs.index_error。
+pub fn failedRecordFiles(gpa: std.mem.Allocator, db: *zkb.sqlite.Db) ![]FailedFile {
+    var out: std.ArrayList(FailedFile) = .empty;
+    errdefer {
+        for (out.items) |f| {
+            gpa.free(f.path);
+            gpa.free(f.reason);
+        }
+        out.deinit(gpa);
+    }
+
+    var st = try db.prepare(
+        \\SELECT rel_path, index_error FROM docs
+        \\WHERE index_error IS NOT NULL AND rel_path LIKE 'records/%'
+        \\ORDER BY rel_path
+    );
+    defer st.finalize();
+    while (try st.step()) {
+        try out.append(gpa, .{
+            .path = try gpa.dupe(u8, st.columnText(0)),
+            .reason = try gpa.dupe(u8, st.columnText(1)),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+// ---------------------------------------------------------------------- tests
+
+test "索引失败的 csv 能被查出来，而不是只留下一个计数" {
+    // 一个列不一致的 csv 会让整个 records 类型不存在，而这个命令原本回答
+    // 「no records types yet / create one: ...」——建议是错的：你已经建了，路径也对。
+    // 原因一直写在 docs.index_error 里，只有 `zkb maintain` 会报，而遇到这种情况的人
+    // 不会先想到去跑维护检查。
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var db = try zkb.store.open(":memory:", .read_write);
+    defer db.close();
+    var s = zkb.store.Store.init(&db);
+
+    const cid = try s.ensureCollection("kb", "/tmp/kb", 1000);
+    const bad = try s.upsertDocContent(cid, "records/mixed/a.csv", "sha-a", 10, 1000);
+    _ = try s.upsertDocContent(cid, "records/ok/b.csv", "sha-b", 10, 1000);
+    // records 之外的失败不该混进这个提示里。
+    const other = try s.upsertDocContent(cid, "memory/note.md", "sha-c", 10, 1000);
+
+    try s.markFailed(bad, "header differs from other files of type 'mixed' (e.g. b.csv)");
+    try s.markFailed(other, "some unrelated failure");
+
+    const failed = try failedRecordFiles(gpa, &db);
+    defer {
+        for (failed) |f| {
+            gpa.free(f.path);
+            gpa.free(f.reason);
+        }
+        gpa.free(failed);
+    }
+
+    try testing.expectEqual(@as(usize, 1), failed.len);
+    try testing.expectEqualStrings("records/mixed/a.csv", failed[0].path);
+    try testing.expect(std.mem.indexOf(u8, failed[0].reason, "header differs") != null);
 }
