@@ -10,8 +10,7 @@
 //! the final name.
 
 const std = @import("std");
-const paths = @import("../util/paths.zig");
-const hash = @import("../util/hash.zig");
+const zkb = @import("zkb");
 
 const Writer = std.Io.Writer;
 
@@ -61,7 +60,7 @@ pub fn pull(
     w: *Writer,
     q: Quant,
 ) !void {
-    var layout = try paths.resolve(gpa, env);
+    var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
     const s = spec(q);
@@ -81,7 +80,7 @@ pub fn pull(
     if (std.Io.Dir.accessAbsolute(io, final, .{})) |_| {
         try w.print("verifying existing {s} ...\n", .{s.file});
         try w.flush();
-        const digest = try hash.fileSha256(io, final);
+        const digest = try zkb.hash.fileSha256(io, final);
         if (std.mem.eql(u8, &digest, s.sha256)) {
             try w.print("already present and verified: {s}\n", .{final});
             return;
@@ -176,7 +175,7 @@ pub fn pull(
 
     try w.print("verifying sha256 ...\n", .{});
     try w.flush();
-    const digest = try hash.fileSha256(io, part);
+    const digest = try zkb.hash.fileSha256(io, part);
     if (!std.mem.eql(u8, &digest, s.sha256)) {
         try w.print("sha256 mismatch\n  expected {s}\n  got      {s}\n", .{ s.sha256, digest });
         // The .part is only worth keeping as a *correct* resumable prefix.

@@ -7,6 +7,13 @@ const sqlite = zkb.sqlite;
 
 const testing = std.testing;
 
+test {
+    _ = @import("store_test.zig");
+    _ = @import("chunk_test.zig");
+    _ = @import("search_test.zig");
+    _ = @import("tokenizer_test.zig");
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

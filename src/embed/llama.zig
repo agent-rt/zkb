@@ -49,7 +49,17 @@ pub const Pooling = enum {
 };
 
 pub const Options = struct {
-    n_ctx: u32 = 8192,
+    /// Chunks are capped at 1024 tokens (SPEC §4.2), so a large context buys
+    /// nothing and costs real time: llama.cpp sizes its compute buffers from
+    /// n_batch, and every decode pays for them whether or not the work fills it.
+    ///
+    /// Measured on M2 Pro with an 841-token chunk (docs/experiments/E5-indexing.md):
+    ///   n_ctx 8192 -> 562 ms   4096 -> 425 ms   2048 -> 353 ms   1536 -> 334 ms
+    ///
+    /// 2048 rather than 1536: only 5% off the floor, and it leaves 2x the chunk
+    /// ceiling as headroom so an unusually long query still embeds instead of
+    /// failing with ContextTooSmall.
+    n_ctx: u32 = 2048,
     pooling: Pooling = .unspecified,
     n_gpu_layers: i32 = 999,
     /// Silence llama.cpp's load-time chatter. Diagnostics go through zkb's

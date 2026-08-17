@@ -61,6 +61,12 @@ pub fn build(b: *std.Build) void {
         .file = b.path("src/db/sqlite_helpers.c"),
         .flags = &.{ "-std=c11", "-Wno-everything" },
     });
+    // Custom FTS5 tokenizer. Lives with the sqlite lib because it needs the
+    // fts5 api declarations, not because it is part of sqlite.
+    sqlite_lib.root_module.addCSourceFile(.{
+        .file = b.path("src/db/fts5_cjk.c"),
+        .flags = &.{ "-std=c11", "-Wno-everything" },
+    });
     sqlite_lib.root_module.addIncludePath(b.path("third_party/sqlite"));
     sqlite_lib.root_module.addIncludePath(b.path("third_party/sqlite-vec"));
 
@@ -136,6 +142,22 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_e3.addArgs(args);
         const e3_step = b.step("e3", "E3: Qwen3-Embedding pooling correctness (blocking)");
         e3_step.dependOn(&run_e3.step);
+
+        const e5 = b.addExecutable(.{
+            .name = "e5_ctx",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/experiments/e5_ctx.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "zkb", .module = zkb_mod }},
+            }),
+        });
+        addLlamaLinks(b, e5.root_module, is_apple);
+        const run_e5 = b.addRunArtifact(e5);
+        if (b.args) |args| run_e5.addArgs(args);
+        const e5_step = b.step("e5-ctx", "E5b: embedding throughput vs n_ctx");
+        e5_step.dependOn(&run_e5.step);
     }
 
     // ------------------------------------------------- llama.cpp cmake step

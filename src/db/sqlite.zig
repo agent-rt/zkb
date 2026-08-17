@@ -20,6 +20,9 @@ pub const c = @cImport({
     @cInclude("sqlite-vec.h");
 });
 
+/// Registers the `zkb_cjk` FTS5 tokenizer (src/db/fts5_cjk.c).
+extern fn zkb_register_cjk_tokenizer(db: *c.sqlite3) c_int;
+
 extern fn zkb_bind_text_transient(stmt: *c.sqlite3_stmt, idx: c_int, value: [*]const u8, n_bytes: c_int) c_int;
 extern fn zkb_bind_blob_transient(stmt: *c.sqlite3_stmt, idx: c_int, value: *const anyopaque, n_bytes: c_int) c_int;
 
@@ -62,6 +65,13 @@ pub const Db = struct {
         // Third arg (api routines) is ignored: built with SQLITE_CORE.
         if (c.sqlite3_vec_init(h, &verr, null) != c.SQLITE_OK) {
             if (verr) |m| c.sqlite3_free(m);
+            _ = c.sqlite3_close_v2(h);
+            return error.SqliteOpen;
+        }
+
+        // FTS5 tokenizers are per-connection too: without this, opening a
+        // table declared with tokenize='zkb_cjk' fails outright.
+        if (zkb_register_cjk_tokenizer(h) != c.SQLITE_OK) {
             _ = c.sqlite3_close_v2(h);
             return error.SqliteOpen;
         }

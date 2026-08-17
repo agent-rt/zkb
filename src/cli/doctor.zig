@@ -10,8 +10,6 @@ const std = @import("std");
 // second instance of the module (and its @cImport) into this binary.
 const zkb = @import("zkb");
 const sqlite = zkb.sqlite;
-const paths = @import("../util/paths.zig");
-const hash = @import("../util/hash.zig");
 
 const Writer = std.Io.Writer;
 
@@ -51,7 +49,7 @@ pub fn run(
 
     // ---------------------------------------------------------------- layout
     try w.print("layout\n", .{});
-    var layout = paths.resolve(gpa, env) catch |err| {
+    var layout = zkb.paths.resolve(gpa, env) catch |err| {
         try fail(w, &r, "cannot resolve ~/.zkb: {t}", .{err});
         return r;
     };
@@ -168,7 +166,7 @@ pub fn run(
         return r;
     };
 
-    const digest = hash.fileSha256(io, model_path) catch |err| {
+    const digest = zkb.hash.fileSha256(io, model_path) catch |err| {
         try fail(w, &r, "cannot hash model: {t}", .{err});
         try printSummary(w, r);
         return r;

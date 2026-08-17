@@ -4,6 +4,17 @@
 //! derived index that can be deleted and rebuilt. See docs REQ/SPEC.
 
 pub const sqlite = @import("db/sqlite.zig");
+pub const schema = @import("db/schema.zig");
+pub const store = @import("db/store.zig");
+pub const markdown = @import("ingest/markdown.zig");
+pub const chunk = @import("ingest/chunk.zig");
+pub const scan = @import("ingest/scan.zig");
+pub const indexer = @import("ingest/indexer.zig");
+pub const fts_query = @import("search/fts_query.zig");
+pub const rrf = @import("search/rrf.zig");
+pub const hybrid = @import("search/hybrid.zig");
+pub const hash = @import("util/hash.zig");
+pub const paths = @import("util/paths.zig");
 pub const build_options = @import("build_options");
 
 /// Only present when built with -Dllama (the default). Guarded so the storage
