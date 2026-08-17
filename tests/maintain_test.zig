@@ -450,3 +450,53 @@ test "a section title drops its number so two numberings compare equal" {
     try testing.expectEqualStrings("Resource IDs", T.sectionTitleForTest("Resource IDs"));
     try testing.expectEqualStrings("安全机制", T.sectionTitleForTest("a > b > 4. 安全机制"));
 }
+
+test "太短的 chunk 不参与相似度比较" {
+    // 真实语料上这一类占了 near_duplicate 报告的 8/18：五份事故报告共用日式商务信函的
+    // 固定结尾，`以上` 是 2 个 token，任意两个这样的 chunk 余弦都是 1.000。那说明的是
+    // 「短」，不是「重复」——而它把真正需要看的几对埋掉了。
+    //
+    // 两组 chunk 用同一个向量，余弦都是 1.000；唯一的变量是 n_tokens。
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var vs = store.Store.init(&db);
+
+    var vec: [1024]f32 = @splat(0);
+    vec[7] = 1.0;
+    const v = vec[0..@intCast(zkb.schema.embedding_dim)];
+
+    const cid = try vs.ensureCollection("docs", "/tmp/docs", 1000);
+    const doc_a = try vs.upsertDocContent(cid, "a.md", "sha-a", 10, 1000);
+    const doc_b = try vs.upsertDocContent(cid, "b.md", "sha-b", 10, 1000);
+
+    for ([_]i64{ doc_a, doc_b }) |doc| {
+        _ = try vs.insertChunk(cid, doc, .{
+            .idx = 0,
+            .heading_path = "报告",
+            .byte_start = 0,
+            .byte_end = 6,
+            .n_tokens = 2,
+            .text = "以上",
+        }, v);
+    }
+
+    var r1 = try zkb.maintain_vec.run(gpa, &db, .{});
+    defer r1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r1.pairs.len);
+
+    // 同样两篇各加一个足够长、向量也相同的 chunk —— 这一对该报出来。
+    for ([_]i64{ doc_a, doc_b }) |doc| {
+        _ = try vs.insertChunk(cid, doc, .{
+            .idx = 1,
+            .heading_path = "报告 > 原因",
+            .byte_start = 10,
+            .byte_end = 400,
+            .n_tokens = 300,
+            .text = "本事象は複数の要因が重なって発生し、自動復旧が期待どおりに働かなかった",
+        }, v);
+    }
+
+    var r2 = try zkb.maintain_vec.run(gpa, &db, .{});
+    defer r2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), r2.pairs.len);
+}

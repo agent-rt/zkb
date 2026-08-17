@@ -148,9 +148,23 @@ fn isNavigation(text: []const u8) bool {
     return linkDensity(text) >= nav_link_density;
 }
 
+/// 参与相似度比较的最小 token 数。
+///
+/// 太短的 chunk 没有方向：`以上` 是 2 个 token，任意两个这样的 chunk 余弦都是 1.000，
+/// 而那说明的是「短」不是「重复」。真实语料上这一类占了 near_duplicate 报告的 8/18——
+/// 五份事故报告共用日式商务信函的固定结尾，于是两两成对，把真正需要看的那几对埋掉。
+///
+/// 门槛按实测定：全库 2499 个 chunk 里 51 个低于 20 token，而它们全都是署名、结束语、
+/// 单行小节这类没有独立信息的片段。已有的 `fragment` 检查专门报告这种碎片，所以在这里
+/// 排除它们不会让问题消失，只是让它出现在正确的检查项里。
+const min_compare_tokens: i64 = 20;
+
 // The classification rules are what E7 measured as load-bearing, so they are
 // reachable from tests without exposing the internals they run on.
 pub const isNavigationForTest = isNavigation;
+
+/// 同上：门槛本身要可测，否则改动它没有对照物。
+pub const min_compare_tokens_for_test = min_compare_tokens;
 
 /// How many leading path segments two files share, ignoring their basenames.
 fn sharedDepth(a: []const u8, b: []const u8) usize {
@@ -197,6 +211,8 @@ const ChunkRow = struct {
     collection_id: i64,
     /// A table of contents rather than prose. Excluded from the pair check.
     nav: bool,
+    /// Too short for its embedding direction to mean anything. Also excluded.
+    tiny: bool,
 };
 
 /// Compare every chunk against every other, and classify what comes back.
@@ -224,7 +240,7 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, cfg: Config) !Result {
     var dim: usize = 0;
     {
         var st = try db.prepare(
-            \\SELECT c.id, c.doc_id, d.collection_id, v.embedding, c.text
+            \\SELECT c.id, c.doc_id, d.collection_id, v.embedding, c.text, c.n_tokens
             \\FROM chunks c
             \\JOIN docs d ON d.id = c.doc_id
             \\JOIN vec_chunks v ON v.chunk_id = c.id
@@ -244,6 +260,7 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, cfg: Config) !Result {
                 .doc_id = st.columnI64(1),
                 .collection_id = st.columnI64(2),
                 .nav = isNavigation(st.columnText(4)),
+                .tiny = st.columnI64(5) < min_compare_tokens,
             });
             const at = vectors.items.len;
             try vectors.resize(gpa, at + dim);
@@ -307,6 +324,8 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, cfg: Config) !Result {
             // A pair of tables of contents is not a duplicate-knowledge finding,
             // and on this corpus it was the largest single class of them.
             if (chunks.items[i].nav or chunks.items[j].nav) continue;
+            // Nor is a pair of two-token sign-offs. See min_compare_tokens.
+            if (chunks.items[i].tiny or chunks.items[j].tiny) continue;
             try raw_pairs.append(gpa, .{ .a = i, .b = j, .cos = cos });
         }
     }
