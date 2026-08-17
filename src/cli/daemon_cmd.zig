@@ -33,10 +33,32 @@ pub fn start(
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
+    // The log below is opened before the daemon is spawned, so run/ has to
+    // exist first. Every other writing command already does this; without it a
+    // first `zkb daemon start` on a machine that has never indexed anything
+    // died with a bare `error: FileNotFound` and created nothing.
+    try layout.ensureDirs(io);
 
     if (try isRunning(gpa, io, layout.sock)) {
         try w.writeAll("daemon is already running\n");
         return 0;
+    }
+
+    // The daemon resolves the model path at startup and exits if there is none.
+    // Letting that happen unseen costs the caller a five second readiness
+    // timeout and a log file holding the single word `ModelNotFound`. Checking
+    // here turns the most likely first-run failure into the same shape every
+    // other missing prerequisite uses: what is absent, and the command that
+    // creates it.
+    if (zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0)) |found| {
+        var f = found;
+        f.deinit(gpa);
+    } else |err| switch (err) {
+        error.ModelNotFound => {
+            try w.writeAll("no embedding model\nrun: zkb model pull\n");
+            return 3;
+        },
+        else => return err,
     }
 
     const exe = try zkb.paths.selfExe(gpa, io);

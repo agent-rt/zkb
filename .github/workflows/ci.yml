@@ -61,6 +61,16 @@ jobs:
           n=$(grep -c '^  FAIL' <<<"$doc")
           [ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 failed check, got $n"; echo "$doc"; exit 1; }
 
+          # The first thing a new install does. Without a model the daemon
+          # cannot serve, so start must say so and name the fix rather than
+          # spending five seconds waiting for a process that already exited.
+          # This also covers run/ being created: before that fix the failure
+          # here was a bare FileNotFound, which this assertion would not accept.
+          rc=0
+          out=$("$bin" daemon start 2>&1) || rc=$?
+          [ "$rc" -eq 3 ] || { echo "FAIL: daemon start without a model should exit 3, got $rc"; echo "$out"; exit 1; }
+          grep -q 'zkb model pull' <<<"$out" || { echo "FAIL: daemon start should name the fix"; echo "$out"; exit 1; }
+
           # Report a missing index as exit 3 with something to act on, rather
           # than failing or pretending to succeed.
           for cmd in records status; do
