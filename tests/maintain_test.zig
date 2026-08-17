@@ -61,7 +61,7 @@ test "links are extracted from every syntax the corpus actually uses" {
         \\# Doc
         \\
         \\See [the spec](../other/SPEC.md) and [[wikilink]].
-        \\Also kb://projects/x/index.md and [ext](https://example.com/page).
+        \\Also zkb://projects/x/index.md and [ext](https://example.com/page).
         \\
     ;
     var doc = try markdown.scan(gpa, src);
@@ -75,7 +75,7 @@ test "links are extracted from every syntax the corpus actually uses" {
     try testing.expectEqual(@as(usize, 2), kinds.get(.frontmatter).?);
     try testing.expectEqual(@as(usize, 1), kinds.get(.md).?);
     try testing.expectEqual(@as(usize, 1), kinds.get(.wiki).?);
-    try testing.expectEqual(@as(usize, 1), kinds.get(.lore).?);
+    try testing.expectEqual(@as(usize, 1), kinds.get(.collection_uri).?);
     // http links are recorded but never resolved: zkb does not go online, so
     // reporting them as broken would be reporting on something it cannot know.
     try testing.expectEqual(@as(usize, 1), kinds.get(.external).?);
@@ -89,7 +89,7 @@ test "paths inside code fences are not links" {
         \\
         \\```bash
         \\cat [not a link](./nope.md)
-        \\see kb://projects/fake/thing.md
+        \\see zkb://projects/fake/thing.md
         \\```
         \\
         \\Real [link](./real.md).
@@ -110,7 +110,7 @@ test "link syntax written as inline code is not a link" {
     const src =
         \\# Doc
         \\
-        \\Supported forms: `[text](path)`, `[[wikilink]]`, and `kb://x/y.md`.
+        \\Supported forms: `[text](path)`, `[[wikilink]]`, and `zkb://x/y.md`.
         \\
         \\A real one: [spec](./SPEC.md).
         \\
@@ -177,7 +177,7 @@ test "resolution happens after the whole scan, not during it" {
     ));
 }
 
-test "relative, absolute, lore and wiki targets all resolve" {
+test "relative, absolute, collection-uri and wiki targets all resolve" {
     var db = try store.open(":memory:", .read_write);
     defer db.close();
     var s = store.Store.init(&db);
@@ -191,7 +191,7 @@ test "relative, absolute, lore and wiki targets all resolve" {
         \\
         \\- [req](./REQ.md)
         \\- [spec](SPEC.md)
-        \\- kb://skills/y/SKILL.md
+        \\- zkb://skills/y/SKILL.md
         \\- [[SKILL]]
         \\
     );
@@ -336,7 +336,7 @@ test "the diff separates new from resolved and survives re-indexing" {
         defer d.deinit(gpa);
         try testing.expectEqual(@as(usize, 1), d.new_keys.len);
     }
-    try maintain.record(gpa, &db, &first, 1000);
+    try maintain.record(gpa, &db, &first, maintain.Check.default(), 1000);
 
     // Re-index the same document: chunk and link row ids change, but the finding
     // is the same one. Keys are content-derived precisely so this is "unchanged"
@@ -351,7 +351,7 @@ test "the diff separates new from resolved and survives re-indexing" {
         try testing.expectEqual(@as(usize, 0), d.new_keys.len);
         try testing.expectEqual(@as(usize, 1), d.unchanged);
     }
-    try maintain.record(gpa, &db, &second, 2000);
+    try maintain.record(gpa, &db, &second, maintain.Check.default(), 2000);
 
     // Fix it: the finding must show up as resolved.
     _ = try addDoc(&s, cid, "missing.md", "# Now exists\n");
@@ -362,4 +362,56 @@ test "the diff separates new from resolved and survives re-indexing" {
     defer d.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), d.new_keys.len);
     try testing.expectEqual(@as(usize, 1), d.resolved_keys.len);
+}
+
+// ---------------------------------------------------------------------------
+// vector checks: the classification rules, which E7 measured as mattering more
+// than the threshold does
+// ---------------------------------------------------------------------------
+
+test "a table of contents is recognised as navigation" {
+    // The single largest false-positive class E7 found: two project index.md
+    // files whose "related knowledge" sections resemble each other because both
+    // are lists of links. The highest-scoring pair in the whole pool (0.973)
+    // was one of these.
+    const toc =
+        \\## 关联知识
+        \\- [projects/a/index.md](zkb://projects/a/index.md) — A
+        \\- [projects/b/index.md](zkb://projects/b/index.md) — B
+    ;
+    try testing.expect(zkb.maintain_vec.isNavigationForTest(toc));
+
+    const prose =
+        \\本 API 所有对外可见的资源 ID 采用 GID 规范：资源对象的 JSON 字段
+        \\统一使用 id 表示 GID，跨服务引用时必须携带 kind 前缀。
+    ;
+    try testing.expect(!zkb.maintain_vec.isNavigationForTest(prose));
+}
+
+test "a prose paragraph with one link is not navigation" {
+    const mostly_prose =
+        \\这一节说明为什么选择 RRF 而不是加权求和，详见 [SPEC](zkb://SPEC.md)。
+        \\加权求和需要一个系数，而没有实验支撑的系数正是当初要避开的那笔债。
+    ;
+    try testing.expect(!zkb.maintain_vec.isNavigationForTest(mostly_prose));
+}
+
+test "two files of one project are the same project, nested or not" {
+    const T = zkb.maintain_vec;
+    try testing.expect(T.sameProjectForTest("projects/x/REQ.md", "projects/x/SPEC.md"));
+    // A doc under a subdirectory still belongs to its project.
+    try testing.expect(T.sameProjectForTest("projects/x/docs/design.md", "projects/x/README.md"));
+    try testing.expect(!T.sameProjectForTest("projects/x/REQ.md", "projects/y/REQ.md"));
+    try testing.expect(!T.sameProjectForTest("projects/x/REQ.md", "skills/z/case.md"));
+}
+
+test "a section title drops its number so two numberings compare equal" {
+    // `REQ.md > 11. 验收标准` and `SPEC.md > 14. 验收标准` are the same section
+    // restated, which is a finding; two *different* sections overlapping is the
+    // document matrix working as intended, which is not.
+    const T = zkb.maintain_vec;
+    try testing.expectEqualStrings("验收标准", T.sectionTitleForTest("toolname — 需求规格说明书 > 11. 验收标准"));
+    try testing.expectEqualStrings("验收标准", T.sectionTitleForTest("toolname — 技术规格说明书 > 14. 验收标准"));
+    try testing.expectEqualStrings("Resource IDs", T.sectionTitleForTest("Resource IDs"));
+    try testing.expectEqualStrings("安全机制", T.sectionTitleForTest("a > b > 4. 安全机制"));
 }

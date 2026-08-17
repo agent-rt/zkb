@@ -1,6 +1,6 @@
 //! E5b — does n_ctx dominate embedding throughput?
 //!
-//! The first full index of ~/docs ran at roughly 410 ms per chunk, an order of
+//! The first full index ran at roughly 410 ms per chunk, an order of
 //! magnitude slower than the SPEC's estimate. Hypothesis: the context is sized
 //! 8192 while chunks are capped at 1024 tokens, so every decode pays for compute
 //! buffers eight times larger than the work being done.

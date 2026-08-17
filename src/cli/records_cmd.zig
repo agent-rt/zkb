@@ -2,7 +2,7 @@
 //!
 //! Output is TSV by default. Several rows of data cost roughly half the tokens
 //! the same data would as JSON, and no agent has trouble reading it — a judgement
-//! taken that several agent-facing tools have converged on (SPEC §16.6).
+//! that several agent-facing tools have converged on.
 
 const std = @import("std");
 const zkb = @import("zkb");
@@ -14,6 +14,7 @@ pub const Options = struct {
     where: ?[]const u8 = null,
     search: ?[]const u8 = null,
     agg: ?[]const u8 = null,
+    window: ?[]const u8 = null,
     limit: usize = 50,
     show_schema: bool = false,
     json: bool = false,
@@ -67,10 +68,11 @@ pub fn run(
     }
 
     if (opts.agg) |src| return runAgg(gpa, &db, w, &schema, src, if (where) |c| &c else null);
+    if (opts.window) |src| return runWindow(gpa, &db, w, &schema, src, if (where) |c| &c else null);
 
     // ---- semantic search, restricted to the rows the filter allows
     if (opts.search) |query| {
-        return runSearch(gpa, io, &db, &layout, w, &schema, query, if (where) |c| &c else null, opts);
+            return runSearch(gpa, io, env, &db, &layout, w, &schema, query, if (where) |c| &c else null, opts);
     }
 
     return runSelect(gpa, &db, w, &schema, if (where) |c| &c else null, opts);
@@ -84,7 +86,7 @@ fn listTypes(gpa: std.mem.Allocator, db: *zkb.sqlite.Db, w: *Writer) !u8 {
     }
     if (types.len == 0) {
         try w.writeAll("no records types yet\n");
-        try w.writeAll("create one: ~/kb/records/<type>/<file>.csv, then: zkb index\n");
+        try w.writeAll("create one: ~/.zkb/data/records/<type>/<file>.csv, then: zkb index\n");
         return 0;
     }
     try w.writeAll("type\trows\n");
@@ -282,6 +284,70 @@ fn runAgg(
     return 0;
 }
 
+/// `avg(amount) over 7 by date` — a moving aggregate, one output row per input
+/// row.
+///
+/// The window frame is `N PRECEDING` through `CURRENT ROW`, i.e. the N rows
+/// ending here, which is what "7 day moving average" means to a person. SQLite
+/// has done this since 3.25; the only new thing is letting a field name through
+/// the same whitelist `--where` uses.
+fn runWindow(
+    gpa: std.mem.Allocator,
+    db: *zkb.sqlite.Db,
+    w: *Writer,
+    schema: *const zkb.records.Schema,
+    src: []const u8,
+    where: ?*const zkb.expr.Compiled,
+) !u8 {
+    const win = zkb.expr.parseWindow(schema, src) catch |err| {
+        try w.print("cannot parse --window: {t}\n", .{err});
+        try w.writeAll("form: sum|avg|min|max|count(field) over N by field [partition field]\n");
+        if (err == error.UnknownField) try printFieldNames(w, schema);
+        return 2;
+    };
+
+    const table = try tableIdent(gpa, schema);
+    defer gpa.free(table);
+    const qfield = try zkb.records.quoteIdent(gpa, win.field);
+    defer gpa.free(qfield);
+    const qorder = try zkb.records.quoteIdent(gpa, win.order_by);
+    defer gpa.free(qorder);
+
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(gpa);
+
+    try sql.print(gpa, "SELECT {s}, {s}, {t}({s}) OVER (", .{ qorder, qfield, win.func, qfield });
+    if (win.partition_by) |p| {
+        const qp = try zkb.records.quoteIdent(gpa, p);
+        defer gpa.free(qp);
+        try sql.print(gpa, "PARTITION BY {s} ", .{qp});
+    }
+    try sql.print(gpa, "ORDER BY {s} ROWS BETWEEN {d} PRECEDING AND CURRENT ROW)", .{
+        qorder, win.n - 1,
+    });
+    try sql.print(gpa, " FROM {s}", .{table});
+    if (where) |c| try sql.print(gpa, " WHERE {s}", .{c.sql});
+    try sql.print(gpa, " ORDER BY {s}", .{qorder});
+
+    const text = try sql.toOwnedSliceSentinel(gpa, 0);
+    defer gpa.free(text);
+    var st = try db.prepare(text);
+    defer st.finalize();
+    if (where) |c| try bindCompiled(&st, c, 1);
+
+    try w.print("{s}\t{s}\t{t}({s}) over {d}\n", .{
+        win.order_by, win.field, win.func, win.field, win.n,
+    });
+    while (try st.step()) {
+        try writeTsvCell(w, st.columnText(0));
+        try w.writeAll("\t");
+        try writeTsvCell(w, st.columnText(1));
+        try w.writeAll("\t");
+        try w.print("{s}\n", .{st.columnText(2)});
+    }
+    return 0;
+}
+
 /// `--search` combined with `--where`: **filter first, then KNN**.
 ///
 /// The other order — take a large k and then drop rows that fail the filter — is
@@ -293,6 +359,7 @@ fn runAgg(
 fn runSearch(
     gpa: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     db: *zkb.sqlite.Db,
     layout: *const zkb.paths.Layout,
     w: *Writer,
@@ -301,14 +368,12 @@ fn runSearch(
     where: ?*const zkb.expr.Compiled,
     opts: Options,
 ) !u8 {
-    const model_path = opts.model orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-    defer if (opts.model == null) gpa.free(model_path);
-
-    std.Io.Dir.accessAbsolute(io, model_path, .{}) catch {
-        try w.print("model not found: {s}\nrun: zkb model pull\n", .{model_path});
+    const found = zkb.model_registry.resolve(gpa, io, env, layout, opts.model, .q8_0) catch {
+        try w.writeAll("model not found\nrun: zkb model pull\n");
         return 4;
     };
+    defer found.deinit(gpa);
+    const model_path = found.path;
 
     var embedder = try zkb.embed.Embedder.init(gpa, model_path, .{});
     defer embedder.deinit();

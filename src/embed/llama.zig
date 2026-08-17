@@ -73,7 +73,15 @@ pub const Options = struct {
 
 var backend_inited = false;
 
-fn silentLog(level: c.ggml_log_level, text: [*c]const u8, user: ?*anyopaque) callconv(.c) void {
+/// Idempotent: llama's backend init is global, and two model types now load it.
+pub fn ensureBackend() void {
+    if (!backend_inited) {
+        c.llama_backend_init();
+        backend_inited = true;
+    }
+}
+
+pub fn silentLog(level: c.ggml_log_level, text: [*c]const u8, user: ?*anyopaque) callconv(.c) void {
     _ = level;
     _ = text;
     _ = user;

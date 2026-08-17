@@ -10,8 +10,9 @@
 //! involved. `_schema.json` exists only to override a column the inference got
 //! wrong, and it only has to name that column.
 //!
-//! **Materialized columns, not EAV.** An EAV store earns its complexity when the truth lives in the database and because its truth lives in
-//! the database and an agent adding a field must not force a migration. zkb's
+//! **Materialized columns, not EAV.** An EAV store earns its complexity when the
+//! truth lives in the database and an agent adding a field must not force a
+//! migration. zkb's
 //! truth is the file and the index is disposable: change the header, re-index,
 //! done. All of EAV's complexity buys the avoidance of migrations, and zkb has
 //! no migrations to avoid (SPEC §16.3). What it buys instead is `amount > 1000`
@@ -21,6 +22,7 @@ const std = @import("std");
 const sqlite = @import("db/sqlite.zig");
 const csvmod = @import("ingest/csv.zig");
 const hash = @import("util/hash.zig");
+const utf8 = @import("util/utf8.zig");
 
 /// How many rows the inference looks at. Enough to be confident, few enough that
 /// a large file costs nothing extra.
@@ -38,7 +40,7 @@ pub const Kind = enum {
     /// Not in SPEC §16.3, which has only the five below. Added because the very
     /// first real file exposed the gap: `店铺ID` values like `A_0001` are all
     /// distinct, so they fall through to `string` and get embedded, which is
-    /// precisely the noise §16.4 that embedding a whole record row produces.
+    /// precisely the noise that embedding a whole record row produces.
     id,
     /// Free text — the only kind that goes into the embedding.
     string,
@@ -83,6 +85,10 @@ pub const Field = struct {
     /// row. Indexing the row by the field's position put every value one column
     /// off — silently, and only for types that had a display override.
     col: usize = 0,
+    /// Fraction of sampled values that are distinct. Only meaningful for a
+    /// freshly inferred schema — `rowLabel` uses it to pick which field names a
+    /// row, and that runs at index time where inference just happened.
+    distinct_ratio: f64 = 0,
     /// True when `_schema.json` set the kind rather than inference.
     overridden: bool = false,
 
@@ -313,9 +319,11 @@ pub fn infer(
     }
 
     for (table.header, 0..) |name, col| {
+        const inferred = try inferColumn(gpa, table, col);
         fields[filled] = .{
             .name = try gpa.dupe(u8, name),
-            .kind = try inferColumn(gpa, table, col),
+            .kind = inferred.kind,
+            .distinct_ratio = inferred.distinct_ratio,
             .col = col,
         };
         filled += 1;
@@ -324,7 +332,9 @@ pub fn infer(
     return .{ .type_name = try gpa.dupe(u8, type_name), .fields = fields };
 }
 
-fn inferColumn(gpa: std.mem.Allocator, table: *const csvmod.Table, col: usize) !Kind {
+const Inferred = struct { kind: Kind, distinct_ratio: f64 };
+
+fn inferColumn(gpa: std.mem.Allocator, table: *const csvmod.Table, col: usize) !Inferred {
     const limit = @min(table.rows.len, sample_rows);
 
     var total: usize = 0;
@@ -351,26 +361,28 @@ fn inferColumn(gpa: std.mem.Allocator, table: *const csvmod.Table, col: usize) !
 
     // An all-empty column has nothing to go on. `string` is the safe default: it
     // is the only kind that neither indexes nor coerces.
-    if (total == 0) return .string;
-
-    if (all_date) return .date;
-    if (all_number) return .number;
+    if (total == 0) return .{ .kind = .string, .distinct_ratio = 0 };
 
     const n_distinct = distinct.count();
     const ratio = @as(f64, @floatFromInt(n_distinct)) / @as(f64, @floatFromInt(total));
 
+    if (all_date) return .{ .kind = .date, .distinct_ratio = ratio };
+    if (all_number) return .{ .kind = .number, .distinct_ratio = ratio };
+
     // Below the evidence floor nothing is claimed at all: with three rows every
     // column is either all-distinct or all-same, and both ratios are as
     // meaningless as they are extreme.
-    if (total < min_evidence_rows) return .string;
+    if (total < min_evidence_rows) return .{ .kind = .string, .distinct_ratio = ratio };
 
     // Nearly-unique short tokens with a digit in them are identifiers, not prose.
     // Requiring a digit is what keeps a column of distinct Japanese shop names
     // (which are prose, and should be embedded) from being swallowed here.
-    if (all_identifier and ratio > 0.95) return .id;
+    if (all_identifier and ratio > 0.95) return .{ .kind = .id, .distinct_ratio = ratio };
 
-    if (n_distinct <= max_enum_values and ratio <= max_enum_ratio) return .@"enum";
-    return .string;
+    if (n_distinct <= max_enum_values and ratio <= max_enum_ratio) {
+        return .{ .kind = .@"enum", .distinct_ratio = ratio };
+    }
+    return .{ .kind = .string, .distinct_ratio = ratio };
 }
 
 /// A category set a person can hold in their head. Beyond this the column is not
@@ -948,11 +960,23 @@ pub fn renderForEmbedding(
 }
 
 /// A short label for the chunk, used as its heading path in search output.
+///
+/// The **most distinctive** free-text field, not the first one. A row is best
+/// identified by whatever varies between rows — a merchant name, a title — and
+/// the leftmost column is often the least distinctive thing there is. Measured
+/// on a four-row file: the label came out `JPY`, because `currency` happened to
+/// sit before `merchant` and, at that sample size, was still classed as text.
 pub fn rowLabel(gpa: std.mem.Allocator, schema: *const Schema, row: []const []const u8) ![]u8 {
+    var best: ?Field = null;
     for (schema.fields) |f| {
         if (!f.kind.vectorized() or f.col >= row.len) continue;
-        const v = std.mem.trim(u8, row[f.col], " \t");
-        if (v.len != 0) return gpa.dupe(u8, v[0..@min(v.len, 64)]);
+        if (std.mem.trim(u8, row[f.col], " \t").len == 0) continue;
+        if (best == null or f.distinct_ratio > best.?.distinct_ratio) best = f;
     }
-    return gpa.dupe(u8, schema.type_name);
+    const f = best orelse return gpa.dupe(u8, schema.type_name);
+    const v = std.mem.trim(u8, row[f.col], " \t");
+    // Cut on a character boundary: this string is stored as
+    // `chunks.heading_path` and indexed by FTS, so a split sequence is
+    // persisted corruption, not just a display glitch.
+    return gpa.dupe(u8, utf8.cut(v, 64));
 }

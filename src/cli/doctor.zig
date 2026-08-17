@@ -56,25 +56,37 @@ pub fn run(
     defer layout.deinit(gpa);
     try ok(w, &r, "root {s}", .{layout.root});
 
+    // Which subdirectory is safe to delete is the single most useful thing this
+    // command can say, and it must be said in a form somebody can copy. Half the
+    // fixes for a broken index are "delete it and re-run", and that sentence has
+    // to be unambiguous about what "it" is.
+    try info(w, "data      {s}   ← the only irreplaceable directory", .{layout.data});
+    try info(w, "disposable {s}", .{layout.index_dir});
+    try info(w, "           {s}", .{layout.models});
+    try info(w, "           {s}", .{layout.run_dir});
+
     // Memories are the only thing here that cannot be rebuilt from something
-    // else: a session is gone once it ends. Everything under ~/.zkb is derived
-    // and can be deleted wholesale, so this is the one directory whose loss is
-    // permanent — and "jj is the backup" only holds if it is actually a repo.
-    if (std.Io.Dir.accessAbsolute(io, layout.kb, .{})) |_| {
+    // else: a session is gone once it ends. Everything else under ~/.zkb is
+    // derived, so this is the one directory whose loss is permanent.
+    //
+    // Reported, not failed. Nothing in zkb calls `jj` or `git` — the two time
+    // axes both live in the file now (facts.csv gained `recorded_at`), so
+    // version control adds review and undo rather than being load-bearing.
+    // A check that fails on a working setup teaches people to ignore checks.
+    if (std.Io.Dir.accessAbsolute(io, layout.data, .{})) |_| {
         var versioned = false;
         var buf: [512]u8 = undefined;
         inline for (.{ ".jj", ".git" }) |marker| {
-            const p = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ layout.kb, marker });
+            const p = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ layout.data, marker });
             if (std.Io.Dir.accessAbsolute(io, p, .{})) |_| versioned = true else |_| {}
         }
         if (versioned) {
-            try ok(w, &r, "memory root {s} is under version control", .{layout.kb});
+            try ok(w, &r, "data is under version control", .{});
         } else {
-            try fail(w, &r, "memory root {s} is NOT under version control", .{layout.kb});
-            try info(w, "memories cannot be rebuilt from anything else — jj git init {s}", .{layout.kb});
+            try info(w, "data is not under version control (optional)", .{});
         }
     } else |_| {
-        try info(w, "no memory root yet at {s} (created by: zkb remember)", .{layout.kb});
+        try info(w, "no data yet (created by: zkb remember)", .{});
     }
 
     // ---------------------------------------------------------------- sqlite
@@ -176,23 +188,24 @@ pub fn run(
         return r;
     }
 
-    const model_path = model_path_override orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-    defer if (model_path_override == null) gpa.free(model_path);
-
-    std.Io.Dir.accessAbsolute(io, model_path, .{}) catch {
-        try fail(w, &r, "model not found: {s}", .{model_path});
+    const found = zkb.model_registry.resolve(gpa, io, env, &layout, model_path_override, .q8_0) catch {
+        try fail(w, &r, "model not found", .{});
         try info(w, "run: zkb model pull", .{});
         try printSummary(w, r);
         return r;
     };
+    defer found.deinit(gpa);
+    const model_path = found.path;
 
     const digest = zkb.hash.fileSha256(io, model_path) catch |err| {
         try fail(w, &r, "cannot hash model: {t}", .{err});
         try printSummary(w, r);
         return r;
     };
-    try ok(w, &r, "model {s}", .{std.fs.path.basename(model_path)});
+    // Where it came from matters: a Hugging Face cache hit means zkb never
+    // downloaded a second copy, and saying so is how anyone finds that out.
+    try ok(w, &r, "model {s} ({t})", .{ std.fs.path.basename(model_path), found.source });
+    if (found.source == .hf_cache) try info(w, "{s}", .{model_path});
     try info(w, "sha256 {s}", .{digest[0..16]});
 
     var embedder = zkb.embed.Embedder.init(gpa, model_path, .{}) catch |err| {

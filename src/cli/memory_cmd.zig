@@ -45,7 +45,7 @@ pub fn remember(
 
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
-    try ensureDir(io, layout.kb);
+    try layout.ensureDirs(io);
     try ensureDir(io, layout.memory);
 
     const db_path = try gpa.dupeZ(u8, layout.db);
@@ -57,15 +57,12 @@ pub fn remember(
     const now_ms = nowMs(io);
     const cid = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);
 
-    const model_path = opts.model orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-    defer if (opts.model == null) gpa.free(model_path);
+    const found = zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0) catch null;
+    defer if (found) |f| f.deinit(gpa);
 
     var embedder: ?zkb.embed.Embedder = null;
     defer if (embedder) |*e| e.deinit();
-    if (std.Io.Dir.accessAbsolute(io, model_path, .{})) |_| {
-        embedder = zkb.embed.Embedder.init(gpa, model_path, .{}) catch null;
-    } else |_| {}
+    if (found) |f| embedder = zkb.embed.Embedder.init(gpa, f.path, .{}) catch null;
 
     // ---- duplicate check, before anything is written
     if (embedder) |*e| {
@@ -136,7 +133,7 @@ pub fn remember(
         try w.writeAll("(will be indexed on the next daemon scan)\n");
     }
 
-    try warnIfUnversioned(io, w, layout.kb);
+    try warnIfUnversioned(io, w, layout.data);
     return 0;
 }
 
@@ -195,7 +192,7 @@ pub fn forget(
 
     try w.print("archived: {s}\n", .{dst});
     try w.writeAll("(kept on disk — use jj if you really want it gone)\n");
-    try warnIfUnversioned(io, w, layout.kb);
+    try warnIfUnversioned(io, w, layout.data);
     return 0;
 }
 
@@ -278,17 +275,16 @@ pub fn recall(
     var vec: ?[]f32 = null;
     defer if (vec) |v| gpa.free(v);
     if (opts.query.len != 0) {
-        const model_path = opts.model orelse
-            try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-        defer if (opts.model == null) gpa.free(model_path);
+        const found = zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0) catch null;
+        defer if (found) |f| f.deinit(gpa);
 
-        if (std.Io.Dir.accessAbsolute(io, model_path, .{})) |_| {
-            var e = try zkb.embed.Embedder.init(gpa, model_path, .{});
+        if (found) |f| {
+            var e = try zkb.embed.Embedder.init(gpa, f.path, .{});
             defer e.deinit();
             const buf = try gpa.alloc(f32, e.n_embd);
             _ = try e.embedQuery(zkb.embed.default_query_task, opts.query, buf);
             vec = buf;
-        } else |_| {}
+        }
     }
 
     var r = try zkb.recall.assemble(gpa, &db, opts.query, vec, .{
@@ -428,8 +424,8 @@ pub fn factsCmd(
             try w.print("no fact recorded for {s}\n", .{k});
             return 3;
         }
-        try w.writeAll("at\tvalue\tnote\n");
-        for (rows) |r| try w.print("{s}\t{s}\t{s}\n", .{ r.at, r.value, r.note });
+        try w.writeAll("at\tvalue\trecorded_at\tnote\n");
+        for (rows) |r| try w.print("{s}\t{s}\t{s}\t{s}\n", .{ r.at, r.value, r.recorded_at, r.note });
         return 0;
     }
 
@@ -473,7 +469,7 @@ pub fn rememberFact(
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
-    try ensureDir(io, layout.kb);
+    try layout.ensureDirs(io);
 
     var ts_buf: [32]u8 = undefined;
     // Defaults to today, but `--at` is the entire point of the column: a raise
@@ -482,10 +478,16 @@ pub fn rememberFact(
     // already tracks it (SPEC §16.2.1).
     const effective = at orelse try isoDate(&ts_buf, io);
 
-    try zkb.facts.append(io, layout.facts, key, value, effective, "user", note);
-    try w.print("{s} = {s}  (effective {s})\n", .{ key, value, effective });
+    // The other axis: `at` is when it took effect, `recorded_at` is now. Both
+    // go in the file, because an axis that lives only in version control cannot
+    // be queried and so is not really there.
+    var today_buf: [32]u8 = undefined;
+    const recorded = try isoDate(&today_buf, io);
+
+    try zkb.facts.append(io, layout.facts, key, value, effective, recorded, "user", note);
+    try w.print("{s} = {s}  (effective {s}, recorded {s})\n", .{ key, value, effective, recorded });
     try w.print("appended to {s}\n", .{layout.facts});
-    try warnIfUnversioned(io, w, layout.kb);
+    try warnIfUnversioned(io, w, layout.data);
     return 0;
 }
 
@@ -571,16 +573,17 @@ fn writeOneLine(w: *Writer, text: []const u8) !void {
     }
 }
 
-/// Memories are the only thing in zkb that cannot be rebuilt from something
-/// else, and "jj is the backup" only holds if the directory is actually a repo.
-/// Checked on every write, because the moment it matters is the moment before
-/// the first loss (SPEC §15.3).
+/// Mention version control once, the first time a memory root has none.
+///
+/// Not a warning any more: nothing in zkb calls `jj` or `git`, and since
+/// `facts.csv` carries `recorded_at` there is no feature that depends on a repo.
+/// It is still the only data here that cannot be rebuilt, so it is worth saying
+/// — but a line printed on every single write is a line people stop reading.
 fn warnIfUnversioned(io: std.Io, w: *Writer, kb: []const u8) !void {
     var buf: [512]u8 = undefined;
     inline for (.{ ".jj", ".git" }) |marker| {
         const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ kb, marker }) catch return;
         if (std.Io.Dir.accessAbsolute(io, p, .{})) |_| return else |_| {}
     }
-    try w.print("\nWARNING: {s} is not under version control — memories have no backup\n", .{kb});
-    try w.print("  jj git init {s}\n", .{kb});
+    try w.print("\nnote: {s} is not under version control (optional)\n", .{kb});
 }

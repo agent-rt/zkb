@@ -4,10 +4,14 @@
 //! stdout except protocol frames** — a stray log line corrupts the stream and the
 //! client sees a parse error rather than a diagnostic. Diagnostics go to stderr.
 //!
-//! Three tools. Tool definitions are re-sent to the model on every turn, so each
-//! one costs context permanently; `search`, `query` and `recall` are what a
-//! resource URI cannot express (SPEC §8). Anything readable is a resource
+//! Four tools. Tool definitions are re-sent to the model on every turn, so each
+//! one costs context permanently; `search`, `query`, `recall` and `records` are
+//! what a resource URI cannot express (SPEC §8). Anything readable is a resource
 //! instead, which costs no tool slot.
+//!
+//! `records` deliberately covers introspection *and* querying in one slot:
+//! calling it with no type lists the types and their inferred schemas. Two tools
+//! would cost twice the context to say the same thing.
 //!
 //! No write tools. Over documents that is because zkb only reads them — an agent
 //! that wants to change a file uses its own editing tools and the next scan picks
@@ -18,6 +22,7 @@
 const std = @import("std");
 const zkb = @import("zkb");
 const client = zkb.ipc_client;
+const records_cmd = @import("../cli/records_cmd.zig");
 
 const Writer = std.Io.Writer;
 
@@ -47,7 +52,7 @@ pub fn run(
         const line = std.mem.trimEnd(u8, raw, "\r\n");
         if (line.len == 0) continue;
 
-        handle(gpa, io, layout.sock, w, line) catch |err| {
+        handle(gpa, io, env, layout.sock, w, line) catch |err| {
             std.debug.print("zkb mcp: {t}\n", .{err});
         };
         w.flush() catch return 0;
@@ -57,6 +62,7 @@ pub fn run(
 fn handle(
     gpa: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     sock: []const u8,
     w: *Writer,
     line: []const u8,
@@ -87,7 +93,7 @@ fn handle(
     }
     if (std.mem.eql(u8, method, "tools/list")) return handleToolsList(w, id);
     if (std.mem.eql(u8, method, "resources/list")) return handleResourcesList(w, id);
-    if (std.mem.eql(u8, method, "tools/call")) return handleToolsCall(gpa, io, sock, w, id, params);
+    if (std.mem.eql(u8, method, "tools/call")) return handleToolsCall(gpa, io, env, sock, w, id, params);
     if (std.mem.eql(u8, method, "resources/read")) return handleResourcesRead(gpa, io, sock, w, id, params);
 
     return writeError(w, id, -32601, "method not found");
@@ -137,7 +143,16 @@ fn handleToolsList(w: *Writer, id: std.json.Value) !void {
         \\ "description":"What you should know about this user before answering: their recorded preferences, decisions and corrections, plus the current value of every stored fact. Call this at the start of a session, and again when the topic shifts. Facts are exact values, not retrieved text — trust them over anything a document says. To record something new, run the shell command: zkb remember \"...\"",
         \\ "inputSchema":{"type":"object","properties":{
         \\   "query":{"type":"string","description":"Optional. Omit at session start to get the most recent memories; pass a topic to bias towards memories about it. Facts are always included either way."},
-        \\   "budget":{"type":"integer","description":"Token budget for the memories (default 1500). Facts are not counted against it."}}}}
+        \\   "budget":{"type":"integer","description":"Token budget for the memories (default 1500). Facts are not counted against it."}}}},
+        \\{"name":"zkb_records",
+        \\ "description":"Query the user's structured data (expenses, weight logs, any csv under records/). Exact filtering and aggregation over real columns — use this for numbers, not zkb_search. Call with no arguments to list the available types and their columns. Output is TSV.",
+        \\ "inputSchema":{"type":"object","properties":{
+        \\   "type":{"type":"string","description":"Record type, e.g. 'expenses'. Omit to list all types and their inferred schemas."},
+        \\   "where":{"type":"string","description":"Filter, e.g. \\"amount > 1000 AND category = 'food'\\". Operators: = != < <= > >= LIKE IN, IS NULL; AND/OR and parentheses. Field names must match the schema."},
+        \\   "agg":{"type":"string","description":"Aggregate, e.g. \\"sum(amount) by category\\". Functions: sum avg min max count."},
+        \\   "window":{"type":"string","description":"Moving aggregate, e.g. \\"avg(kg) over 7 by date\\" for a 7-row moving average. Optional trailing 'partition <field>'."},
+        \\   "limit":{"type":"integer","description":"Max rows for a plain listing (default 50)."},
+        \\   "schema":{"type":"boolean","description":"Show the inferred column kinds (date/number/enum/id/string) instead of rows."}}}}
         \\]}
     );
     try endResult(w);
@@ -157,6 +172,7 @@ fn handleResourcesList(w: *Writer, id: std.json.Value) !void {
 fn handleToolsCall(
     gpa: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     sock: []const u8,
     w: *Writer,
     id: std.json.Value,
@@ -169,6 +185,13 @@ fn handleToolsCall(
     };
     const args = params.object.get("arguments") orelse std.json.Value{ .object = .empty };
     if (args != .object) return writeError(w, id, -32602, "arguments must be an object");
+
+    // Structured queries touch no model and need no daemon: they are SQL over
+    // an index that is already on disk. Handled before the socket connect below,
+    // so `zkb_records` keeps working when the daemon is down.
+    if (std.mem.eql(u8, name, "zkb_records")) {
+        return recordsTool(gpa, io, env, w, id, args.object);
+    }
 
     // Optional here, required per tool: `zkb_recall` with no query is the
     // session-start case, where nothing has been asked yet.
@@ -245,6 +268,45 @@ fn handleToolsCall(
     }
 
     return writeError(w, id, -32602, "unknown tool");
+}
+
+/// Reuses the CLI path verbatim rather than restating the query builder here.
+///
+/// **No `search` argument.** Semantic search over records already works through
+/// `zkb_search` — a record row is a chunk in the same retrieval space as a
+/// document. The one thing that would be new is `--search` combined with
+/// `--where` (the prefilter path), and that needs the embedding model: loading
+/// 620 MB into a long-lived stdio server to save one tool call is the wrong
+/// trade until real use says otherwise.
+fn recordsTool(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *Writer,
+    id: std.json.Value,
+    args: std.json.ObjectMap,
+) !void {
+    var opts: records_cmd.Options = .{
+        .type_name = strArg(args, "type"),
+        .where = strArg(args, "where"),
+        .agg = strArg(args, "agg"),
+        .window = strArg(args, "window"),
+    };
+    if (intArg(args, "limit")) |n| opts.limit = @intCast(@max(1, n));
+    // Explicit rather than inferred from "no other argument": a type with no
+    // filter most obviously means "show me the rows", and the TSV header already
+    // carries the column names an agent needs to write a filter. `schema` is for
+    // when it also needs the inferred kinds.
+    opts.show_schema = boolArg(args, "schema");
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const code = records_cmd.run(gpa, io, env, &out.writer, opts) catch |err| {
+        return toolError(w, id, @errorName(err));
+    };
+    if (code != 0) return toolError(w, id, out.written());
+    return toolText(w, id, out.written());
 }
 
 /// Facts first and labelled as exact values: the failure this guards against is
@@ -454,6 +516,11 @@ fn strArg(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn boolArg(o: std.json.ObjectMap, key: []const u8) bool {
+    const v = o.get(key) orelse return false;
+    return v == .bool and v.bool;
 }
 
 fn intArg(o: std.json.ObjectMap, key: []const u8) ?i64 {

@@ -5,7 +5,8 @@
 //! Rank-based and therefore unitless, which is the whole reason it is used here
 //! instead of a weighted sum of scores: cosine distance and BM25 are not on a
 //! comparable scale, and any weights chosen to bridge them would be numbers with
-//! no experimental backing — exactly the debt a prior design flagged.
+//! no experimental backing — exactly the kind of debt a prior design flagged
+//! and never paid off.
 //! Adding a retrieval path later means adding a term, not re-tuning weights.
 
 const std = @import("std");

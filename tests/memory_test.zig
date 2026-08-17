@@ -14,10 +14,10 @@ const gpa = testing.allocator;
 // ---------------------------------------------------------------------------
 
 const salary_csv =
-    \\key,value,at,src,note
-    \\birth_date,1990-03-15,2020-01-01,user,
-    \\salary,450000,2025-04-01,user,月薪
-    \\salary,480000,2026-04-01,user,调薪后
+    \\key,value,at,recorded_at,src,note
+    \\birth_date,1990-03-15,2020-01-01,2026-08-17,user,
+    \\salary,450000,2025-04-01,2025-04-02,user,月薪
+    \\salary,480000,2026-04-01,2026-08-17,user,调薪后
     \\
 ;
 
@@ -39,7 +39,7 @@ fn currentOf(source: []const u8, key: []const u8) !struct { value: []u8, at: []u
 test "the latest effective date wins, not the last line written" {
     // The append order and the effective order are different axes: a back-dated
     // correction appended today must not become the current value.
-    const back_dated = salary_csv ++ "salary,400000,2024-01-01,user,忘了记的旧数据\n";
+    const back_dated = salary_csv ++ "salary,400000,2024-01-01,2026-08-17,user,忘了记的旧数据\n";
     const c = try currentOf(back_dated, "salary");
     defer gpa.free(c.value);
     defer gpa.free(c.at);
@@ -75,6 +75,7 @@ test "the embedded text excludes the value" {
         .value_num = 480000,
         .value_txt = "480000",
         .at = "2026-04-01",
+        .recorded_at = "2026-08-17",
         .src = "user",
         .note = "调薪后",
     };
@@ -204,4 +205,30 @@ test "a single-entry recency list is not discarded as a sparse path" {
     defer gpa.free(fused);
     try testing.expectEqual(@as(usize, 1), fused.len);
     try testing.expectEqual(@as(i64, 99), fused[0].chunk_id);
+}
+
+test "the two time axes are independent and both survive a round trip" {
+    // `at` is when the salary changed; `recorded_at` is when it was written
+    // down. Neither can be derived from the other, which is the whole reason
+    // the second one is a column rather than a commit timestamp.
+    var parsed = try zkb.facts.parse(gpa, salary_csv);
+    defer parsed.deinit(gpa);
+
+    for (parsed.facts) |f| {
+        if (!std.mem.eql(u8, f.key, "salary")) continue;
+        if (!std.mem.eql(u8, f.value_txt, "480000")) continue;
+        try testing.expectEqualStrings("2026-04-01", f.at);
+        try testing.expectEqualStrings("2026-08-17", f.recorded_at);
+        return;
+    }
+    return error.NotFound;
+}
+
+test "a file predating the column still parses, with the axis simply absent" {
+    // Absent, not invented: a made-up recording date would be worse than an
+    // empty one, because nothing downstream could tell it was a guess.
+    var parsed = try zkb.facts.parse(gpa, "key,value,at\nsalary,480000,2026-04-01\n");
+    defer parsed.deinit(gpa);
+    try testing.expectEqualStrings("2026-04-01", parsed.facts[0].at);
+    try testing.expectEqualStrings("", parsed.facts[0].recorded_at);
 }

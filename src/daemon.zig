@@ -30,8 +30,11 @@ const embed = @import("embed/llama.zig");
 const equeue = @import("embed/queue.zig");
 const proto = @import("ipc/proto.zig");
 const paths = @import("util/paths.zig");
+const registry = @import("embed/registry.zig");
+const fsevents = @import("util/fsevents.zig");
 const maintain = @import("maintain.zig");
 const recallmod = @import("recall.zig");
+const tracemod = @import("search/trace.zig");
 const records = @import("records.zig");
 const memorymod = @import("memory.zig");
 const factsmod = @import("facts.zig");
@@ -45,6 +48,10 @@ pub const Options = struct {
     /// Seconds between filesystem rescans. 195 files cost 0.09s to stat, so this
     /// can be frequent without mattering.
     scan_interval_s: u64 = 30,
+    /// Hour of day (local, 0-23) for the daily maintenance pass. Defaults to
+    /// 04:00 — the point is that it lands when nobody is waiting on a query
+    /// (SPEC §14.9).
+    maintain_hour: u8 = 4,
     collection: []const u8 = "docs",
     root: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
@@ -62,6 +69,9 @@ pub const State = struct {
     collection_id: i64 = 0,
 
     queue: equeue.Queue = .{},
+    /// Retrieval trace. Disabled unless $ZKB_TRACE=1, in which case every search
+    /// and query appends one line.
+    trace: tracemod.Writer = undefined,
 
     /// Guards the fields below.
     mutex: std.Io.Mutex = .init,
@@ -97,6 +107,11 @@ pub const State = struct {
     /// waiting out the interval, which is the difference between "appended a row
     /// and it is queryable" taking under a second and taking up to 30.
     rescan: std.atomic.Value(bool) = .init(false),
+
+    /// How many times the anti-starvation deadline fired. Surfaced in `stats`
+    /// because if this is nonzero and growing, the machine is under enough query
+    /// load that ingestion is competing, which is worth being able to see.
+    starvation_overrides: usize = 0,
 
     running: std.atomic.Value(bool) = .init(true),
     started_ms: i64 = 0,
@@ -150,10 +165,27 @@ pub const State = struct {
         return job.count;
     }
 
-    /// Block until no interactive request has been seen for the backoff window.
-    /// Called by the ingest path before every chunk.
+    /// Block until no interactive request has been seen for the backoff window —
+    /// but never for longer than `max_ingest_starvation_ms`.
+    ///
+    /// The deadline is not a nicety. Every interactive request refreshes
+    /// `last_interactive_ms`, so under a steady stream of them the backoff window
+    /// never expires and ingestion stops **forever**. Measured: a search every
+    /// 100 ms kept a newly written document unindexed for the entire 20 s run,
+    /// and it indexed within 3 s of the load stopping. An agent searching in a
+    /// loop is not a pathological case here, it is the design target — and the
+    /// failure is silent, since the index simply stays stale.
+    ///
+    /// So: yield to interactive work, but age out of it. Falling behind on a
+    /// query by ~300 ms once every few seconds is a far better trade than an
+    /// index that never updates.
     pub fn waitWhileInteractive(self: *State) void {
+        const started = nowMs(self.io);
         while (self.interactiveRecently() and !self.shuttingDown()) {
+            if (nowMs(self.io) - started >= max_ingest_starvation_ms) {
+                self.starvation_overrides += 1;
+                return;
+            }
             std.Io.sleep(self.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch return;
         }
     }
@@ -223,6 +255,13 @@ pub const rescan_tick_ms: u64 = 100;
 /// How long the ingest loop stays out of the way after an interactive request.
 pub const ingest_backoff_ms: i64 = 1_500;
 
+/// Upper bound on how long a single chunk may be deferred by that backoff.
+///
+/// Without it the backoff is unbounded under sustained load — see
+/// `waitWhileInteractive`. Five seconds is long enough that a burst of queries
+/// is fully absorbed, short enough that nobody notices the index lagging.
+pub const max_ingest_starvation_ms: i64 = 5_000;
+
 /// The only writer. Rescans the filesystem, then drains the pending queue.
 fn ingestThread(st: *State) void {
     var db = store.open(st.db_path_z, .read_write) catch return;
@@ -268,6 +307,8 @@ fn ingestThread(st: *State) void {
         _ = maintain.resolveLinks(st.gpa, &db) catch 0;
         st.scanning.store(false, .release);
 
+        maybeRunDailyMaintenance(st, &db) catch {};
+
         // Sleep in short slices so neither shutdown nor an explicit rescan
         // request waits a whole interval.
         //
@@ -282,6 +323,37 @@ fn ingestThread(st: *State) void {
             std.Io.sleep(st.io, .{ .nanoseconds = rescan_tick_ms * std.time.ns_per_ms }, .awake) catch {};
         }
     }
+}
+
+/// Run the full check set once a day, and record it so `zkb maintain --since
+/// last` can show what changed.
+///
+/// It lives on the ingest thread rather than in its own launchd job because it
+/// wants the same single write connection — `maintenance_runs` is a write — and
+/// because a second process would have to load nothing but still coordinate.
+/// The vector checks read stored vectors only, so this competes for CPU but
+/// never for the embedder (SPEC §14.9).
+fn maybeRunDailyMaintenance(st: *State, db: *sqlite.Db) !void {
+    const now_ms = nowMs(st.io);
+    const day_ms = std.time.ms_per_day;
+
+    // "Once since the last one, and only after the configured hour" — expressed
+    // as a floor on elapsed time plus an hour check, so a machine that was
+    // asleep at 04:00 still gets a run when it wakes rather than skipping a day.
+    const last = (try db.queryI64("SELECT COALESCE(max(started_at), 0) FROM maintenance_runs")) orelse 0;
+    if (now_ms - last < day_ms) return;
+
+    const secs = @divTrunc(now_ms, std.time.ms_per_s);
+    const day_secs = @mod(secs, std.time.s_per_day);
+    const hour: u8 = @intCast(@divTrunc(day_secs, std.time.s_per_hour));
+    // First run of a fresh index has no history to compare against, so it is
+    // allowed at any hour; after that the schedule applies.
+    if (last != 0 and hour != st.opts.maintain_hour) return;
+
+    const checks = maintain.Check.default();
+    var report = maintain.run(st.gpa, db, .{ .checks = checks, .now_ms = now_ms }) catch return;
+    defer report.deinit(st.gpa);
+    try maintain.record(st.gpa, db, &report, checks, now_ms);
 }
 
 /// The roots the ingest thread reconciles, in priority order.
@@ -304,7 +376,7 @@ fn ingestRoots(st: *State) [3]IngestRoot {
         },
         .{
             .name = "kb",
-            .path = st.layout.kb,
+            .path = st.layout.data,
             .kind = .records,
             .filters = factsmod.scan_filters,
         },
@@ -457,14 +529,14 @@ fn handleStats(st: *State, db: *sqlite.Db, w: *std.Io.Writer, id: i64) !void {
         "{{\"docs\":{d},\"chunks\":{d},\"pending\":{d},\"failed\":{d}," ++
             "\"fts_rows\":{d},\"vec_rows\":{d},\"drift\":{}," ++
             "\"served_interactive\":{d},\"served_ingest\":{d},\"max_preempted\":{d}," ++
-            "\"scanning\":{}}}",
+            "\"scanning\":{},\"starvation_overrides\":{d}}}",
         .{
             c.docs,                                           c.chunks,
             c.pending,                                        c.failed,
             c.fts_rows,                                       c.vec_rows,
             c.chunks != c.fts_rows or c.chunks != c.vec_rows, st.queue.served_interactive,
             st.queue.served_ingest,                           st.queue.max_preempted,
-            st.scanning.load(.acquire),
+            st.scanning.load(.acquire),          st.starvation_overrides,
         },
     );
     try proto.finishOk(w);
@@ -495,11 +567,13 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
         }
     }
 
+    const t0 = nowMs(st.io);
     var results = hybrid.search(st.gpa, db, mode, query, vec, null, .{
         .top_k = cfg.candidates,
         .candidates = @max(50, cfg.candidates),
     }) catch return proto.writeError(w, req.id, .internal, "search failed", null);
     defer results.deinit(st.gpa);
+    st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
 
     var p = packmod.assemble(st.gpa, db, query, &results, cfg) catch
         return proto.writeError(w, req.id, .internal, "pack assembly failed", null);
@@ -633,9 +707,11 @@ fn searchAndWrite(
     vec: ?[]const f32,
     k: usize,
 ) !void {
+    const t0 = nowMs(st.io);
     var results = hybrid.search(st.gpa, db, mode, query, vec, null, .{ .top_k = k }) catch
         return proto.writeError(w, id, .internal, "search failed", null);
     defer results.deinit(st.gpa);
+    st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
 
     var s = store.Store.init(db);
     const c = try s.counts();
@@ -697,10 +773,7 @@ pub fn run(
     var layout = try paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
-    std.Io.Dir.createDirPath(.cwd(), io, layout.root) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try layout.ensureDirs(io);
 
     const root = opts.root orelse blk: {
         const home = env.get("HOME") orelse return error.NoHomeDirectory;
@@ -708,8 +781,10 @@ pub fn run(
     };
     defer if (opts.root == null) gpa.free(root);
 
-    const model_path = opts.model_path orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
+    // Resolved once at startup: the daemon holds the path for its whole life,
+    // and a Hugging Face cache hit should not be re-discovered per request.
+    const found = try registry.resolve(gpa, io, env, &layout, opts.model_path, .q8_0);
+    const model_path = found.path;
     defer if (opts.model_path == null) gpa.free(model_path);
 
     const db_path_z = try gpa.dupeZ(u8, layout.db);
@@ -730,15 +805,13 @@ pub fn run(
         .root = root,
         .model_path = model_path,
         .started_ms = nowMs(io),
+        .trace = tracemod.Writer.init(io, env, layout.trace),
     };
 
     // A stale socket from a killed daemon would block bind; nothing is listening
     // on it by definition, since we checked the pid file first.
     std.Io.Dir.deleteFileAbsolute(io, layout.sock) catch {};
 
-    // The 108-byte sun_path limit is a kernel constant, not something we can
-    // work around, so say which limit was hit and by how much — `NameTooLong`
-    // from inside the std networking stack points nowhere useful.
     const addr = std.Io.net.UnixAddress.init(layout.sock) catch |err| {
         // The sun_path limit is a kernel constant, not something we can work
         // around, so say which limit was hit and by how much — `NameTooLong`
@@ -760,6 +833,18 @@ pub fn run(
 
     try writePidFile(io, layout.pid);
     defer std.Io.Dir.deleteFileAbsolute(io, layout.pid) catch {};
+
+    // Watches the same roots the ingest loop scans. Purely an accelerator: if it
+    // fails to start, the interval scan still finds everything, just later.
+    var watch_roots: std.ArrayList([]const u8) = .empty;
+    defer watch_roots.deinit(gpa);
+    for (ingestRoots(&st)) |r| {
+        std.Io.Dir.accessAbsolute(io, r.path, .{}) catch continue;
+        watch_roots.append(gpa, r.path) catch {};
+    }
+    var watcher = fsevents.Watcher.start(gpa, watch_roots.items, &st.rescan) catch
+        fsevents.Watcher{ .flag = &st.rescan };
+    _ = &watcher;
 
     const embedder_thread = try std.Thread.spawn(.{}, embedderThread, .{&st});
     const ingest = try std.Thread.spawn(.{}, ingestThread, .{&st});

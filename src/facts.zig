@@ -10,20 +10,31 @@
 //! Storing both creates two truths and they drift — a birthday passes and the
 //! age does not. That one rule removes a whole class of problems.
 //!
-//! **`at` is when the fact took effect, not when it was written down.** "Salary
-//! became 480k in April" recorded in August still has `at = 2026-04-01`. When we
-//! learned it is answered by jj's commit time — two time axes, each carried by
-//! whatever already tracks it, instead of a version table (SPEC §16.2.1).
+//! **Two time axes, both in the file** (SPEC §16.2.1):
 //!
-//! Append-only means changing a value never rewrites a row, so there is no
-//! "how do I undo a bad edit" question: `jj revert` that line.
+//!   `at`            when the fact took effect
+//!   `recorded_at`   when it was written down
+//!
+//! "Salary became 480k in April" written down in August is `at = 2026-04-01`,
+//! `recorded_at = 2026-08-17`. The two are genuinely different questions and
+//! neither can be derived from the other.
+//!
+//! An earlier design left the second axis to version control — "the commit time
+//! already tracks it, do not store two truths". That was wrong for a reason
+//! worth remembering: **nothing ever read it.** An axis you cannot query is not
+//! an axis, and reading it would have meant forking `jj` and parsing its output.
+//! One column makes it real and makes `where recorded_at > '2026-08'` work.
+//!
+//! Append-only means changing a value never rewrites a row, so a correction is
+//! just another row with a later `recorded_at`. Version control is still a good
+//! idea here, but it is no longer load-bearing.
 
 const std = @import("std");
 const sqlite = @import("db/sqlite.zig");
 const csvmod = @import("ingest/csv.zig");
 const scan = @import("ingest/scan.zig");
 
-pub const columns = [_][]const u8{ "key", "value", "at", "src", "note" };
+pub const columns = [_][]const u8{ "key", "value", "at", "recorded_at", "src", "note" };
 
 /// The kb root holds `facts.csv` (and later `records/*.csv`) beside `memory/`.
 /// Restricting this collection to `.csv` is what keeps the memory markdown from
@@ -43,11 +54,14 @@ pub const Fact = struct {
     value_num: ?f64,
     value_txt: []const u8,
     at: []const u8,
+    /// When this row was written. Empty for a hand-written file that omits the
+    /// column — absent, not zero, because a made-up date would be worse.
+    recorded_at: []const u8,
     src: []const u8,
     note: []const u8,
 };
 
-/// Parse `facts.csv`. The five columns are built in — no `_schema.json` needed.
+/// Parse `facts.csv`. The six columns are built in — no `_schema.json` needed.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
     facts: []Fact,
     bad_rows: []usize,
@@ -57,6 +71,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
             a.free(f.key);
             a.free(f.value_txt);
             a.free(f.at);
+            a.free(f.recorded_at);
             a.free(f.src);
             a.free(f.note);
         }
@@ -70,6 +85,9 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
     const i_key = table.columnIndex("key") orelse return error.MissingColumn;
     const i_value = table.columnIndex("value") orelse return error.MissingColumn;
     const i_at = table.columnIndex("at") orelse return error.MissingColumn;
+    // Optional: a hand-written file predating the column still parses, it just
+    // cannot answer "when did I learn this".
+    const i_recorded = table.columnIndex("recorded_at");
     const i_src = table.columnIndex("src");
     const i_note = table.columnIndex("note");
 
@@ -79,6 +97,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
             gpa.free(f.key);
             gpa.free(f.value_txt);
             gpa.free(f.at);
+            gpa.free(f.recorded_at);
             gpa.free(f.src);
             gpa.free(f.note);
         }
@@ -94,6 +113,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
             .value_num = std.fmt.parseFloat(f64, raw_value) catch null,
             .value_txt = try gpa.dupe(u8, raw_value),
             .at = try gpa.dupe(u8, row[i_at]),
+            .recorded_at = try gpa.dupe(u8, if (i_recorded) |i| row[i] else ""),
             .src = try gpa.dupe(u8, if (i_src) |i| row[i] else ""),
             .note = try gpa.dupe(u8, if (i_note) |i| row[i] else ""),
         });
@@ -120,8 +140,9 @@ pub fn replaceFor(
         _ = try st.step();
     }
     var st = try db.prepare(
-        \\INSERT INTO facts(chunk_id, doc_id, line_no, key, value_num, value_txt, at, src, note)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        \\INSERT INTO facts(chunk_id, doc_id, line_no, key, value_num, value_txt,
+        \\                  at, recorded_at, src, note)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
     );
     defer st.finalize();
     for (facts, 0..) |f, i| {
@@ -134,8 +155,9 @@ pub fn replaceFor(
         if (f.value_num) |n| try st.bindF64(5, n) else try st.bindNull(5);
         try st.bindText(6, f.value_txt);
         try st.bindText(7, f.at);
-        try st.bindText(8, f.src);
-        try st.bindText(9, f.note);
+        try st.bindText(8, f.recorded_at);
+        try st.bindText(9, f.src);
+        try st.bindText(10, f.note);
         _ = try st.step();
     }
 }
@@ -144,12 +166,14 @@ pub const Current = struct {
     key: []const u8,
     value: []const u8,
     at: []const u8,
+    recorded_at: []const u8,
     note: []const u8,
 
     pub fn deinit(self: Current, gpa: std.mem.Allocator) void {
         gpa.free(self.key);
         gpa.free(self.value);
         gpa.free(self.at);
+        gpa.free(self.recorded_at);
         gpa.free(self.note);
     }
 };
@@ -173,6 +197,7 @@ fn parseFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?struct {
             a.free(f.key);
             a.free(f.value_txt);
             a.free(f.at);
+            a.free(f.recorded_at);
             a.free(f.src);
             a.free(f.note);
         }
@@ -219,9 +244,11 @@ pub fn currentAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Curre
             if (std.mem.order(u8, f.at, existing.at) == .lt) break;
             gpa.free(existing.value);
             gpa.free(existing.at);
+            gpa.free(existing.recorded_at);
             gpa.free(existing.note);
             existing.value = try gpa.dupe(u8, f.value_txt);
             existing.at = try gpa.dupe(u8, f.at);
+            existing.recorded_at = try gpa.dupe(u8, f.recorded_at);
             existing.note = try gpa.dupe(u8, f.note);
             break;
         } else {
@@ -229,6 +256,7 @@ pub fn currentAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Curre
                 .key = try gpa.dupe(u8, f.key),
                 .value = try gpa.dupe(u8, f.value_txt),
                 .at = try gpa.dupe(u8, f.at),
+                .recorded_at = try gpa.dupe(u8, f.recorded_at),
                 .note = try gpa.dupe(u8, f.note),
             });
         }
@@ -266,6 +294,7 @@ pub fn history(
             .key = try gpa.dupe(u8, f.key),
             .value = try gpa.dupe(u8, f.value_txt),
             .at = try gpa.dupe(u8, f.at),
+            .recorded_at = try gpa.dupe(u8, f.recorded_at),
             .note = try gpa.dupe(u8, f.note),
         });
     }
@@ -291,6 +320,7 @@ pub fn append(
     key: []const u8,
     value: []const u8,
     at: []const u8,
+    recorded_at: []const u8,
     src: []const u8,
     note: []const u8,
 ) !void {
@@ -309,7 +339,7 @@ pub fn append(
     const w = &writer.interface;
 
     if (!exists or end == 0) try csvmod.writeRow(w, &columns);
-    try csvmod.writeRow(w, &.{ key, value, at, src, note });
+    try csvmod.writeRow(w, &.{ key, value, at, recorded_at, src, note });
     try w.flush();
 }
 

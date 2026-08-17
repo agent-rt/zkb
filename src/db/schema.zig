@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 5;
+pub const schema_version: i64 = 6;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -186,6 +186,17 @@ const ddl_v5 =
     \\) STRICT;
 ;
 
+/// v6: `facts.recorded_at` — when the row was written, as opposed to when the
+/// fact took effect.
+///
+/// v5 and earlier left this to version control ("the commit time already tracks
+/// it"). Nothing ever read it, which is what makes an axis imaginary rather than
+/// real. A column can be queried; a commit timestamp would have meant forking
+/// `jj` and parsing its output.
+const ddl_v6 =
+    \\ALTER TABLE facts ADD COLUMN recorded_at TEXT NOT NULL DEFAULT '';
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -204,6 +215,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v3);
         try db.exec(ddl_v4);
         try db.exec(ddl_v5);
+        try db.exec(ddl_v6);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -217,6 +229,20 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 3) try migrateToV3(db);
     if (have < 4) try migrateToV4(db);
     if (have < 5) try migrateToV5(db);
+    if (have < 6) try migrateToV6(db);
+}
+
+/// v5 -> v6: the second time axis becomes a column.
+///
+/// Existing rows get `''` rather than a guessed date: "not recorded" is the
+/// truth for a row written before the column existed, and inventing a timestamp
+/// would make it un-auditable.
+fn migrateToV6(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v6);
+    try setMetaInt(db, "schema_version", 6);
+    try db.exec("COMMIT;");
 }
 
 /// v4 -> v5: the records schema registry.

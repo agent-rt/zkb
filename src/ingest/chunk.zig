@@ -5,7 +5,7 @@
 //! and a chunk over the model's limit is silently truncated with no error —
 //! so the count has to be the real one (SPEC §4.2).
 //!
-//! Parameters are the v0.1 values inherited from an earlier design. They are configurable
+//! Parameters are v0.1 values inherited from an earlier design. They are configurable
 //! precisely because they have no experimental backing yet; E2's baseline is
 //! what will let them be tuned against something.
 

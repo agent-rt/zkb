@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test
+    # Apple Silicon: Metal is the only accelerator wired up, and the llama.cpp
+    # build below assumes it.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # llama.cpp is a cmake dependency built once and linked statically. Cached
+      # because it dominates a cold build.
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: build/llama.cpp
+          key: llama-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+      - name: Build llama.cpp
+        run: zig build llama-cpp
+
+      - name: zig build test
+        run: zig build test --summary all
+      - name: zig build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      # No model in CI: 609 MiB per run is not worth it, so this covers the
+      # paths that must work without one.
+      - name: smoke
+        run: |
+          ./zig-out/bin/zkb version
+          ./zig-out/bin/zkb --help > /dev/null || true
+          ./zig-out/bin/zkb records > /dev/null
+          ./zig-out/bin/zkb skill | head -1 | grep -q '^---$'

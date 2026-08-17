@@ -158,6 +158,26 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_e5.addArgs(args);
         const e5_step = b.step("e5-ctx", "E5b: embedding throughput vs n_ctx");
         e5_step.dependOn(&run_e5.step);
+
+    }
+
+    // E7 needs no model either: it reads vectors that are already indexed.
+    {
+        const e7 = b.addExecutable(.{
+            .name = "e7_thresholds",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/experiments/e7_thresholds.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "zkb", .module = zkb_mod }},
+            }),
+        });
+        if (want_llama) addLlamaLinks(b, e7.root_module, is_apple);
+        const run_e7 = b.addRunArtifact(e7);
+        if (b.args) |args| run_e7.addArgs(args);
+        const e7_step = b.step("e7", "E7: pool near-duplicate and island candidates for judgement");
+        e7_step.dependOn(&run_e7.step);
     }
 
     // ------------------------------------------------- llama.cpp cmake step
@@ -205,6 +225,9 @@ fn addLlamaLinks(b: *std.Build, mod: *std.Build.Module, is_apple: bool) void {
         mod.linkFramework("Metal", .{});
         mod.linkFramework("MetalKit", .{});
         mod.linkFramework("Accelerate", .{});
+        // FSEvents + CoreFoundation, for the daemon's filesystem watcher
+        // (src/util/fsevents.zig).
+        mod.linkFramework("CoreServices", .{});
     }
     mod.link_libcpp = true;
 }

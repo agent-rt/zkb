@@ -8,6 +8,7 @@ const daemon_cmd = @import("cli/daemon_cmd.zig");
 const query_cmd = @import("cli/query_cmd.zig");
 const memory_cmd = @import("cli/memory_cmd.zig");
 const records_cmd = @import("cli/records_cmd.zig");
+const skill_cmd = @import("cli/skill_cmd.zig");
 const mcp = @import("mcp/server.zig");
 
 const usage =
@@ -29,12 +30,13 @@ const usage =
     \\  facts [key] [--history]
     \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
     \\  records [type] [--where EXPR] [--search TEXT] [--agg EXPR]
-    \\                 [--schema] [-n N] [--json]
+    \\                 [--window "avg(f) over N by f"] [--schema] [-n N] [--json]
     \\  sql <select ...> [--json]
     \\
     \\  status
     \\  maintain [--since last] [--check NAME] [--all] [--json]
     \\  mcp                          stdio MCP server (for Claude Code etc.)
+    \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
     \\  doctor [--model PATH]
     \\  model pull [--quant q8_0|f16]
     \\  version
@@ -331,6 +333,8 @@ pub fn main(init: std.process.Init) !u8 {
                 opts.search = args.next();
             } else if (std.mem.eql(u8, a, "--agg")) {
                 opts.agg = args.next();
+            } else if (std.mem.eql(u8, a, "--window")) {
+                opts.window = args.next();
             } else if (std.mem.eql(u8, a, "--schema")) {
                 opts.show_schema = true;
             } else if (std.mem.eql(u8, a, "--json")) {
@@ -365,6 +369,10 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         return records_cmd.sqlCmd(gpa, init.environ_map, w, q, json);
+    }
+
+    if (std.mem.eql(u8, cmd, "skill")) {
+        return skill_cmd.run(gpa, init.io, init.environ_map, w);
     }
 
     if (std.mem.eql(u8, cmd, "status")) {
@@ -567,7 +575,8 @@ fn maintainCmd(
     };
     defer db.close();
 
-    var report = try zkb.maintain.run(gpa, &db, .{ .checks = checks });
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+    var report = try zkb.maintain.run(gpa, &db, .{ .checks = checks, .now_ms = now_ms });
     defer report.deinit(gpa);
 
     if (as_json) {
@@ -625,7 +634,6 @@ fn maintainCmd(
         if (report.findings.len == 0) try w.writeAll("no findings\n");
     }
 
-    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    try zkb.maintain.record(gpa, &db, &report, now_ms);
+    try zkb.maintain.record(gpa, &db, &report, checks, now_ms);
     return 0;
 }

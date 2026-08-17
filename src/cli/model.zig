@@ -11,40 +11,17 @@
 
 const std = @import("std");
 const zkb = @import("zkb");
+const registry = zkb.model_registry;
 
 const Writer = std.Io.Writer;
 
-pub const Quant = enum { q8_0, f16 };
-
-pub const Spec = struct {
-    file: []const u8,
-    url: []const u8,
-    size: u64,
-    /// SHA-256 == the LFS oid from https://huggingface.co/api/models/<repo>/tree/main
-    sha256: []const u8,
-};
-
-const repo_base = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/";
-
-pub fn spec(q: Quant) Spec {
-    return switch (q) {
-        // q8_0 is the default: E3 measured cos 0.9997 against the fp32
-        // reference, so the quality gap to f16 is inside quantization noise
-        // while halving resident memory. See docs/experiments/E3-pooling.md.
-        .q8_0 => .{
-            .file = "Qwen3-Embedding-0.6B-Q8_0.gguf",
-            .url = repo_base ++ "Qwen3-Embedding-0.6B-Q8_0.gguf",
-            .size = 639_150_592,
-            .sha256 = "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
-        },
-        .f16 => .{
-            .file = "Qwen3-Embedding-0.6B-f16.gguf",
-            .url = repo_base ++ "Qwen3-Embedding-0.6B-f16.gguf",
-            .size = 1_197_629_632,
-            .sha256 = "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340",
-        },
-    };
-}
+pub const Quant = registry.Quant;
+pub const Spec = registry.Spec;
+pub const spec = registry.spec;
+pub const hfBlob = registry.hfBlob;
+pub const resolve = registry.resolve;
+pub const Resolved = registry.Resolved;
+pub const Source = registry.Source;
 
 pub const Error = error{
     HashMismatch,
@@ -69,11 +46,16 @@ pub fn pull(
     const part = try std.fmt.allocPrint(gpa, "{s}.part", .{final});
     defer gpa.free(part);
 
-    // Absolute paths resolve fine through cwd; there is no *Absolute variant.
-    std.Io.Dir.createDirPath(.cwd(), io, layout.models) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try layout.ensureDirs(io);
+
+    // Already in a Hugging Face cache? Nothing to do — zkb reads it in place
+    // rather than making a second copy of the same 609 MiB.
+    if (try hfBlob(gpa, io, env, s)) |p| {
+        defer gpa.free(p);
+        try w.print("already present in the Hugging Face cache:\n  {s}\n", .{p});
+        try w.writeAll("zkb will read it there; nothing downloaded\n");
+        return;
+    }
 
     // Already there and intact? Say so and stop — re-hashing 609 MiB is much
     // cheaper than re-downloading it, and silently redownloading would be rude.

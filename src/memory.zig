@@ -20,6 +20,7 @@ const std = @import("std");
 const sqlite = @import("db/sqlite.zig");
 const markdown = @import("ingest/markdown.zig");
 const scan = @import("ingest/scan.zig");
+const utf8 = @import("util/utf8.zig");
 
 /// `archive/` is excluded, which is what makes `forget` mean something: the file
 /// stays on disk and in version control, but leaves the index entirely. Relying
@@ -230,7 +231,7 @@ pub fn slug(gpa: std.mem.Allocator, body: []const u8, fallback: []const u8) ![]u
 ///
 /// Time enters ranking as **its own path**, not as a multiplicative decay on the
 /// score. A decay needs a coefficient, and a coefficient with no experimental
-/// backing is exactly the debt a prior design flagged and that RRF was chosen
+/// backing is exactly the debt an earlier design flagged and that RRF was chosen
 /// to avoid. A rank list needs no calibration and no units (SPEC §15.6).
 ///
 /// Only used by `recall`. In `search` the user asked for something specific, and
@@ -326,7 +327,7 @@ pub fn findSimilar(
         const cos = 1.0 - st.columnF64(2);
         try out.append(gpa, .{
             .rel_path = try gpa.dupe(u8, st.columnText(0)),
-            .excerpt = try gpa.dupe(u8, text[0..@min(text.len, 160)]),
+            .excerpt = try gpa.dupe(u8, utf8.cut(text, 160)),
             .cos = cos,
         });
     }

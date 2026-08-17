@@ -13,6 +13,7 @@ const std = @import("std");
 const sqlite = @import("db/sqlite.zig");
 const store = @import("db/store.zig");
 const schema = @import("db/schema.zig");
+const maintain_vec = @import("maintain_vec.zig");
 const markdown = @import("ingest/markdown.zig");
 
 /// Set the first time link extraction runs.
@@ -38,6 +39,22 @@ pub const Check = enum {
     oversized,
     /// No frontmatter block at all.
     no_frontmatter,
+    /// The same thing written twice in two places with no structural reason to
+    /// agree. Vector-based, thresholded — see maintain_vec.zig.
+    near_duplicate,
+    /// Identical content at two paths.
+    duplicate_content,
+    /// A chunk connected to nothing else in the corpus.
+    ///
+    /// **Off by default**, because E7 measured it as not viable on a corpus of
+    /// unrelated projects: at any threshold that reports a readable number of
+    /// chunks, what it reports is ordinary content about a topic only one
+    /// project covers. That is not isolated knowledge, it is a corpus of forty
+    /// projects. The check is meaningful where documents are expected to be
+    /// topically interlinked, so it stays available via `--check island`.
+    island,
+    /// Old, and superseded by something newer that says the same thing.
+    stale,
 
     /// Checks that run by default.
     ///
@@ -45,14 +62,31 @@ pub const Check = enum {
     /// fires on 135 of 195 documents (69%). A check that flags most of the corpus
     /// is not a finding, it is a description of the corpus — and it would bury
     /// the handful of findings that do need acting on. Frontmatter is a
-    /// convention of specific namespaces (specific namespaces), not a global rule.
+    /// convention of specific namespaces, not a global rule.
     /// Still available via `--check no_frontmatter`.
     pub fn default() []const Check {
-        return &.{ .index_failed, .broken_link, .orphan, .not_in_index, .fragment, .oversized };
+        return &.{
+            .index_failed, .broken_link,      .orphan, .not_in_index,
+            .fragment,     .oversized,        .near_duplicate,
+            .duplicate_content,
+        };
     }
 
     pub fn all() []const Check {
-        return &.{ .index_failed, .broken_link, .orphan, .not_in_index, .fragment, .oversized, .no_frontmatter };
+        return &.{
+            .index_failed,      .broken_link, .orphan, .not_in_index,
+            .fragment,          .oversized,   .island, .near_duplicate,
+            .duplicate_content, .stale,       .no_frontmatter,
+        };
+    }
+
+    /// True for the checks that need vectors, which are the expensive ones.
+    /// Grouped so a run that wants none of them can skip the whole KNN pass.
+    pub fn isVector(self: Check) bool {
+        return switch (self) {
+            .near_duplicate, .duplicate_content, .island, .stale => true,
+            else => false,
+        };
     }
 
     pub fn parse(name: []const u8) ?Check {
@@ -99,6 +133,10 @@ pub const Report = struct {
 
 pub const Options = struct {
     checks: []const Check = Check.default(),
+    vec: maintain_vec.Config = .{},
+    /// Wall clock, for the stale check. Zero means "skip the age comparison",
+    /// which is what a caller with no clock should get rather than 1970.
+    now_ms: i64 = 0,
     /// A document with one chunk under this many tokens is a fragment.
     fragment_max_tokens: i64 = 100,
     /// More chunks than this suggests the document should be split.
@@ -133,7 +171,15 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, opts: Options) !Report {
         .fragment => try checkFragment(gpa, db, &findings, opts.fragment_max_tokens),
         .oversized => try checkOversized(gpa, db, &findings, opts.oversized_chunks),
         .no_frontmatter => try checkNoFrontmatter(gpa, db, &findings),
+        // Handled together below: all four read the same KNN pass.
+        .near_duplicate, .duplicate_content, .island, .stale => {},
     };
+
+    var wants_vector = false;
+    for (opts.checks) |c| {
+        if (c.isVector()) wants_vector = true;
+    }
+    if (wants_vector) try runVectorChecks(gpa, db, &findings, opts);
 
     return .{
         .findings = try findings.toOwnedSlice(gpa),
@@ -155,6 +201,83 @@ fn add(
         .path = try gpa.dupe(u8, path),
         .detail = try gpa.dupe(u8, detail),
     });
+}
+
+/// One KNN pass feeds all four vector checks, because they are all questions
+/// about the same neighbour list.
+fn runVectorChecks(
+    gpa: std.mem.Allocator,
+    db: *sqlite.Db,
+    out: *std.ArrayList(Finding),
+    opts: Options,
+) !void {
+    var wanted: [4]bool = @splat(false);
+    for (opts.checks) |c| switch (c) {
+        .near_duplicate => wanted[0] = true,
+        .duplicate_content => wanted[1] = true,
+        .island => wanted[2] = true,
+        .stale => wanted[3] = true,
+        else => {},
+    };
+
+    var result = try maintain_vec.run(gpa, db, opts.vec);
+    defer result.deinit(gpa);
+
+    var kbuf: [1024]u8 = undefined;
+    var dbuf: [1024]u8 = undefined;
+
+    for (result.pairs) |p| {
+        const check: Check = switch (p.kind) {
+            .duplicate_content => .duplicate_content,
+            .near_duplicate => .near_duplicate,
+            // Expected overlap is computed and then deliberately not reported:
+            // on a corpus built as a document matrix it is the majority of what
+            // the threshold finds, and reporting it is what makes the whole
+            // check read as noise (SPEC §14.5).
+            .expected_overlap => continue,
+        };
+        if (check == .near_duplicate and !wanted[0]) continue;
+        if (check == .duplicate_content and !wanted[1]) continue;
+
+        // Keyed on the path pair, not on chunk ids: chunk ids change on every
+        // re-index, and a finding that changes identity every run makes every
+        // run look entirely new.
+        const key = try std.fmt.bufPrint(&kbuf, "{t}:{s}|{s}", .{ check, p.a_path, p.b_path });
+        const detail = try std.fmt.bufPrint(&dbuf, "cos {d:.3} with {s}{s}{s}", .{
+            p.cos,
+            p.b_path,
+            if (p.b_heading.len != 0) " > " else "",
+            p.b_heading,
+        });
+        try add(gpa, out, check, key, p.a_path, detail);
+    }
+
+    if (wanted[2]) {
+        for (result.islands) |i| {
+            const key = try std.fmt.bufPrint(&kbuf, "island:{s}|{s}", .{ i.path, i.heading });
+            const detail = try std.fmt.bufPrint(&dbuf, "nearest is {s} at cos {d:.3}", .{
+                if (i.nearest_path.len != 0) i.nearest_path else "(nothing)",
+                i.cos,
+            });
+            try add(gpa, out, .island, key, i.path, detail);
+        }
+    }
+
+    if (wanted[3] and opts.now_ms != 0) {
+        const stale = try maintain_vec.staleCandidates(gpa, result.pairs, opts.now_ms, opts.vec);
+        defer {
+            for (stale) |s| s.deinit(gpa);
+            gpa.free(stale);
+        }
+        for (stale) |s| {
+            const key = try std.fmt.bufPrint(&kbuf, "stale:{s}", .{s.old_path});
+            const days = @divTrunc(opts.now_ms - s.old_mtime_ms, std.time.ms_per_day);
+            const detail = try std.fmt.bufPrint(&dbuf, "{d} days old; {s} says the same at cos {d:.3}", .{
+                days, s.newer_path, s.cos,
+            });
+            try add(gpa, out, .stale, key, s.old_path, detail);
+        }
+    }
 }
 
 fn checkIndexFailed(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
@@ -293,6 +416,15 @@ fn checkNoFrontmatter(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayLis
     }
 }
 
+/// Schemes that point outside the knowledge base. Everything else is treated as
+/// a collection-absolute path.
+fn isExternalScheme(scheme: []const u8) bool {
+    inline for (.{ "http", "https", "file", "ftp", "mailto", "data" }) |ext| {
+        if (std.ascii.eqlIgnoreCase(scheme, ext)) return true;
+    }
+    return false;
+}
+
 fn isConventionFile(path: []const u8) bool {
     const base = std.fs.path.basename(path);
     for (not_expected_inbound) |n| if (std.mem.eql(u8, base, n)) return true;
@@ -385,7 +517,16 @@ fn emptyDiff(gpa: std.mem.Allocator, report: *const Report) !Diff {
 }
 
 /// Persist the finding keys so the next run can diff against them.
-pub fn record(gpa: std.mem.Allocator, db: *sqlite.Db, report: *const Report, now_ms: i64) !void {
+/// `checks` is recorded, not assumed: `--since last` diffs a run against the
+/// previous one, and comparing a single-check run against a full one would
+/// report every finding the narrow run did not look for as newly resolved.
+pub fn record(
+    gpa: std.mem.Allocator,
+    db: *sqlite.Db,
+    report: *const Report,
+    checks: []const Check,
+    now_ms: i64,
+) !void {
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(gpa);
     try json.appendSlice(gpa, "{\"keys\":[");
@@ -402,8 +543,15 @@ pub fn record(gpa: std.mem.Allocator, db: *sqlite.Db, report: *const Report, now
         "INSERT INTO maintenance_runs(started_at, checks, report) VALUES (?1, ?2, ?3)",
     );
     defer st.finalize();
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(gpa);
+    for (checks, 0..) |c, i| {
+        if (i != 0) try names.append(gpa, ',');
+        try names.appendSlice(gpa, @tagName(c));
+    }
+
     try st.bindI64(1, now_ms);
-    try st.bindText(2, "all");
+    try st.bindText(2, names.items);
     try st.bindText(3, json.items);
     _ = try st.step();
 }
@@ -484,22 +632,30 @@ fn normalizeTarget(
     is_wiki: bool,
 ) !?[]u8 {
     var t = raw;
-    // A kb:// URI is rooted at the collection, not relative to the document
-    // that mentions it: kb://projects/alpha/REQ.md means exactly that path.
-    const is_lore = std.mem.startsWith(u8, t, "kb://");
-    if (is_lore) t = t["kb://".len..];
+    // A custom URI scheme is rooted at the collection, not relative to the
+    // document that mentions it: `zkb://projects/x/REQ.md` means exactly that
+    // path. Knowledge-base tools commonly define one, and resolving it as a
+    // relative path is the single largest source of false "broken link"
+    // findings — measured at 288 of 348 on one corpus.
+    //
+    // Generic on purpose: any scheme that is not a network or filesystem URL is
+    // treated this way, so no tool's name is hardcoded here.
+    const scheme_end = std.mem.indexOf(u8, t, "://");
+    const is_collection_uri = if (scheme_end) |e| !isExternalScheme(t[0..e]) else false;
+    if (is_collection_uri) t = t[scheme_end.? + 3 ..];
     if (t.len == 0) return null;
     // A pure anchor points inside the same document; not a link between files.
     if (t[0] == '#') return null;
     // Drop any fragment.
     if (std.mem.indexOfScalar(u8, t, '#')) |h| t = t[0..h];
     if (t.len == 0) return null;
+    // Anything still carrying a scheme is external: http(s), file, mailto.
     if (std.mem.indexOf(u8, t, "://") != null) return null;
 
     // A wikilink without an extension names a document by stem.
     const needs_ext = std.mem.indexOfScalar(u8, t, '.') == null;
 
-    if (is_lore or t[0] == '/') {
+    if (is_collection_uri or t[0] == '/') {
         const abs = std.mem.trimStart(u8, t, "/");
         return if (needs_ext)
             try std.fmt.allocPrint(gpa, "{s}.md", .{abs})

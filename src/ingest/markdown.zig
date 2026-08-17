@@ -337,8 +337,14 @@ pub const LinkKind = enum {
     md,
     /// [[wikilink]]
     wiki,
-    /// kb:// URI
-    lore,
+    /// A `scheme://` rooted at the collection rather than the web —
+    /// `zkb://projects/x/REQ.md` names exactly that path.
+    ///
+    /// The scheme itself is **not** matched: anything that is not a network or
+    /// filesystem URL is treated this way. `zkb://` is the documented spelling,
+    /// but a corpus that already uses another tool's scheme keeps resolving
+    /// without a migration, which matters when the links number in the hundreds.
+    collection_uri,
     /// depends_on / related_to / part_of in frontmatter
     frontmatter,
     /// Any scheme:// — recorded but never resolved. zkb does not go online, and
@@ -502,34 +508,55 @@ fn extractInline(
                 }
             }
         }
-        // Bare kb:// URI outside any markdown link syntax.
-        if (source[i] == 'l' and std.mem.startsWith(u8, source[i..end], "kb://")) {
-            var j = i;
-            while (j < end and !std.ascii.isWhitespace(source[j]) and
-                source[j] != ')' and source[j] != ']' and source[j] != '`') j += 1;
-            const raw = source[i..j];
-            // A bare "kb://" is prose naming the scheme, not a reference to
-            // anything. Recording it guarantees a permanently broken link.
-            if (raw.len > "kb://".len) {
+        // A bare `scheme://path` outside any markdown link syntax. Scanned
+        // generically so no tool's URI scheme has to be known here.
+        if (bareUriAt(source, i, end)) |raw| {
+            // A scheme with nothing after it is prose naming the scheme, not a
+            // reference. Recording it guarantees a permanently broken link.
+            const sep = std.mem.indexOf(u8, raw, "://").? + 3;
+            if (raw.len > sep) {
                 try out.append(gpa, .{ .kind = classify(raw), .raw = raw, .byte_offset = i });
             }
-            i = j;
+            i += raw.len;
             continue;
         }
         i += 1;
     }
 }
 
+/// Schemes that leave the knowledge base.
+fn isExternalScheme(scheme: []const u8) bool {
+    inline for (.{ "http", "https", "file", "ftp", "data" }) |ext| {
+        if (std.ascii.eqlIgnoreCase(scheme, ext)) return true;
+    }
+    return false;
+}
+
+/// A bare `scheme://rest` starting at `i`, if there is one. The scheme must be
+/// letters, which is what keeps `://` inside prose from matching.
+fn bareUriAt(source: []const u8, i: usize, end: usize) ?[]const u8 {
+    if (!std.ascii.isAlphabetic(source[i])) return null;
+    if (i > 0 and (std.ascii.isAlphanumeric(source[i - 1]) or source[i - 1] == '/')) return null;
+    var j = i;
+    while (j < end and std.ascii.isAlphanumeric(source[j])) j += 1;
+    if (j + 3 > end or !std.mem.eql(u8, source[j..][0..3], "://")) return null;
+    j += 3;
+    while (j < end and !std.ascii.isWhitespace(source[j]) and
+        source[j] != ')' and source[j] != ']' and source[j] != '`') j += 1;
+    return source[i..j];
+}
+
 /// Extensions zkb indexes. A link to anything else is an asset reference.
 const document_exts = [_][]const u8{ ".md", ".txt", ".mdx" };
 
 fn classify(raw: []const u8) LinkKind {
-    if (std.mem.startsWith(u8, raw, "kb://")) {
-        return if (isAsset(raw)) .asset else .lore;
+    if (std.mem.indexOf(u8, raw, "://")) |e| {
+        // http/file/mailto point outside the knowledge base — file:// in
+        // particular is an absolute machine path that must never be joined onto
+        // a document's directory. Any other scheme is a collection-rooted URI.
+        if (isExternalScheme(raw[0..e])) return .external;
+        return if (isAsset(raw)) .asset else .collection_uri;
     }
-    // Any scheme is external, not just http: file:// in particular is an absolute
-    // machine path that must never be joined onto a document's directory.
-    if (std.mem.indexOf(u8, raw, "://") != null) return .external;
     if (std.mem.startsWith(u8, raw, "mailto:")) return .external;
     if (isAsset(raw)) return .asset;
     return .md;

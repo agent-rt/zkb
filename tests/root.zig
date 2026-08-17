@@ -18,6 +18,8 @@ test {
     _ = @import("csv_test.zig");
     _ = @import("memory_test.zig");
     _ = @import("records_test.zig");
+    _ = @import("paths_test.zig");
+    _ = @import("utf8_test.zig");
 }
 
 // ---------------------------------------------------------------------------

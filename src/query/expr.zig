@@ -344,3 +344,70 @@ fn lowerBuf(s: []const u8) []const u8 {
     for (trimmed, 0..) |c, i| S.buf[i] = std.ascii.toLower(c);
     return S.buf[0..trimmed.len];
 }
+
+// ---------------------------------------------------------------------------
+// --window
+// ---------------------------------------------------------------------------
+
+/// `avg(amount) over 7 by date [partition category]`
+///
+/// A moving aggregate over the `n` rows ending at each row, ordered by a field.
+/// SQLite has had window functions since 3.25 and they are already compiled in —
+/// this only exposes them through the same whitelist discipline as `--where`, so
+/// a field name still cannot reach the SQL without matching the schema.
+///
+/// Separate from `--agg` rather than an `OVER` clause bolted onto it, because
+/// the two produce different shapes: `--agg` collapses rows, `--window` keeps
+/// every row and adds a column. Sharing a flag would make `by` mean GROUP BY in
+/// one form and ORDER BY in the other.
+pub const Window = struct {
+    func: AggFn,
+    field: []const u8,
+    /// Rows in the frame, counting the current one.
+    n: u32,
+    order_by: []const u8,
+    partition_by: ?[]const u8,
+};
+
+pub fn parseWindow(schema: *const records.Schema, source: []const u8) Error!Window {
+    var s = std.mem.trim(u8, source, " \t");
+
+    const open = std.mem.indexOfScalar(u8, s, '(') orelse return error.UnexpectedToken;
+    const func = std.meta.stringToEnum(AggFn, lowerBuf(s[0..open])) orelse
+        return error.UnknownOperator;
+
+    const close = std.mem.indexOfScalarPos(u8, s, open, ')') orelse return error.UnexpectedEnd;
+    const field = std.mem.trim(u8, s[open + 1 .. close], " \t");
+    if (schema.find(field) == null) return error.UnknownField;
+
+    s = std.mem.trim(u8, s[close + 1 ..], " \t");
+    if (!std.ascii.startsWithIgnoreCase(s, "over")) return error.UnexpectedToken;
+    s = std.mem.trimStart(u8, s[4..], " \t");
+
+    var it = std.mem.tokenizeAny(u8, s, " \t");
+    const n_text = it.next() orelse return error.UnexpectedEnd;
+    const n = std.fmt.parseInt(u32, n_text, 10) catch return error.UnexpectedToken;
+    if (n == 0) return error.UnexpectedToken;
+
+    const by_kw = it.next() orelse return error.UnexpectedEnd;
+    if (!std.ascii.eqlIgnoreCase(by_kw, "by")) return error.UnexpectedToken;
+    const order_by = it.next() orelse return error.UnexpectedEnd;
+    if (schema.find(order_by) == null) return error.UnknownField;
+
+    var partition_by: ?[]const u8 = null;
+    if (it.next()) |kw| {
+        if (!std.ascii.eqlIgnoreCase(kw, "partition")) return error.UnexpectedToken;
+        const p = it.next() orelse return error.UnexpectedEnd;
+        if (schema.find(p) == null) return error.UnknownField;
+        partition_by = p;
+    }
+    if (it.next() != null) return error.UnexpectedToken;
+
+    return .{
+        .func = func,
+        .field = field,
+        .n = n,
+        .order_by = order_by,
+        .partition_by = partition_by,
+    };
+}

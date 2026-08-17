@@ -75,28 +75,35 @@ pub fn run(
     var mode = opts.mode;
 
     if (mode != .keyword) {
-        const model_path = opts.model orelse
-            try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-        defer if (opts.model == null) gpa.free(model_path);
+        const found = zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0) catch null;
+        defer if (found) |f| f.deinit(gpa);
 
-        if (std.Io.Dir.accessAbsolute(io, model_path, .{})) |_| {
-            var embedder = try zkb.embed.Embedder.init(gpa, model_path, .{});
+        if (found) |f| {
+            var embedder = try zkb.embed.Embedder.init(gpa, f.path, .{});
             defer embedder.deinit();
 
             // Query side takes the instruct prefix; documents do not (SPEC §3.3).
             const vec = try gpa.alloc(f32, embedder.n_embd);
             _ = try embedder.embedQuery(zkb.embed.default_query_task, opts.query, vec);
             query_vec = vec;
-        } else |_| {
+        } else {
             try w.print("note: model unavailable, falling back to keyword search\n", .{});
             mode = .keyword;
         }
     }
 
+    const trace_t0: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
     var results = try zkb.hybrid.search(gpa, &db, mode, opts.query, query_vec, collection_id, .{
         .top_k = opts.top_k,
     });
     defer results.deinit(gpa);
+    {
+        // Same trace as the daemon writes, so a corpus of queries is not split
+        // by which path happened to serve them.
+        const tw = zkb.trace.Writer.init(io, env, layout.trace);
+        const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+        tw.record(gpa, opts.query, &results, now - trace_t0);
+    }
 
     // Staleness is reported, never hidden: a stopped daemon or a failed document
     // means the answer is incomplete and the user cannot tell otherwise.
@@ -142,10 +149,7 @@ pub fn run(
 /// Collapse whitespace so a multi-line chunk stays one readable line, and cut on
 /// a UTF-8 boundary so the terminal never sees a broken sequence.
 fn writeExcerpt(w: *Writer, text: []const u8, max_bytes: usize) !void {
-    var end = @min(text.len, max_bytes);
-    if (end < text.len) {
-        while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    }
+    const end = zkb.utf8.truncate(text, max_bytes);
     var last_space = false;
     for (text[0..end]) |c| {
         const is_space = c == '\n' or c == '\r' or c == '\t' or c == ' ';

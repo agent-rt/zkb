@@ -96,7 +96,7 @@ test "too few rows is not enough evidence for an enum" {
 
 test "a distinct short token containing a digit is an identifier, not prose" {
     // Embedding a SKU adds noise to the semantic neighbourhood and answers no
-    // question — the same noise that embedding a whole record row produces.
+    // question — the noise that embedding a whole record row produces.
     try testing.expectEqual(records.Kind.id, try kindOf(
         "id\nA_0001\nA_0002\nA_0003\nB_0001\nB_0002\nB_0003\nC_0001\nC_0002\nC_0003\n",
         "id",
@@ -376,4 +376,97 @@ test "sum(*) is meaningless and is refused" {
     var schema = try testSchema();
     defer schema.deinit(gpa);
     try testing.expectError(error.UnexpectedToken, expr.parseAgg(&schema, "sum(*)"));
+}
+
+// ---------------------------------------------------------------------------
+// rowLabel
+// ---------------------------------------------------------------------------
+
+test "a row is labelled by its most distinctive text field, not its first" {
+    // Measured failure: a four-row expenses file labelled every row `JPY`,
+    // because `currency` sat left of `merchant` and, at that sample size, was
+    // still classed as text. The leftmost column is often the least
+    // identifying thing in a row.
+    var schema = try inferFrom(
+        "currency,merchant,category\n" ++
+            "JPY,セブンイレブン,food\n" ++
+            "JPY,ヨドバシカメラ,electronics\n" ++
+            "JPY,ブルーボトル,food\n" ++
+            "JPY,無印良品,home\n" ++
+            "JPY,ユニクロ,clothing\n" ++
+            "JPY,ローソン,food\n" ++
+            "JPY,ビックカメラ,electronics\n" ++
+            "JPY,ドトール,food\n",
+    );
+    defer schema.deinit(gpa);
+
+    const row = [_][]const u8{ "JPY", "ブルーボトル", "food" };
+    const label = try records.rowLabel(gpa, &schema, &row);
+    defer gpa.free(label);
+    try testing.expectEqualStrings("ブルーボトル", label);
+}
+
+test "a row with no text at all falls back to the type name" {
+    var schema = try inferFrom("a,b\n1,2\n3,4\n5,6\n");
+    defer schema.deinit(gpa);
+    const row = [_][]const u8{ "1", "2" };
+    const label = try records.rowLabel(gpa, &schema, &row);
+    defer gpa.free(label);
+    try testing.expectEqualStrings("t", label);
+}
+
+// ---------------------------------------------------------------------------
+// --window
+// ---------------------------------------------------------------------------
+
+test "window parses a moving aggregate" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+
+    const win = try expr.parseWindow(&schema, "avg(amount) over 7 by date");
+    try testing.expectEqual(expr.AggFn.avg, win.func);
+    try testing.expectEqualStrings("amount", win.field);
+    try testing.expectEqual(@as(u32, 7), win.n);
+    try testing.expectEqualStrings("date", win.order_by);
+    try testing.expectEqual(@as(?[]const u8, null), win.partition_by);
+}
+
+test "window accepts an optional partition" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+    const win = try expr.parseWindow(&schema, "sum(amount) over 3 by date partition cat");
+    try testing.expectEqualStrings("cat", win.partition_by.?);
+}
+
+test "window refuses an unknown field in any of its three positions" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+    try testing.expectError(error.UnknownField, expr.parseWindow(&schema, "avg(nope) over 7 by date"));
+    try testing.expectError(error.UnknownField, expr.parseWindow(&schema, "avg(amount) over 7 by nope"));
+    try testing.expectError(
+        error.UnknownField,
+        expr.parseWindow(&schema, "avg(amount) over 7 by date partition nope"),
+    );
+}
+
+test "a zero-row window is refused rather than producing an empty frame" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+    try testing.expectError(error.UnexpectedToken, expr.parseWindow(&schema, "avg(amount) over 0 by date"));
+}
+
+test "window requires the ordering field: a moving average needs an order" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+    try testing.expectError(error.UnexpectedEnd, expr.parseWindow(&schema, "avg(amount) over 7"));
+    try testing.expectError(error.UnexpectedToken, expr.parseWindow(&schema, "avg(amount) over 7 date"));
+}
+
+test "trailing junk after a window is refused" {
+    var schema = try testSchema();
+    defer schema.deinit(gpa);
+    try testing.expectError(
+        error.UnexpectedToken,
+        expr.parseWindow(&schema, "avg(amount) over 7 by date garbage"),
+    );
 }

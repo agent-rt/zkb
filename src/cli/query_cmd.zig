@@ -31,7 +31,8 @@ pub fn run(
     defer layout.deinit(gpa);
 
     if (try viaDaemon(gpa, io, layout.sock, w, opts)) |code| return code;
-    return inProcess(gpa, io, &layout, w, opts);
+    const tw = zkb.trace.Writer.init(io, env, layout.trace);
+    return inProcess(gpa, io, env, &layout, w, opts, tw);
 }
 
 fn viaDaemon(
@@ -120,9 +121,11 @@ fn renderFromJson(w: *Writer, result: std.json.Value, query: []const u8) !void {
 fn inProcess(
     gpa: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     layout: *const zkb.paths.Layout,
     w: *Writer,
     opts: Options,
+    tw: zkb.trace.Writer,
 ) !u8 {
     std.Io.Dir.accessAbsolute(io, layout.db, .{}) catch {
         try w.print("no index at {s}\nrun: zkb index\n", .{layout.db});
@@ -144,26 +147,32 @@ fn inProcess(
     var vec: ?[]f32 = null;
     defer if (vec) |v| gpa.free(v);
 
-    const model_path = opts.model orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-    defer if (opts.model == null) gpa.free(model_path);
+    const found = zkb.model_registry.resolve(gpa, io, env, layout, opts.model, .q8_0) catch null;
+    defer if (found) |f| f.deinit(gpa);
 
-    if (std.Io.Dir.accessAbsolute(io, model_path, .{})) |_| {
-        var embedder = try zkb.embed.Embedder.init(gpa, model_path, .{});
+    if (found) |f| {
+        var embedder = try zkb.embed.Embedder.init(gpa, f.path, .{});
         defer embedder.deinit();
         const buf = try gpa.alloc(f32, embedder.n_embd);
         _ = try embedder.embedQuery(zkb.embed.default_query_task, opts.query, buf);
         vec = buf;
-    } else |_| {
+    } else {
         try w.writeAll("note: model unavailable, keyword-only context\n");
         mode = .keyword;
     }
 
+    const trace_t0: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
     var results = try zkb.hybrid.search(gpa, &db, mode, opts.query, vec, null, .{
         .top_k = opts.candidates,
         .candidates = @max(50, opts.candidates),
     });
     defer results.deinit(gpa);
+    {
+        // Same trace as the daemon writes, so a corpus of queries is not split
+        // by which path happened to serve them.
+        const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+        tw.record(gpa, opts.query, &results, now - trace_t0);
+    }
 
     var p = try zkb.pack.assemble(gpa, &db, opts.query, &results, .{
         .budget_tokens = opts.budget,

@@ -40,10 +40,7 @@ pub fn run(
     };
     defer if (opts.root == null) gpa.free(root);
 
-    std.Io.Dir.createDirPath(.cwd(), io, layout.root) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try layout.ensureDirs(io);
 
     const db_path = try gpa.dupeZ(u8, layout.db);
     defer gpa.free(db_path);
@@ -94,14 +91,12 @@ pub fn run(
 
     // Model identity is bound into the index: vectors are only comparable to
     // query vectors from the same model and the same query task (SPEC §3.3).
-    const model_path = opts.model orelse
-        try std.fmt.allocPrint(gpa, "{s}/Qwen3-Embedding-0.6B-Q8_0.gguf", .{layout.models});
-    defer if (opts.model == null) gpa.free(model_path);
-
-    std.Io.Dir.accessAbsolute(io, model_path, .{}) catch {
-        try w.print("model not found: {s}\nrun: zkb model pull\n", .{model_path});
+    const found = zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0) catch {
+        try w.writeAll("model not found\nrun: zkb model pull\n");
         return 4;
     };
+    defer found.deinit(gpa);
+    const model_path = found.path;
 
     try w.print("loading model ...\n", .{});
     try w.flush();
@@ -211,11 +206,11 @@ fn intOf(o: std.json.ObjectMap, key: []const u8) i64 {
     };
 }
 
-/// What zkb itself writes: `~/kb/memory/*.md` and `~/kb/*.csv`.
+/// What zkb itself writes: `~/.zkb/data/memory/*.md` and `~/.zkb/data/*.csv`.
 ///
 /// Two collections over nested roots, told apart only by extension — the memory
-/// root is a subdirectory of the kb root, and restricting the kb collection to
-/// `.csv` is what stops every memory being indexed twice.
+/// root is a subdirectory of the data root, and restricting the data collection
+/// to `.csv` is what stops every memory being indexed twice.
 ///
 /// Facts are indexed for *retrieval* (so "what do I know about my salary" can
 /// find the fact row); the current value itself is always read straight from the
@@ -238,7 +233,7 @@ fn kbRoots(layout: *const zkb.paths.Layout) [2]KbRoot {
             .filters = zkb.memory.scan_filters,
         },
         .{
-            .path = layout.kb,
+            .path = layout.data,
             .name = "kb",
             .kind = .records,
             .filters = zkb.facts.scan_filters,
