@@ -48,7 +48,18 @@ jobs:
           # Work without any state at all.
           "$bin" skill | head -1 | grep -q '^---$'
           "$bin" facts  > /dev/null
-          "$bin" doctor > /dev/null
+
+          # doctor's job is to report what is missing, so on a runner with no
+          # model it must fail — and fail for that reason alone. Asserting the
+          # count catches a regression in any of the other checks, which a bare
+          # "run it and ignore the status" would hide.
+          rc=0
+          doc=$("$bin" doctor 2>&1) || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: doctor without a model should exit 1, got $rc"; echo "$doc"; exit 1; }
+          grep -q 'model not found'   <<<"$doc" || { echo "FAIL: expected the model check to fail"; echo "$doc"; exit 1; }
+          grep -q 'zkb model pull'    <<<"$doc" || { echo "FAIL: doctor should say how to fix it"; exit 1; }
+          n=$(grep -c '^  FAIL' <<<"$doc")
+          [ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 failed check, got $n"; echo "$doc"; exit 1; }
 
           # Report a missing index as exit 3 with something to act on, rather
           # than failing or pretending to succeed.
