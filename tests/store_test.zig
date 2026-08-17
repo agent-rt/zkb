@@ -109,6 +109,41 @@ test "deleteDoc leaves no searchable residue" {
     try testing.expectEqual(@as(i64, 0), orphan_vecs);
 }
 
+test "deleteDoc clears the links keyed on it, and the links pointing at it" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const keep = try s.upsertDocContent(cid, "keep.md", "sha-keep", 10, 1000);
+    const drop = try s.upsertDocContent(cid, "drop.md", "sha-drop", 10, 1000);
+    try addChunks(&s, cid, keep, 1);
+    try addChunks(&s, cid, drop, 1);
+
+    // The doc being deleted emits a link, and is itself the target of one. Both
+    // sides matter and only the first has a foreign key to catch it.
+    try db.exec("INSERT INTO links(doc_id, chunk_id, kind, raw, target_doc_id) VALUES (2, NULL, 'wiki', 'zkb://x', NULL)");
+    try db.exec("INSERT INTO links(doc_id, chunk_id, kind, raw, target_doc_id) VALUES (1, NULL, 'wiki', 'zkb://drop', 2)");
+
+    // Without the links delete this fails on the foreign key, after the chunks
+    // are already gone.
+    try s.deleteDoc(drop);
+
+    const c = try s.counts();
+    try testing.expectEqual(@as(i64, 1), c.docs);
+
+    const outbound = (try db.queryI64("SELECT count(*) FROM links WHERE doc_id = 2")) orelse -1;
+    try testing.expectEqual(@as(i64, 0), outbound);
+
+    // The inbound link survives — the document that wrote it is still there —
+    // but it must no longer claim to resolve, or it would alias the next doc to
+    // reuse id 2.
+    const inbound = (try db.queryI64("SELECT count(*) FROM links WHERE doc_id = 1")) orelse -1;
+    try testing.expectEqual(@as(i64, 1), inbound);
+    const dangling = (try db.queryI64("SELECT count(*) FROM links WHERE target_doc_id = 2")) orelse -1;
+    try testing.expectEqual(@as(i64, 0), dangling);
+}
+
 test "re-index of a changed doc replaces chunks rather than accumulating" {
     var db = try openMem();
     defer db.close();

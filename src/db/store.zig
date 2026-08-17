@@ -283,8 +283,34 @@ pub const Store = struct {
         _ = try st.step();
     }
 
+    /// THE single delete path for a document.
+    ///
+    /// `links` is keyed on the doc rather than the chunk, so it does not belong
+    /// in deleteChunks and was missed there: a doc that had emitted any link
+    /// could not be deleted at all, because `links.doc_id` held a foreign key
+    /// on it. The delete failed *after* the chunks were gone, so the index was
+    /// left with a doc row that had no content, and `zkb forget` reported
+    /// success on the file it had already moved.
     pub fn deleteDoc(self: *Store, doc_id: i64) Error!void {
         try self.deleteChunks(doc_id);
+        {
+            var st = try self.db.prepare("DELETE FROM links WHERE doc_id = ?1");
+            defer st.finalize();
+            try st.bindI64(1, doc_id);
+            _ = try st.step();
+        }
+        // Inbound references have no foreign key, so nothing would have caught
+        // them — and doc ids are reused, since they are INTEGER PRIMARY KEY.
+        // Left alone, a link into this document would silently start resolving
+        // to whichever unrelated document is created next. Nulling the target
+        // hands it back to the link resolver, which either re-resolves it or
+        // reports it as broken.
+        {
+            var st = try self.db.prepare("UPDATE links SET target_doc_id = NULL WHERE target_doc_id = ?1");
+            defer st.finalize();
+            try st.bindI64(1, doc_id);
+            _ = try st.step();
+        }
         var st = try self.db.prepare("DELETE FROM docs WHERE id = ?1");
         defer st.finalize();
         try st.bindI64(1, doc_id);
