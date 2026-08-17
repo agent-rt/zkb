@@ -55,7 +55,20 @@ pub const Store = struct {
 
     // ------------------------------------------------------------ collections
 
+    /// How a collection's files are parsed and who may write them.
+    pub const Kind = enum { documents, memory, records };
+
     pub fn ensureCollection(self: *Store, name: []const u8, root: []const u8, now_ms: i64) Error!i64 {
+        return self.ensureCollectionKind(name, root, .documents, now_ms);
+    }
+
+    pub fn ensureCollectionKind(
+        self: *Store,
+        name: []const u8,
+        root: []const u8,
+        kind: Kind,
+        now_ms: i64,
+    ) Error!i64 {
         {
             var st = try self.db.prepare("SELECT id FROM collections WHERE name = ?1");
             defer st.finalize();
@@ -63,14 +76,31 @@ pub const Store = struct {
             if (try st.step()) return st.columnI64(0);
         }
         var st = try self.db.prepare(
-            "INSERT INTO collections(name, root, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO collections(name, root, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
         );
         defer st.finalize();
         try st.bindText(1, name);
         try st.bindText(2, root);
-        try st.bindI64(3, now_ms);
+        try st.bindText(3, @tagName(kind));
+        try st.bindI64(4, now_ms);
         _ = try st.step();
         return self.db.lastInsertRowId();
+    }
+
+    pub fn collectionKind(self: *Store, id: i64) Error!Kind {
+        var st = try self.db.prepare("SELECT kind FROM collections WHERE id = ?1");
+        defer st.finalize();
+        try st.bindI64(1, id);
+        if (!try st.step()) return .documents;
+        return std.meta.stringToEnum(Kind, st.columnText(0)) orelse .documents;
+    }
+
+    pub fn findCollection(self: *Store, name: []const u8) Error!?i64 {
+        var st = try self.db.prepare("SELECT id FROM collections WHERE name = ?1");
+        defer st.finalize();
+        try st.bindText(1, name);
+        if (!try st.step()) return null;
+        return st.columnI64(0);
     }
 
     // ------------------------------------------------------------------- docs
@@ -263,10 +293,30 @@ pub const Store = struct {
 
     // ----------------------------------------------------------------- chunks
 
-    /// THE single delete path for chunks. Removes the rows from all three tables.
-    /// Virtual tables are not reached by foreign keys, so this must never be
-    /// bypassed — see the module comment.
+    /// THE single delete path for chunks. Removes the rows from every table
+    /// keyed on a chunk. Virtual tables are not reached by foreign keys, so this
+    /// must never be bypassed — see the module comment.
+    ///
+    /// Schema v4 added `facts` and `rec_memory`, two more per-chunk projections,
+    /// and forgetting them here made `DELETE FROM docs` fail on a foreign key —
+    /// after the chunks were already gone, leaving a doc row with no content.
+    /// The FK was doing its job; the invariant is that *this* function knows
+    /// every table a chunk touches, so anything added later belongs here too.
     pub fn deleteChunks(self: *Store, doc_id: i64) Error!void {
+        // Projections first: they reference chunks, so they must go before the
+        // rows they point at.
+        {
+            var st = try self.db.prepare("DELETE FROM facts WHERE doc_id = ?1");
+            defer st.finalize();
+            try st.bindI64(1, doc_id);
+            _ = try st.step();
+        }
+        {
+            var st = try self.db.prepare("DELETE FROM rec_memory WHERE doc_id = ?1");
+            defer st.finalize();
+            try st.bindI64(1, doc_id);
+            _ = try st.step();
+        }
         // Virtual tables first: if this fails we still have chunks rows to
         // retry from. Doing it the other way round would lose the id list.
         {

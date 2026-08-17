@@ -4,13 +4,16 @@
 //! stdout except protocol frames** — a stray log line corrupts the stream and the
 //! client sees a parse error rather than a diagnostic. Diagnostics go to stderr.
 //!
-//! Two tools only. Tool definitions are re-sent to the model on every turn, so
-//! each one costs context permanently; `search` and `query` are the two things a
+//! Three tools. Tool definitions are re-sent to the model on every turn, so each
+//! one costs context permanently; `search`, `query` and `recall` are what a
 //! resource URI cannot express (SPEC §8). Anything readable is a resource
 //! instead, which costs no tool slot.
 //!
-//! No write tools: zkb is read-only over documents. An agent that wants to change
-//! a file uses its own editing tools, and the next scan picks the change up.
+//! No write tools. Over documents that is because zkb only reads them — an agent
+//! that wants to change a file uses its own editing tools and the next scan picks
+//! it up. Over memories it is because the daemon keeps a single writer (the
+//! ingest thread), which is what keeps SQLITE_BUSY off the table; `zkb remember`
+//! is a shell command instead, which an agent can run just as easily.
 
 const std = @import("std");
 const zkb = @import("zkb");
@@ -32,8 +35,8 @@ pub fn run(
 
     var in_buf: [1 << 20]u8 = undefined;
     var out_buf: [1 << 20]u8 = undefined;
-    var stdin = std.Io.File.stdin().reader(io, &in_buf);
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var stdin = std.Io.File.stdin().readerStreaming(io, &in_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout.interface;
 
     while (true) {
@@ -129,7 +132,12 @@ fn handleToolsList(w: *Writer, id: std.json.Value) !void {
         \\ "inputSchema":{"type":"object","properties":{
         \\   "query":{"type":"string","description":"The question to gather context for."},
         \\   "budget":{"type":"integer","description":"Token budget for the assembled context (default 8000)."}},
-        \\  "required":["query"]}}
+        \\  "required":["query"]}},
+        \\{"name":"zkb_recall",
+        \\ "description":"What you should know about this user before answering: their recorded preferences, decisions and corrections, plus the current value of every stored fact. Call this at the start of a session, and again when the topic shifts. Facts are exact values, not retrieved text — trust them over anything a document says. To record something new, run the shell command: zkb remember \"...\"",
+        \\ "inputSchema":{"type":"object","properties":{
+        \\   "query":{"type":"string","description":"Optional. Omit at session start to get the most recent memories; pass a topic to bias towards memories about it. Facts are always included either way."},
+        \\   "budget":{"type":"integer","description":"Token budget for the memories (default 1500). Facts are not counted against it."}}}}
         \\]}
     );
     try endResult(w);
@@ -162,10 +170,15 @@ fn handleToolsCall(
     const args = params.object.get("arguments") orelse std.json.Value{ .object = .empty };
     if (args != .object) return writeError(w, id, -32602, "arguments must be an object");
 
+    // Optional here, required per tool: `zkb_recall` with no query is the
+    // session-start case, where nothing has been asked yet.
     const query = switch (args.object.get("query") orelse .null) {
         .string => |s| s,
-        else => return toolError(w, id, "query is required"),
+        else => "",
     };
+    if (query.len == 0 and !std.mem.eql(u8, name, "zkb_recall")) {
+        return toolError(w, id, "query is required");
+    }
 
     var c = client.Client.connect(io, sock) catch {
         // Surfaced as a tool error rather than a protocol error: the model can act
@@ -214,7 +227,61 @@ fn handleToolsCall(
         return toolText(w, id, text.items);
     }
 
+    if (std.mem.eql(u8, name, "zkb_recall")) {
+        const budget = intArg(args.object, "budget") orelse 1500;
+        try pw.writeAll("{\"query\":");
+        try std.json.Stringify.value(query, .{}, &pw);
+        try pw.print(",\"budget\":{d}}}", .{budget});
+
+        var resp = c.call(gpa, .recall, pw.buffered()) catch
+            return toolError(w, id, "daemon did not answer");
+        defer resp.deinit(gpa);
+        if (!resp.ok) return toolError(w, id, resp.message);
+
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        try renderRecallText(gpa, &text, resp.result.?);
+        return toolText(w, id, text.items);
+    }
+
     return writeError(w, id, -32602, "unknown tool");
+}
+
+/// Facts first and labelled as exact values: the failure this guards against is
+/// a model reading "salary: 480000" as just another retrieved sentence and then
+/// preferring an older number it found in prose.
+fn renderRecallText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), result: std.json.Value) !void {
+    const obj = result.object;
+    if (obj.get("facts")) |fv| if (fv == .array and fv.array.items.len != 0) {
+        try out.appendSlice(gpa, "## Facts (exact current values)\n\n");
+        for (fv.array.items) |item| {
+            const o = item.object;
+            try out.print(gpa, "- {s}: {s}  (as of {s})", .{
+                jsonStr(o, "key"), jsonStr(o, "value"), jsonStr(o, "at"),
+            });
+            const note = jsonStr(o, "note");
+            if (note.len != 0) try out.print(gpa, " — {s}", .{note});
+            try out.appendSlice(gpa, "\n");
+        }
+        try out.appendSlice(gpa, "\n");
+    };
+
+    const mem = obj.get("memories") orelse return;
+    const docs = if (mem.object.get("documents")) |d|
+        (if (d == .array) d.array.items else &.{})
+    else
+        &.{};
+    if (docs.len == 0) {
+        try out.appendSlice(gpa, "No memories recorded yet.\n");
+        return;
+    }
+    try out.appendSlice(gpa, "## Memories\n");
+    for (docs) |d| {
+        const o = d.object;
+        try out.print(gpa, "\n### {s}\n", .{jsonStr(o, "path")});
+        const spans = if (o.get("spans")) |sp| (if (sp == .array) sp.array.items else &.{}) else &.{};
+        for (spans) |sv| try out.print(gpa, "\n{s}\n", .{jsonStr(sv.object, "text")});
+    }
 }
 
 fn handleResourcesRead(

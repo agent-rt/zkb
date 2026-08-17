@@ -221,7 +221,13 @@ test "v1 to v2 rebuilds the FTS index from chunks.text and keeps every vector" {
     defer db.close();
     var s = store.Store.init(&db);
 
-    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    // Seeded with raw v1 SQL, not `ensureCollection`: the Store API writes the
+    // *current* schema (v4 added `collections.kind`), so a migration test that
+    // builds its "old" database through today's API stops testing a migration.
+    try db.exec(
+        "INSERT INTO collections(id, name, root, created_at) VALUES (1, 'docs', '/tmp/docs', 1000);",
+    );
+    const cid: i64 = 1;
     const did = try s.upsertDocContent(cid, "a.md", "sha-a", 10, 1000);
     {
         var vec = dummyVector(3);

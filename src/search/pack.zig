@@ -392,7 +392,13 @@ fn loadSpan(
 
 /// Markdown, meant to be pasted straight into a prompt.
 pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
-    try w.print("# Context for: {s}\n", .{pack.query});
+    // An empty query is `recall` at session start — nothing was asked, so there
+    // is no question to echo back.
+    if (pack.query.len != 0) {
+        try w.print("# Context for: {s}\n", .{pack.query});
+    } else {
+        try w.writeAll("## Memories\n");
+    }
 
     if (pack.dropped_terms.len != 0) {
         try w.writeAll("\n> not searched (unmatchable by the tokenizer):");

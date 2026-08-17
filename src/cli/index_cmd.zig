@@ -69,6 +69,14 @@ pub fn run(
     // "nothing to index" is exactly when that goes unnoticed.
     try resolveAndReport(gpa, &db, w);
 
+    // Before the pending check, not after: the docs root being up to date says
+    // nothing about the memory root, and deciding to skip the model load on the
+    // docs count alone would leave new memories unindexed.
+    var kb_roots = kbRoots(&layout);
+    const kb_pending = try reconcileKb(gpa, io, &s, &kb_roots, now_ms);
+    if (kb_pending != 0) try w.print("  kb: {d} queued\n", .{kb_pending});
+
+    // `counts()` is global, so this covers the docs root and both kb roots.
     const pending_before = (try s.counts()).pending;
     if (pending_before == 0) {
         try w.writeAll("nothing to index\n");
@@ -99,6 +107,7 @@ pub fn run(
     try w.flush();
 
     const stats = try zkb.indexer.indexPending(gpa, io, &s, &embedder, cid, root, now_ms, .{});
+    try indexKb(gpa, io, &s, &embedder, &kb_roots, now_ms, w);
     try resolveAndReport(gpa, &db, w);
 
     const c = try s.counts();
@@ -134,6 +143,81 @@ pub fn run(
         return 1;
     }
     return 0;
+}
+
+/// What zkb itself writes: `~/kb/memory/*.md` and `~/kb/*.csv`.
+///
+/// Two collections over nested roots, told apart only by extension — the memory
+/// root is a subdirectory of the kb root, and restricting the kb collection to
+/// `.csv` is what stops every memory being indexed twice.
+///
+/// Facts are indexed for *retrieval* (so "what do I know about my salary" can
+/// find the fact row); the current value itself is always read straight from the
+/// csv, never from the index (§16.5).
+const KbRoot = struct {
+    path: []const u8,
+    name: []const u8,
+    kind: zkb.store.Store.Kind,
+    filters: zkb.scan.Filters,
+    cid: i64 = 0,
+    pending: usize = 0,
+};
+
+fn kbRoots(layout: *const zkb.paths.Layout) [2]KbRoot {
+    return .{
+        .{
+            .path = layout.memory,
+            .name = "memory",
+            .kind = .memory,
+            .filters = zkb.memory.scan_filters,
+        },
+        .{
+            .path = layout.kb,
+            .name = "kb",
+            .kind = .records,
+            .filters = zkb.facts.scan_filters,
+        },
+    };
+}
+
+/// Reconcile happens before the model is loaded, so its result can decide
+/// whether loading is needed at all — the docs root having nothing to do says
+/// nothing about the memory root.
+fn reconcileKb(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    s: *zkb.store.Store,
+    roots: []KbRoot,
+    now_ms: i64,
+) !usize {
+    var total: usize = 0;
+    for (roots) |*r| {
+        std.Io.Dir.accessAbsolute(io, r.path, .{}) catch continue;
+        r.cid = try s.ensureCollectionKind(r.name, r.path, r.kind, now_ms);
+        const report = try zkb.scan.reconcile(gpa, io, s, r.cid, r.path, r.filters, now_ms);
+        r.pending = report.queued;
+        total += report.queued;
+    }
+    return total;
+}
+
+fn indexKb(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    s: *zkb.store.Store,
+    embedder: *zkb.embed.Embedder,
+    roots: []const KbRoot,
+    now_ms: i64,
+    w: *Writer,
+) !void {
+    for (roots) |r| {
+        if (r.cid == 0 or r.pending == 0) continue;
+        const st = try zkb.indexer.indexPending(gpa, io, s, embedder, r.cid, r.path, now_ms, .{});
+        try w.print("  {s}: {d} doc(s), {d} chunk(s)", .{ r.name, st.docs_indexed, st.chunks_written });
+        if (st.docs_failed != 0) try w.print(", {d} FAILED", .{st.docs_failed});
+        try w.writeAll("\n");
+        try w.flush();
+    }
 }
 
 /// Resolve pending links after a pass, never during one: a document can link to

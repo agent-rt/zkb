@@ -31,6 +31,8 @@ const equeue = @import("embed/queue.zig");
 const proto = @import("ipc/proto.zig");
 const paths = @import("util/paths.zig");
 const maintain = @import("maintain.zig");
+const recallmod = @import("recall.zig");
+const facts = @import("facts.zig");
 
 pub const max_conns: usize = 8;
 
@@ -335,6 +337,7 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
         .stats => try handleStats(st, db, w, req.id),
         .search => try handleSearch(st, db, w, &req),
         .query => try handleQuery(st, db, w, &req),
+        .recall => try handleRecall(st, db, w, &req),
         .index => try handleIndex(st, w, req.id),
         .maintain => try handleMaintain(st, db, w, &req),
         .shutdown => {
@@ -419,6 +422,45 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
 
     try proto.beginOk(w, req.id);
     try packmod.renderJson(w, &p);
+    try proto.finishOk(w);
+}
+
+/// Memories plus the facts snapshot. Read-only, so it runs on the connection
+/// thread; the write side (`remember`) stays in the CLI, because a second writer
+/// would break the single-writer invariant this daemon is built on.
+fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.Request) !void {
+    const query = req.str("query") orelse "";
+    var cfg: recallmod.Config = .{};
+    if (req.int("budget")) |b| cfg.budget_tokens = @intCast(@max(0, b));
+    if (req.int("candidates")) |c| cfg.candidates = @intCast(@max(1, c));
+
+    var vec: ?[]f32 = null;
+    defer if (vec) |v| st.gpa.free(v);
+    if (query.len != 0 and st.degraded() == null) {
+        const buf = try st.gpa.alloc(f32, @intCast(schema.embedding_dim));
+        if (st.embedText(.interactive, .query, "", query, buf)) |_| {
+            vec = buf;
+        } else |_| st.gpa.free(buf);
+    }
+
+    // Facts come from `facts.csv`, not from the index: the index can be stale or
+    // mid-rebuild, and a stale salary reads exactly like a current one.
+    const current = facts.currentAll(st.gpa, st.io, st.layout.facts) catch &.{};
+    defer {
+        for (current) |f| f.deinit(st.gpa);
+        st.gpa.free(current);
+    }
+
+    var r = recallmod.assemble(st.gpa, db, query, vec, cfg) catch
+        return proto.writeError(w, req.id, .internal, "recall failed", null);
+    defer r.deinit(st.gpa);
+
+    try proto.beginOk(w, req.id);
+    try w.writeAll("{\"facts\":");
+    try recallmod.renderFactsJson(w, current);
+    try w.writeAll(",\"memories\":");
+    try packmod.renderJson(w, &r.pack);
+    try w.writeAll("}");
     try proto.finishOk(w);
 }
 
@@ -603,7 +645,20 @@ pub fn run(
     // on it by definition, since we checked the pid file first.
     std.Io.Dir.deleteFileAbsolute(io, layout.sock) catch {};
 
-    const addr = try std.Io.net.UnixAddress.init(layout.sock);
+    // The 108-byte sun_path limit is a kernel constant, not something we can
+    // work around, so say which limit was hit and by how much — `NameTooLong`
+    // from inside the std networking stack points nowhere useful.
+    const addr = std.Io.net.UnixAddress.init(layout.sock) catch |err| {
+        // The sun_path limit is a kernel constant, not something we can work
+        // around, so say which limit was hit and by how much — `NameTooLong`
+        // raised from inside the std networking stack points nowhere useful.
+        std.debug.print(
+            "socket path is {d} bytes, over the unix sun_path limit:\n  {s}\n" ++
+                "set $ZKB_HOME to a shorter path\n",
+            .{ layout.sock.len, layout.sock },
+        );
+        return err;
+    };
     var server = try addr.listen(io, .{});
     defer server.socket.close(io);
     defer std.Io.Dir.deleteFileAbsolute(io, layout.sock) catch {};

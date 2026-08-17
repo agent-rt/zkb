@@ -56,6 +56,27 @@ pub fn run(
     defer layout.deinit(gpa);
     try ok(w, &r, "root {s}", .{layout.root});
 
+    // Memories are the only thing here that cannot be rebuilt from something
+    // else: a session is gone once it ends. Everything under ~/.zkb is derived
+    // and can be deleted wholesale, so this is the one directory whose loss is
+    // permanent — and "jj is the backup" only holds if it is actually a repo.
+    if (std.Io.Dir.accessAbsolute(io, layout.kb, .{})) |_| {
+        var versioned = false;
+        var buf: [512]u8 = undefined;
+        inline for (.{ ".jj", ".git" }) |marker| {
+            const p = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ layout.kb, marker });
+            if (std.Io.Dir.accessAbsolute(io, p, .{})) |_| versioned = true else |_| {}
+        }
+        if (versioned) {
+            try ok(w, &r, "memory root {s} is under version control", .{layout.kb});
+        } else {
+            try fail(w, &r, "memory root {s} is NOT under version control", .{layout.kb});
+            try info(w, "memories cannot be rebuilt from anything else — jj git init {s}", .{layout.kb});
+        }
+    } else |_| {
+        try info(w, "no memory root yet at {s} (created by: zkb remember)", .{layout.kb});
+    }
+
     // ---------------------------------------------------------------- sqlite
     try w.print("\nsqlite\n", .{});
     var db = sqlite.Db.open(":memory:", .read_write) catch |err| {

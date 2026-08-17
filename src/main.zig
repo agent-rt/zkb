@@ -6,6 +6,7 @@ const index_cmd = @import("cli/index_cmd.zig");
 const search_cmd = @import("cli/search_cmd.zig");
 const daemon_cmd = @import("cli/daemon_cmd.zig");
 const query_cmd = @import("cli/query_cmd.zig");
+const memory_cmd = @import("cli/memory_cmd.zig");
 const mcp = @import("mcp/server.zig");
 
 const usage =
@@ -19,6 +20,14 @@ const usage =
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--json] [--full] [--model PATH]
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
+    \\
+    \\  remember <text> [--type user|feedback|decision|project|reference]
+    \\                  [--subjects a,b] [--refs a,b] [--force]
+    \\  recall [query] [--budget N] [--json]
+    \\  forget <memory-file>
+    \\  facts [key] [--history]
+    \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
+    \\
     \\  status
     \\  maintain [--since last] [--check NAME] [--all] [--json]
     \\  mcp                          stdio MCP server (for Claude Code etc.)
@@ -32,7 +41,7 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
 
     var out_buf: [64 * 1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
     const w = &stdout.interface;
     defer w.flush() catch {};
 
@@ -184,6 +193,124 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         return query_cmd.run(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "remember")) {
+        var opts: memory_cmd.RememberOptions = .{ .body = "" };
+        var body: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "--")) {
+                if (body == null) body = a else {
+                    try w.writeAll("one memory per call; quote the whole text\n");
+                    return 2;
+                }
+            } else if (std.mem.eql(u8, a, "--type")) {
+                const v = args.next() orelse "";
+                opts.type = zkb.memory.Type.parse(v) orelse {
+                    try w.print("unknown type: {s} (user|feedback|decision|project|reference)\n", .{v});
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, a, "--subjects")) {
+                opts.subjects = args.next() orelse "";
+            } else if (std.mem.eql(u8, a, "--refs")) {
+                opts.refs = args.next() orelse "";
+            } else if (std.mem.eql(u8, a, "--source")) {
+                opts.source = args.next() orelse "claude-code";
+            } else if (std.mem.eql(u8, a, "--force")) {
+                opts.force = true;
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        opts.body = body orelse {
+            try w.writeAll("usage: zkb remember <text> [--type T] [--subjects a,b] [--force]\n");
+            return 2;
+        };
+        return memory_cmd.remember(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "forget")) {
+        const target = args.next() orelse {
+            try w.writeAll("usage: zkb forget <memory-file>\n");
+            return 2;
+        };
+        return memory_cmd.forget(gpa, init.io, init.environ_map, w, target);
+    }
+
+    if (std.mem.eql(u8, cmd, "recall")) {
+        var opts: memory_cmd.RecallOptions = .{};
+        var query: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "--")) {
+                if (query == null) query = a;
+            } else if (std.mem.eql(u8, a, "--budget")) {
+                opts.budget = std.fmt.parseInt(usize, args.next() orelse "1500", 10) catch 1500;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                opts.format = .json;
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        opts.query = query orelse "";
+        return memory_cmd.recall(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "facts")) {
+        var key: ?[]const u8 = null;
+        var want_history = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--history")) {
+                want_history = true;
+            } else if (!std.mem.startsWith(u8, a, "--")) {
+                if (key == null) key = a;
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        return memory_cmd.factsCmd(gpa, init.io, init.environ_map, w, key, want_history);
+    }
+
+    if (std.mem.eql(u8, cmd, "remember-fact")) {
+        var positional: [2]?[]const u8 = .{ null, null };
+        var n: usize = 0;
+        var at: ?[]const u8 = null;
+        var note: []const u8 = "";
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--at")) {
+                at = args.next();
+            } else if (std.mem.eql(u8, a, "--note")) {
+                note = args.next() orelse "";
+            } else if (!std.mem.startsWith(u8, a, "--")) {
+                if (n < positional.len) {
+                    positional[n] = a;
+                    n += 1;
+                }
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        if (n != 2) {
+            try w.writeAll("usage: zkb remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]\n");
+            return 2;
+        }
+        return memory_cmd.rememberFact(
+            gpa,
+            init.io,
+            init.environ_map,
+            w,
+            positional[0].?,
+            positional[1].?,
+            at,
+            note,
+        );
     }
 
     if (std.mem.eql(u8, cmd, "status")) {

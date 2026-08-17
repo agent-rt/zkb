@@ -11,6 +11,12 @@ pub const Layout = struct {
     pid: []const u8,
     log: []const u8,
     models: []const u8,
+    /// The knowledge root that zkb *writes*: memories and facts. Separate from
+    /// ~/docs on purpose — memories are written a few times per session, and
+    /// mixing that commit rate into the documents repo would bury its history.
+    kb: []const u8,
+    memory: []const u8,
+    facts: []const u8,
 
     pub fn deinit(self: *Layout, gpa: std.mem.Allocator) void {
         gpa.free(self.root);
@@ -19,6 +25,9 @@ pub const Layout = struct {
         gpa.free(self.pid);
         gpa.free(self.log);
         gpa.free(self.models);
+        gpa.free(self.kb);
+        gpa.free(self.memory);
+        gpa.free(self.facts);
         self.* = undefined;
     }
 };
@@ -37,6 +46,14 @@ pub fn resolve(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Erro
     };
     errdefer gpa.free(root);
 
+    const kb = if (env.get("ZKB_KB")) |z|
+        try gpa.dupe(u8, z)
+    else blk: {
+        const home = env.get("HOME") orelse return error.NoHomeDirectory;
+        break :blk try std.fmt.allocPrint(gpa, "{s}/kb", .{home});
+    };
+    errdefer gpa.free(kb);
+
     return .{
         .root = root,
         .db = try std.fmt.allocPrint(gpa, "{s}/zkb.db", .{root}),
@@ -44,6 +61,10 @@ pub fn resolve(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Erro
         .pid = try std.fmt.allocPrint(gpa, "{s}/zkb.pid", .{root}),
         .log = try std.fmt.allocPrint(gpa, "{s}/zkb.log", .{root}),
         .models = try std.fmt.allocPrint(gpa, "{s}/models", .{root}),
+        // `kb` is already owned here; duping it again would leak the original.
+        .kb = kb,
+        .memory = try std.fmt.allocPrint(gpa, "{s}/memory", .{kb}),
+        .facts = try std.fmt.allocPrint(gpa, "{s}/facts.csv", .{kb}),
     };
 }
 

@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var out_buf: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
     const w = &stdout.interface;
 
     // A chunk-sized body: representative of what the indexer actually embeds.

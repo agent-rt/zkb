@@ -16,6 +16,8 @@ const markdown = @import("markdown.zig");
 const chunk = @import("chunk.zig");
 const embed = @import("../embed/llama.zig");
 const maintain = @import("../maintain.zig");
+const memory = @import("../memory.zig");
+const factsmod = @import("../facts.zig");
 
 pub const Stats = struct {
     docs_indexed: usize = 0,
@@ -149,6 +151,12 @@ fn indexOne(
     const source = try readFile(gpa, io, abs);
     defer gpa.free(source);
 
+    // A .csv in any collection is facts/records, not prose: one row per chunk so
+    // structured filtering has something to join against.
+    if (std.mem.endsWith(u8, doc.rel_path, ".csv")) {
+        return indexCsv(gpa, s, backend, dim, collection_id, doc, source, now_ms, stats);
+    }
+
     var parsed = try markdown.scan(gpa, source);
     defer parsed.deinit(gpa);
 
@@ -178,8 +186,11 @@ fn indexOne(
     const links = try markdown.extractLinks(gpa, source, &parsed);
     defer gpa.free(links);
     try maintain.replaceLinks(s.db, doc.id, links);
+
+    var chunk_ids: std.ArrayList(i64) = .empty;
+    defer chunk_ids.deinit(gpa);
     for (chunks.items, 0..) |c, i| {
-        _ = try s.insertChunk(collection_id, doc.id, .{
+        const cid = try s.insertChunk(collection_id, doc.id, .{
             .idx = @intCast(c.idx),
             .heading_path = c.heading_path,
             .byte_start = @intCast(c.byte_start),
@@ -187,11 +198,99 @@ fn indexOne(
             .n_tokens = @intCast(c.n_tokens),
             .text = c.text,
         }, vectors[i * dim ..][0..dim]);
+        try chunk_ids.append(gpa, cid);
     }
+    // Memory metadata is materialized from frontmatter, in the same transaction
+    // as the chunks it describes.
+    if ((try s.collectionKind(collection_id)) == .memory and chunk_ids.items.len != 0) {
+        var meta = try memory.parseMeta(gpa, parsed.frontmatter);
+        defer meta.deinit(gpa);
+        try memory.replaceMeta(s.db, doc.id, chunk_ids.items[0], meta);
+    }
+
     try s.markIndexed(doc.id, @intCast(chunks.items.len), now_ms);
     try s.commit();
 
     stats.chunks_written += chunks.items.len;
+}
+
+/// One CSV row becomes one chunk, so a row is retrievable and joinable.
+///
+/// Only the free-text columns go into the embedding. Numbers and dates are
+/// answered by SQL comparison, and putting them in a 1024-dimensional semantic
+/// space adds noise without adding an answer (SPEC §16.4).
+fn indexCsv(
+    gpa: std.mem.Allocator,
+    s: *store.Store,
+    backend: Backend,
+    dim: usize,
+    collection_id: i64,
+    doc: store.Store.PendingDoc,
+    source: []const u8,
+    now_ms: i64,
+    stats: *Stats,
+) !void {
+    const is_facts = std.mem.endsWith(u8, doc.rel_path, "facts.csv");
+    if (!is_facts) {
+        // records/*.csv materialization is M5; index nothing rather than index
+        // it wrongly as prose.
+        try s.begin();
+        errdefer s.rollback();
+        try s.deleteChunks(doc.id);
+        try s.markIndexed(doc.id, 0, now_ms);
+        try s.commit();
+        return;
+    }
+
+    var parsed = try factsmod.parse(gpa, source);
+    defer parsed.deinit(gpa);
+
+    const vectors = try gpa.alloc(f32, parsed.facts.len * dim);
+    defer gpa.free(vectors);
+    var texts: std.ArrayList([]u8) = .empty;
+    defer {
+        for (texts.items) |t| gpa.free(t);
+        texts.deinit(gpa);
+    }
+    for (parsed.facts, 0..) |f, i| {
+        const text = try factsmod.renderForEmbedding(gpa, f);
+        try texts.append(gpa, text);
+        try backend.embedDoc("", text, vectors[i * dim ..][0..dim]);
+        stats.embed_calls += 1;
+    }
+
+    try s.begin();
+    errdefer s.rollback();
+    try s.deleteChunks(doc.id);
+
+    var chunk_ids: std.ArrayList(i64) = .empty;
+    defer chunk_ids.deinit(gpa);
+    for (parsed.facts, 0..) |f, i| {
+        const id = try s.insertChunk(collection_id, doc.id, .{
+            .idx = @intCast(i),
+            .heading_path = f.key,
+            .byte_start = @intCast(i),
+            .byte_end = @intCast(i + 1),
+            .n_tokens = 16,
+            .text = texts.items[i],
+        }, vectors[i * dim ..][0..dim]);
+        try chunk_ids.append(gpa, id);
+    }
+    try factsmod.replaceFor(s.db, doc.id, chunk_ids.items, parsed.facts);
+
+    // A row a person broke while editing in a spreadsheet is recorded as an
+    // error rather than skipped: silently dropping it loses data quietly.
+    if (parsed.bad_rows.len != 0) {
+        var buf: [128]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{d} malformed row(s), first at line {d}", .{
+            parsed.bad_rows.len, parsed.bad_rows[0],
+        });
+        try s.markFailed(doc.id, msg);
+    } else {
+        try s.markIndexed(doc.id, @intCast(parsed.facts.len), now_ms);
+    }
+    try s.commit();
+    stats.chunks_written += parsed.facts.len;
 }
 
 /// Monotonic nanoseconds. Zig 0.16 has no ambient Timer: clocks come from Io,

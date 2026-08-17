@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 3;
+pub const schema_version: i64 = 4;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -131,6 +131,40 @@ const ddl_v3 =
     \\) STRICT;
 ;
 
+/// v4 adds the memory collection and facts. Both are materialized from files
+/// (md and csv), so like everything else here they are derived and rebuildable.
+const ddl_v4 =
+    \\ALTER TABLE collections ADD COLUMN kind TEXT NOT NULL DEFAULT 'documents';
+    \\
+    \\CREATE TABLE facts (
+    \\  chunk_id  INTEGER PRIMARY KEY,
+    \\  doc_id    INTEGER NOT NULL REFERENCES docs(id),
+    \\  line_no   INTEGER NOT NULL,
+    \\  key       TEXT NOT NULL,
+    \\  value_num REAL,
+    \\  value_txt TEXT,
+    \\  at        TEXT NOT NULL,
+    \\  src       TEXT,
+    \\  note      TEXT
+    \\) STRICT;
+    \\
+    \\CREATE INDEX facts_key_at ON facts(key, at DESC);
+    \\
+    \\CREATE TABLE rec_memory (
+    \\  chunk_id INTEGER PRIMARY KEY,
+    \\  doc_id   INTEGER NOT NULL REFERENCES docs(id),
+    \\  type     TEXT NOT NULL,
+    \\  status   TEXT NOT NULL,
+    \\  created  TEXT NOT NULL,
+    \\  source   TEXT,
+    \\  subjects TEXT,
+    \\  refs     TEXT
+    \\) STRICT;
+    \\
+    \\CREATE INDEX rec_memory_doc     ON rec_memory(doc_id);
+    \\CREATE INDEX rec_memory_status  ON rec_memory(status, created DESC);
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -147,6 +181,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         errdefer db.exec("ROLLBACK;") catch {};
         try db.exec(ddl_v1);
         try db.exec(ddl_v3);
+        try db.exec(ddl_v4);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -158,6 +193,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
 
     if (have == 1) try migrateV1ToV2(db);
     if (have < 3) try migrateToV3(db);
+    if (have < 4) try migrateToV4(db);
+}
+
+/// v3 -> v4: collection kinds, facts, memory metadata.
+fn migrateToV4(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v4);
+    try setMetaInt(db, "schema_version", 4);
+    try db.exec("COMMIT;");
 }
 
 /// v2 -> v3: add the link graph and the maintenance history.

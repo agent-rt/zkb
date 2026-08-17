@@ -17,6 +17,11 @@ pub const Method = enum {
     stats,
     search,
     query,
+    /// Memories plus the current-value snapshot of every fact. Read-only, so it
+    /// belongs on the connection thread like search and query; `remember` does
+    /// not, because writing would break the single-writer invariant that keeps
+    /// SQLITE_BUSY off the table (see `handleIndex`).
+    recall,
     index,
     maintain,
     shutdown,

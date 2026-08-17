@@ -240,7 +240,10 @@ fn bm25(
     }
 }
 
-fn hydrate(gpa: std.mem.Allocator, db: *sqlite.Db, f: rrf.Fused) !Hit {
+/// Public so `recall` can fuse in a third ranking path (recency) and still
+/// produce Hits identical to the ones this module returns — a second, slightly
+/// different hydration would drift from this one.
+pub fn hydrate(gpa: std.mem.Allocator, db: *sqlite.Db, f: rrf.Fused) !Hit {
     var st = try db.prepare(
         \\SELECT c.doc_id, c.idx, c.heading_path, c.text, c.n_tokens,
         \\       d.rel_path, COALESCE(d.title, ''), col.name
