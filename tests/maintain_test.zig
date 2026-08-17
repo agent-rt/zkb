@@ -81,6 +81,41 @@ test "links are extracted from every syntax the corpus actually uses" {
     try testing.expectEqual(@as(usize, 1), kinds.get(.external).?);
 }
 
+test "opaque uri schemes are external, not relative paths" {
+    // A scheme is not always followed by `//`. Looking for `://` misses
+    // data: and mailto:, which then fall through to the relative-path branch
+    // and get reported as broken links — nine inline SVGs in one downloaded
+    // article did exactly that.
+    const src =
+        \\# Doc
+        \\
+        \\![svg](data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%3F%3E)
+        \\Write to [me](mailto:someone@example.com) or call [here](tel:+81-3-1234-5678).
+        \\Spec at zkb://projects/x/SPEC.md, notes in [file](../notes/today.md).
+        \\A [dated file](2026-08-17:log.md) is a path, not a scheme.
+        \\详见 zkb://projects/x/REQ.md。另见 zkb://projects/x/PLAN.md、以上。
+        \\
+    ;
+    var doc = try markdown.scan(gpa, src);
+    defer doc.deinit(gpa);
+    const links = try markdown.extractLinks(gpa, src, &doc);
+    defer gpa.free(links);
+
+    var kinds: std.EnumMap(markdown.LinkKind, usize) = .{};
+    for (links) |l| kinds.put(l.kind, (kinds.get(l.kind) orelse 0) + 1);
+
+    // data:, mailto: and tel: — none of them a path to resolve.
+    try testing.expectEqual(@as(usize, 3), kinds.get(.external).?);
+    // Three bare collection uris, each followed by punctuation: an ascii comma,
+    // a full-width period and a full-width enumeration comma. Swallowing any of
+    // them turns `.md` into `.md,` and files a document reference as an asset.
+    try testing.expectEqual(@as(usize, 3), kinds.get(.collection_uri).?);
+    try testing.expect(kinds.get(.asset) == null);
+    // The relative link, plus the one that only looks like it has a scheme:
+    // a leading digit cannot start one, so it stays a path.
+    try testing.expectEqual(@as(usize, 2), kinds.get(.md).?);
+}
+
 test "paths inside code fences are not links" {
     // A path in a shell snippet or sample config is not a reference. Counting it
     // produces broken-link noise for something nobody meant as a link.

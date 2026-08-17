@@ -526,10 +526,29 @@ fn extractInline(
 
 /// Schemes that leave the knowledge base.
 fn isExternalScheme(scheme: []const u8) bool {
-    inline for (.{ "http", "https", "file", "ftp", "data" }) |ext| {
+    inline for (.{ "http", "https", "file", "ftp", "data", "mailto" }) |ext| {
         if (std.ascii.eqlIgnoreCase(scheme, ext)) return true;
     }
     return false;
+}
+
+/// The scheme at the start of `raw`, if there is one: a letter, then letters,
+/// digits, `+`, `-` or `.`, up to a colon (RFC 3986 §3.1).
+///
+/// Needed because not every scheme is followed by `//`. `data:image/svg+xml,…`
+/// and `mailto:a@b` are opaque, so looking for `://` misses them and they fall
+/// through to the relative-path branch — which is how nine inline SVGs in one
+/// downloaded article turned into nine reported broken links.
+fn schemeOf(raw: []const u8) ?[]const u8 {
+    if (raw.len == 0 or !std.ascii.isAlphabetic(raw[0])) return null;
+    var i: usize = 1;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == ':') return raw[0..i];
+        const c = raw[i];
+        // A slash or fragment before any colon means this is a path.
+        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return null;
+    }
+    return null;
 }
 
 /// A bare `scheme://rest` starting at `i`, if there is one. The scheme must be
@@ -541,23 +560,66 @@ fn bareUriAt(source: []const u8, i: usize, end: usize) ?[]const u8 {
     while (j < end and std.ascii.isAlphanumeric(source[j])) j += 1;
     if (j + 3 > end or !std.mem.eql(u8, source[j..][0..3], "://")) return null;
     j += 3;
-    while (j < end and !std.ascii.isWhitespace(source[j]) and
-        source[j] != ')' and source[j] != ']' and source[j] != '`') j += 1;
-    return source[i..j];
+    while (j < end) {
+        const c = source[j];
+        if (std.ascii.isWhitespace(c) or c == ')' or c == ']' or c == '`') break;
+        // Full-width punctuation ends the uri. It has to be a hard boundary
+        // rather than something trimmed afterwards: CJK prose has no spaces, so
+        // `zkb://a/b.md。另见 …` would otherwise run to the next ascii space and
+        // swallow the rest of the clause into the link.
+        if (cjkPunctLen(source[j..end]) != 0) break;
+        j += 1;
+    }
+    return source[i .. i + trimUriTail(source[i..j])];
+}
+
+/// Byte length of the full-width punctuation mark at the start of `rest`, or 0.
+fn cjkPunctLen(rest: []const u8) usize {
+    const marks = [_][]const u8{
+        "，", "。", "、", "；", "：", "！", "？", "（", "）", "「", "」",
+        "『", "』", "《", "》", "【", "】", "〜", "…", "　",
+    };
+    for (marks) |m| {
+        if (rest.len >= m.len and std.mem.eql(u8, rest[0..m.len], m)) return m.len;
+    }
+    return 0;
+}
+
+/// Length of `raw` with sentence punctuation trimmed off the end.
+///
+/// A bare URI in prose is almost always followed by punctuation — `zkb://a/b.md,`
+/// or `…参见 zkb://a/b.md。` — and swallowing it changes what the link means: the
+/// extension becomes `.md,`, which is not a document extension, so the reference
+/// is filed as an asset and silently stops counting as a link between documents.
+/// That corrupts the orphan and inbound-link checks rather than announcing itself.
+///
+/// Ascii punctuation only. Unlike the full-width marks, these do occur inside
+/// real urls, so they are trimmed from the end rather than treated as boundaries.
+fn trimUriTail(raw: []const u8) usize {
+    const tail = ",.;:!?'\"<>";
+    var n = raw.len;
+    while (n > 0 and std.mem.indexOfScalar(u8, tail, raw[n - 1]) != null) n -= 1;
+    return n;
 }
 
 /// Extensions zkb indexes. A link to anything else is an asset reference.
 const document_exts = [_][]const u8{ ".md", ".txt", ".mdx" };
 
 fn classify(raw: []const u8) LinkKind {
-    if (std.mem.indexOf(u8, raw, "://")) |e| {
-        // http/file/mailto point outside the knowledge base — file:// in
+    if (schemeOf(raw)) |scheme| {
+        // http/file/data point outside the knowledge base — file:// in
         // particular is an absolute machine path that must never be joined onto
-        // a document's directory. Any other scheme is a collection-rooted URI.
-        if (isExternalScheme(raw[0..e])) return .external;
-        return if (isAsset(raw)) .asset else .collection_uri;
+        // a document's directory.
+        if (isExternalScheme(scheme)) return .external;
+        // Any other scheme with an authority is a collection-rooted URI, which
+        // is what keeps zkb:// working without naming it here.
+        if (std.mem.startsWith(u8, raw[scheme.len..], "://"))
+            return if (isAsset(raw)) .asset else .collection_uri;
+        // An opaque scheme we do not know (tel:, urn:, javascript:). Calling it
+        // external is wrong only in naming; calling it a path would make it a
+        // broken link on every document that uses one.
+        return .external;
     }
-    if (std.mem.startsWith(u8, raw, "mailto:")) return .external;
     if (isAsset(raw)) return .asset;
     return .md;
 }
