@@ -1,0 +1,25 @@
+.{
+    .name = .zkb,
+    .version = "0.1.0",
+    .fingerprint = 0x8392868c2cd8fd52, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Pinned to a commit validated on real devices. Do not
+        // chase upstream: llama.cpp's C API drifts and an upgrade is its own
+        // commit with its own verification.
+        .llama_cpp = .{
+            .url = "https://github.com/ggerganov/llama.cpp/archive/58e68df0f91dd16ff56423ee5ef44062ed73bdfc.tar.gz",
+            .hash = "N-V-__8AANJh9gjDCadgBdC10LEbZ4CMgX7-zJbh_v-fOZak",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        // SQLite + sqlite-vec are vendored (single-file C each) so that
+        // `git clone && zig build` works offline. See SPEC 9.1.
+        "third_party/sqlite",
+        "third_party/sqlite-vec",
+    },
+}

@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# cmake-built llama.cpp static libs (rebuild with: zig build llama-cpp)
+build/
