@@ -38,18 +38,45 @@ pub const Options = struct {
     progress: ?*const fn (done: usize, total: usize, rel_path: []const u8) void = null,
 };
 
-/// Wraps the embedder's tokenizer for the chunker. Generic character heuristics
-/// are off by up to 30% on CJK and an over-long chunk is silently truncated by
-/// the model, so the count has to come from the model itself.
-const EmbedCounter = struct {
-    embedder: *embed.Embedder,
+/// Whatever can turn text into vectors, so the same pipeline serves both the
+/// foreground `zkb index` (embedder called directly) and the daemon (embedder
+/// reached through the priority queue). Without this the two paths would be two
+/// copies of the parse/chunk/write logic, and they would drift.
+pub const Backend = struct {
+    ctx: *anyopaque,
+    embedDocFn: *const fn (ctx: *anyopaque, heading: []const u8, text: []const u8, out: []f32) anyerror!void,
+    countFn: *const fn (ctx: *anyopaque, text: []const u8) anyerror!usize,
 
-    fn counter(self: *EmbedCounter) chunk.TokenCounter {
-        return .{ .ctx = self, .countFn = countImpl };
+    fn embedDoc(self: Backend, heading: []const u8, text: []const u8, out: []f32) anyerror!void {
+        return self.embedDocFn(self.ctx, heading, text, out);
     }
 
-    fn countImpl(ctx: *anyopaque, text: []const u8) anyerror!usize {
-        const self: *EmbedCounter = @ptrCast(@alignCast(ctx));
+    fn counter(self: *const Backend) chunk.TokenCounter {
+        return .{ .ctx = @constCast(self), .countFn = countAdapter };
+    }
+
+    fn countAdapter(ctx: *anyopaque, text: []const u8) anyerror!usize {
+        const self: *Backend = @ptrCast(@alignCast(ctx));
+        return self.countFn(self.ctx, text);
+    }
+};
+
+/// Calls a loaded Embedder directly. Used by the foreground CLI, which owns the
+/// model outright and has no other thread to coordinate with.
+pub const DirectBackend = struct {
+    embedder: *embed.Embedder,
+
+    pub fn backend(self: *DirectBackend) Backend {
+        return .{ .ctx = self, .embedDocFn = embedDoc, .countFn = count };
+    }
+
+    fn embedDoc(ctx: *anyopaque, heading: []const u8, text: []const u8, out: []f32) anyerror!void {
+        const self: *DirectBackend = @ptrCast(@alignCast(ctx));
+        _ = try self.embedder.embedDocument(heading, text, out);
+    }
+
+    fn count(ctx: *anyopaque, text: []const u8) anyerror!usize {
+        const self: *DirectBackend = @ptrCast(@alignCast(ctx));
         return self.embedder.countTokens(text);
     }
 };
@@ -64,6 +91,8 @@ pub fn indexPending(
     now_ms: i64,
     opts: Options,
 ) !Stats {
+    var direct: DirectBackend = .{ .embedder = embedder };
+    const backend = direct.backend();
     var stats: Stats = .{};
     const started = nowNs(io);
 
@@ -77,13 +106,12 @@ pub fn indexPending(
         if (opts.limit == 0) std.math.maxInt(i64) else opts.limit,
     );
 
-    var ec: EmbedCounter = .{ .embedder = embedder };
     const dim: usize = @intCast(schema.embedding_dim);
 
     for (pending.items, 0..) |doc, n| {
         if (opts.progress) |cb| cb(n + 1, pending.items.len, doc.rel_path);
 
-        indexOne(gpa, io, s, embedder, &ec, dim, collection_id, root, doc, now_ms, opts, &stats) catch |err| {
+        indexOne(gpa, io, s, backend, dim, collection_id, root, doc, now_ms, opts, &stats) catch |err| {
             // Drop any partial work, then record why. Never leave a document
             // looking indexed when it is not.
             s.rollback();
@@ -105,8 +133,7 @@ fn indexOne(
     gpa: std.mem.Allocator,
     io: std.Io,
     s: *store.Store,
-    embedder: *embed.Embedder,
-    ec: *EmbedCounter,
+    backend: Backend,
     dim: usize,
     collection_id: i64,
     root: []const u8,
@@ -124,7 +151,7 @@ fn indexOne(
     var parsed = try markdown.scan(gpa, source);
     defer parsed.deinit(gpa);
 
-    var chunks = try chunk.split(gpa, source, &parsed, ec.counter(), opts.chunking);
+    var chunks = try chunk.split(gpa, source, &parsed, backend.counter(), opts.chunking);
     defer chunks.deinit(gpa);
 
     // Vectors first, outside any transaction.
@@ -133,7 +160,7 @@ fn indexOne(
     for (chunks.items, 0..) |c, i| {
         const slot = vectors[i * dim ..][0..dim];
         const t0 = nowNs(io);
-        _ = try embedder.embedDocument(c.heading_path, c.text, slot);
+        try backend.embedDoc(c.heading_path, c.text, slot);
         stats.embed_ns += @intCast(nowNs(io) - t0);
         stats.embed_calls += 1;
     }
@@ -176,4 +203,61 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, abs: []const u8) ![]u8 {
     var reader = file.reader(io, &read_buf);
     try reader.interface.readSliceAll(buf);
     return buf;
+}
+
+// ---------------------------------------------------------------------------
+// daemon path
+// ---------------------------------------------------------------------------
+
+/// Index one document from inside the daemon, reaching the embedder through the
+/// priority queue so an interactive query can preempt between chunks.
+///
+/// `daemon_state` is `*daemon.State`, passed as anyopaque to avoid an import
+/// cycle (daemon imports indexer for exactly this function).
+pub fn indexOneQueued(
+    daemon_state: anytype,
+    s: *store.Store,
+    doc: store.Store.PendingDoc,
+    now_ms: i64,
+) !void {
+    const St = @TypeOf(daemon_state);
+    const QueuedBackend = struct {
+        st: St,
+
+        fn backend(self: *@This()) Backend {
+            return .{ .ctx = self, .embedDocFn = embedDoc, .countFn = count };
+        }
+
+        fn embedDoc(ctx: *anyopaque, heading: []const u8, text: []const u8, out: []f32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Per-chunk, not per-document. Checking only before each document
+            // meant a 60-chunk file held the embedder for ~18s regardless of who
+            // was waiting — the backoff has to be at the granularity of the thing
+            // that actually blocks.
+            self.st.waitWhileInteractive();
+            return self.st.embedText(.ingest, .document, heading, text, out);
+        }
+
+        fn count(ctx: *anyopaque, text: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.st.countTokens(.ingest, text);
+        }
+    };
+
+    var qb: QueuedBackend = .{ .st = daemon_state };
+    const dim: usize = @intCast(schema.embedding_dim);
+    var stats: Stats = .{};
+    return indexOne(
+        daemon_state.gpa,
+        daemon_state.io,
+        s,
+        qb.backend(),
+        dim,
+        daemon_state.collection_id,
+        daemon_state.root,
+        doc,
+        now_ms,
+        .{},
+        &stats,
+    );
 }

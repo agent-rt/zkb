@@ -4,12 +4,15 @@ const doctor = @import("cli/doctor.zig");
 const model = @import("cli/model.zig");
 const index_cmd = @import("cli/index_cmd.zig");
 const search_cmd = @import("cli/search_cmd.zig");
+const daemon_cmd = @import("cli/daemon_cmd.zig");
 
 const usage =
     \\zkb — Agent memory + personal knowledge base
     \\
     \\usage: zkb <command> [args]
     \\
+    \\  daemon start [--preload] [--root DIR] [--model PATH]
+    \\  daemon stop | status | run | install | uninstall
     \\  index [--root DIR] [--collection NAME] [--force] [--model PATH]
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--json] [--full] [--model PATH]
@@ -35,6 +38,53 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
+    if (std.mem.eql(u8, cmd, "daemon")) {
+        const sub = args.next() orelse {
+            try w.writeAll("usage: zkb daemon start|stop|status|run|install|uninstall\n");
+            return 2;
+        };
+        var opts: daemon_cmd.Options = .{};
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--preload")) {
+                opts.preload_model = true;
+            } else if (std.mem.eql(u8, a, "--root")) {
+                opts.root = args.next();
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else if (std.mem.eql(u8, a, "--collection")) {
+                opts.collection = args.next() orelse "docs";
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+
+        if (std.mem.eql(u8, sub, "start"))
+            return daemon_cmd.start(gpa, init.io, init.environ_map, w, opts);
+        if (std.mem.eql(u8, sub, "stop"))
+            return daemon_cmd.stop(gpa, init.io, init.environ_map, w);
+        if (std.mem.eql(u8, sub, "status"))
+            return daemon_cmd.status(gpa, init.io, init.environ_map, w);
+        if (std.mem.eql(u8, sub, "install"))
+            return daemon_cmd.install(gpa, init.io, init.environ_map, w);
+        if (std.mem.eql(u8, sub, "uninstall"))
+            return daemon_cmd.uninstall(gpa, init.io, init.environ_map, w);
+        if (std.mem.eql(u8, sub, "run")) {
+            // Foreground: this is what launchd supervises and what `start` spawns.
+            try w.flush();
+            try zkb.daemon.run(gpa, init.io, init.environ_map, .{
+                .preload_model = opts.preload_model,
+                .scan_interval_s = opts.scan_interval_s,
+                .collection = opts.collection,
+                .root = opts.root,
+                .model_path = opts.model,
+            });
+            return 0;
+        }
+        try w.print("unknown daemon subcommand: {s}\n", .{sub});
+        return 2;
+    }
+
     if (std.mem.eql(u8, cmd, "index")) {
         var opts: index_cmd.Options = .{};
         while (args.next()) |a| {
@@ -55,13 +105,19 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, cmd, "search")) {
-        const query = args.next() orelse {
-            try w.writeAll("usage: zkb search <query> [-k N] [--mode M]\n");
-            return 2;
-        };
-        var opts: search_cmd.Options = .{ .query = query };
+        // Options and the query are parsed in one pass: requiring the query first
+        // made `zkb search --mode keyword ...` report "unknown option: keyword",
+        // which is both wrong and confusing.
+        var query: ?[]const u8 = null;
+        var opts: search_cmd.Options = .{ .query = "" };
         while (args.next()) |a| {
-            if (std.mem.eql(u8, a, "-k")) {
+            if (!std.mem.startsWith(u8, a, "-")) {
+                if (query == null) query = a else {
+                    try w.print("unexpected extra argument: {s}\n", .{a});
+                    try w.writeAll("(quote a multi-word query)\n");
+                    return 2;
+                }
+            } else if (std.mem.eql(u8, a, "-k")) {
                 const v = args.next() orelse break;
                 opts.top_k = std.fmt.parseInt(usize, v, 10) catch 10;
             } else if (std.mem.eql(u8, a, "--mode")) {
@@ -83,6 +139,10 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
         }
+        opts.query = query orelse {
+            try w.writeAll("usage: zkb search <query> [-k N] [--mode hybrid|vector|keyword]\n");
+            return 2;
+        };
         return search_cmd.run(gpa, init.io, init.environ_map, w, opts);
     }
 

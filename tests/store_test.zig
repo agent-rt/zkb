@@ -226,8 +226,11 @@ test "v1 to v2 rebuilds the FTS index from chunks.text and keeps every vector" {
     {
         var vec = dummyVector(3);
         _ = try s.insertChunk(cid, did, .{
-            .idx = 0, .heading_path = "doc > 检索",
-            .byte_start = 0, .byte_end = 100, .n_tokens = 42,
+            .idx = 0,
+            .heading_path = "doc > 检索",
+            .byte_start = 0,
+            .byte_end = 100,
+            .n_tokens = 42,
             .text = "检索融合使用 RRF 而不是加权和",
         }, &vec);
     }

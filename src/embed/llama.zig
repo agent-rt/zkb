@@ -79,10 +79,28 @@ fn silentLog(level: c.ggml_log_level, text: [*c]const u8, user: ?*anyopaque) cal
     _ = user;
 }
 
+/// Queries are short (tens of tokens) while chunks run to 1024, and the per-call
+/// cost tracks the context size rather than the input length — measured on M2 Pro
+/// with the same short query (docs/experiments/E5-indexing.md):
+///
+///   n_ctx 2048 -> 96ms    1024 -> 56ms    512 -> 41ms    256 -> 29ms
+///
+/// So a query paid 96ms for buffers it never used. A second, small context on the
+/// *same* model fixes that: llama_model is shared, only llama_context differs, so
+/// the extra memory is a few MB rather than another copy of the weights.
+///
+/// 512 rather than 256: still 2.3x faster than the document context, with enough
+/// headroom that an unusually long query is rare — and when it does exceed 512 it
+/// falls back to the document context instead of failing.
+pub const query_ctx_tokens: u32 = 512;
+
 pub const Embedder = struct {
     allocator: std.mem.Allocator,
     model: *c.llama_model,
     ctx: *c.llama_context,
+    /// Small context reserved for queries. Null if it could not be created, in
+    /// which case queries use `ctx`.
+    query_ctx: ?*c.llama_context = null,
     vocab: *const c.llama_vocab,
     n_embd: u32,
     n_ctx: u32,
@@ -116,7 +134,15 @@ pub const Embedder = struct {
 
         const ctx = c.llama_init_from_model(model, cparams) orelse return error.LoadFailed;
 
+        // Second context for queries. A failure here is not fatal: queries fall
+        // back to the document context and are merely slower.
+        var qparams = cparams;
+        qparams.n_ctx = @min(query_ctx_tokens, opts.n_ctx);
+        qparams.n_batch = qparams.n_ctx;
+        const query_ctx = c.llama_init_from_model(model, qparams);
+
         return .{
+            .query_ctx = query_ctx,
             .allocator = allocator,
             .model = model,
             .ctx = ctx,
@@ -128,6 +154,7 @@ pub const Embedder = struct {
     }
 
     pub fn deinit(self: *Embedder) void {
+        if (self.query_ctx) |q| c.llama_free(q);
         c.llama_free(self.ctx);
         c.llama_model_free(self.model);
         self.* = undefined;
@@ -162,24 +189,34 @@ pub const Embedder = struct {
     /// Embed raw text as-is. `out` must be at least `n_embd` long. Returns the
     /// L2-normalized vector as a slice of `out`.
     pub fn embed(self: *Embedder, text: []const u8, out: []f32) Error![]f32 {
+        return self.embedIn(self.ctx, self.n_ctx, text, out);
+    }
+
+    fn embedIn(
+        self: *Embedder,
+        ctx: *c.llama_context,
+        ctx_tokens: u32,
+        text: []const u8,
+        out: []f32,
+    ) Error![]f32 {
         if (out.len < self.n_embd) return error.NoEmbedding;
 
         const tokens = try self.tokenize(text);
         defer self.allocator.free(tokens);
         if (tokens.len == 0) return error.TokenizeFailed;
-        if (tokens.len > self.n_ctx) return error.ContextTooSmall;
+        if (tokens.len > ctx_tokens) return error.ContextTooSmall;
 
         // Each call is independent — no KV carry-over between texts.
-        c.llama_memory_clear(c.llama_get_memory(self.ctx), true);
+        c.llama_memory_clear(c.llama_get_memory(ctx), true);
 
         const batch = c.llama_batch_get_one(@constCast(tokens.ptr), @intCast(tokens.len));
-        if (c.llama_decode(self.ctx, batch) != 0) return error.DecodeFailed;
+        if (c.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
 
         const dim: usize = self.n_embd;
-        const src = c.llama_get_embeddings_seq(self.ctx, 0) orelse blk: {
+        const src = c.llama_get_embeddings_seq(ctx, 0) orelse blk: {
             // Model didn't pool: fall back to the last token's hidden state,
             // which is what Qwen3-Embedding's own pooling would produce.
-            break :blk c.llama_get_embeddings_ith(self.ctx, @intCast(tokens.len - 1)) orelse
+            break :blk c.llama_get_embeddings_ith(ctx, @intCast(tokens.len - 1)) orelse
                 return error.NoEmbedding;
         };
 
@@ -223,6 +260,15 @@ pub const Embedder = struct {
             .{ task, query },
         ) catch return error.OutOfMemory;
         defer self.allocator.free(prompt);
+
+        // Small context when the prompt fits; the document context otherwise, so
+        // an unusually long query is slow rather than rejected.
+        if (self.query_ctx) |qctx| {
+            const qtokens = @min(query_ctx_tokens, self.n_ctx);
+            if ((try self.countTokens(prompt)) <= qtokens) {
+                return self.embedIn(qctx, qtokens, prompt, out);
+            }
+        }
         return self.embed(prompt, out);
     }
 };

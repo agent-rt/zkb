@@ -33,8 +33,8 @@ pub const Filters = struct {
     extensions: []const []const u8 = &.{ ".md", ".txt", ".mdx" },
     /// Directory basenames never descended into.
     exclude_dirs: []const []const u8 = &.{
-        ".git", ".jj", "node_modules", ".zig-cache", "zig-out", "target",
-        ".venv", "__pycache__", ".next", "dist", "build",
+        ".git",  ".jj",         "node_modules", ".zig-cache", "zig-out", "target",
+        ".venv", "__pycache__", ".next",        "dist",       "build",
     },
     /// Hard ceiling per file. Larger files are skipped: a multi-megabyte single
     /// document is not prose, and chunking it would flood the index.

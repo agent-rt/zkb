@@ -46,3 +46,30 @@ pub fn resolve(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Erro
         .models = try std.fmt.allocPrint(gpa, "{s}/models", .{root}),
     };
 }
+
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
+
+/// Absolute path of the running executable.
+///
+/// Zig 0.16 dropped `std.fs.selfExePathAlloc`, and argv[0] is not a substitute:
+/// it can be a bare name resolved through PATH, or a symlink. The daemon has to
+/// re-spawn *itself*, so exactness matters more than portability here.
+pub fn selfExe(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    switch (@import("builtin").os.tag) {
+        .macos, .ios => {
+            var buf: [4096]u8 = undefined;
+            var size: u32 = buf.len;
+            // Declared directly instead of @cInclude("mach-o/dyld.h"): that
+            // header drags in mach message types whose translate-c static
+            // assertions fail. One symbol needs no header.
+            if (_NSGetExecutablePath(&buf, &size) != 0) return error.NameTooLong;
+            const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+            return gpa.dupe(u8, buf[0..len]);
+        },
+        else => {
+            var buf: [4096]u8 = undefined;
+            const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf);
+            return gpa.dupe(u8, n);
+        },
+    }
+}

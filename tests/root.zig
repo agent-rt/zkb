@@ -12,6 +12,7 @@ test {
     _ = @import("chunk_test.zig");
     _ = @import("search_test.zig");
     _ = @import("tokenizer_test.zig");
+    _ = @import("queue_test.zig");
 }
 
 // ---------------------------------------------------------------------------

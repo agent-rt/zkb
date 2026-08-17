@@ -45,34 +45,41 @@ pub fn main(init: std.process.Init) !void {
     try w.print("model: {s}\n\n", .{model_path});
     try w.flush();
 
-    for ([_]u32{ 8192, 4096, 2048, 1536 }) |n_ctx| {
+    // A short query, to separate fixed per-call overhead from token-count cost.
+    const short = "Instruct: retrieve relevant passages\nQuery: 混合检索怎么设计";
+
+    try w.print("{s:<12}{s:>14}{s:>14}\n", .{ "n_ctx", "chunk ms", "query ms" });
+    for ([_]u32{ 8192, 4096, 2048, 1024, 512, 256 }) |n_ctx| {
         var e = try emb.Embedder.init(gpa, model_path, .{ .n_ctx = n_ctx });
         defer e.deinit();
 
         const vec = try gpa.alloc(f32, e.n_embd);
         defer gpa.free(vec);
 
-        const tokens = try e.countTokens(body.items);
+        // A chunk-sized body only fits when the context is large enough.
+        var chunk_ms: f64 = 0;
+        if ((try e.countTokens(body.items)) < n_ctx) {
+            _ = try e.embed(body.items, vec); // warm-up, so buffer setup is excluded
+            const t0 = std.Io.Timestamp.now(init.io, .awake).nanoseconds;
+            for (0..iterations) |_| _ = try e.embed(body.items, vec);
+            const el: u64 = @intCast(std.Io.Timestamp.now(init.io, .awake).nanoseconds - t0);
+            chunk_ms = @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(iterations)) / std.time.ns_per_ms;
+        }
 
-        // One warm-up pass so buffer allocation is not attributed to the measurement.
-        _ = try e.embed(body.items, vec);
+        _ = try e.embed(short, vec);
+        const t1 = std.Io.Timestamp.now(init.io, .awake).nanoseconds;
+        for (0..iterations) |_| _ = try e.embed(short, vec);
+        const el2: u64 = @intCast(std.Io.Timestamp.now(init.io, .awake).nanoseconds - t1);
+        const query_ms = @as(f64, @floatFromInt(el2)) / @as(f64, @floatFromInt(iterations)) / std.time.ns_per_ms;
 
-        const t0 = std.Io.Timestamp.now(init.io, .awake).nanoseconds;
-        for (0..iterations) |_| _ = try e.embed(body.items, vec);
-        const elapsed: u64 = @intCast(std.Io.Timestamp.now(init.io, .awake).nanoseconds - t0);
-
-        const per_call_ms = @as(f64, @floatFromInt(elapsed)) /
-            @as(f64, @floatFromInt(iterations)) / std.time.ns_per_ms;
-        try w.print("  n_ctx {d:>5}: {d:>7.1} ms/chunk   ({d} tokens per chunk)\n", .{
-            n_ctx, per_call_ms, tokens,
-        });
+        try w.print("{d:<12}{d:>14.1}{d:>14.1}\n", .{ n_ctx, chunk_ms, query_ms });
         try w.flush();
     }
 
     try w.writeAll(
         \\
-        \\Chunks are capped at 1024 tokens (SPEC 4.2), so anything above ~1536
-        \\buys nothing. If the times differ materially, n_ctx is the knob.
+        \\If query time tracks n_ctx rather than token count, the cost is fixed
+        \\per-call buffer work and a small dedicated query context is the lever.
         \\
     );
     try w.flush();

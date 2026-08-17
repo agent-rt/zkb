@@ -29,6 +29,11 @@ pub fn run(
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
+    // Prefer the daemon: its model is already resident, which is the entire
+    // reason the daemon exists. Falling back to in-process is not auto-starting
+    // anything — it just pays the 1-2s model load here, and says so.
+    if (try viaDaemon(gpa, io, layout.sock, w, opts)) |code| return code;
+
     std.Io.Dir.accessAbsolute(io, layout.db, .{}) catch {
         try w.print("no index at {s}\nrun: zkb index\n", .{layout.db});
         return 3;
@@ -158,7 +163,7 @@ fn writeExcerpt(w: *Writer, text: []const u8, max_bytes: usize) !void {
 fn printJson(w: *Writer, results: *const zkb.hybrid.Results, counts: zkb.store.Store.Counts) !void {
     try w.print("{{\"mode\":\"{t}\",\"fts_skipped\":{},", .{ results.mode, results.fts_skipped });
     try w.print("\"index\":{{\"docs\":{d},\"chunks\":{d},\"pending\":{d},\"failed\":{d},\"complete\":{}}},", .{
-        counts.docs, counts.chunks, counts.pending, counts.failed,
+        counts.docs,                                counts.chunks, counts.pending, counts.failed,
         counts.pending == 0 and counts.failed == 0,
     });
     try w.writeAll("\"dropped_terms\":[");
@@ -185,4 +190,110 @@ fn printJson(w: *Writer, results: *const zkb.hybrid.Results, counts: zkb.store.S
         try w.print(",\"chunk_idx\":{d},\"n_tokens\":{d}}}", .{ h.idx, h.n_tokens });
     }
     try w.writeAll("]}\n");
+}
+
+/// Returns null when the daemon is unavailable, so the caller falls through to
+/// the in-process path.
+fn viaDaemon(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sock: []const u8,
+    w: *Writer,
+    opts: Options,
+) !?u8 {
+    var c = zkb.ipc_client.Client.connect(io, sock) catch return null;
+    defer c.close();
+
+    // Params are small (a query string plus two numbers), so a fixed buffer is
+    // simpler than growing an ArrayList and cannot fail mid-write.
+    var pbuf: [8192]u8 = undefined;
+    var pw = std.Io.Writer.fixed(&pbuf);
+    try pw.writeAll("{\"query\":");
+    try std.json.Stringify.value(opts.query, .{}, &pw);
+    try pw.print(",\"k\":{d},\"mode\":\"{t}\"}}", .{ opts.top_k, opts.mode });
+
+    var resp = c.call(gpa, .search, pw.buffered()) catch return null;
+    defer resp.deinit(gpa);
+
+    if (!resp.ok) {
+        try w.print("{s}: {s}\n", .{ resp.code, resp.message });
+        if (resp.hint) |h| try w.print("hint: {s}\n", .{h});
+        return 4;
+    }
+    if (opts.json) {
+        // Hand the daemon's own JSON through unchanged: re-serializing would risk
+        // the two shapes drifting apart.
+        try w.print("{s}\n", .{resp.line});
+        return 0;
+    }
+    try renderDaemonResult(w, resp.result.?, opts);
+    return 0;
+}
+
+fn renderDaemonResult(w: *Writer, result: std.json.Value, opts: Options) !void {
+    const obj = result.object;
+    if (obj.get("index")) |idx| if (idx == .object) {
+        const o = idx.object;
+        const pending = jsonInt(o, "pending");
+        const failed = jsonInt(o, "failed");
+        if (pending != 0 or failed != 0) {
+            try w.print("index incomplete: {d} pending, {d} failed\n\n", .{ pending, failed });
+        }
+    };
+    if (obj.get("degraded")) |d| if (d == .string) {
+        try w.print("DEGRADED: {s}\n", .{d.string});
+    };
+    if (obj.get("dropped_terms")) |dt| if (dt == .array and dt.array.items.len != 0) {
+        try w.writeAll("dropped terms (unmatchable by the tokenizer):");
+        for (dt.array.items) |t| if (t == .string) try w.print(" {s}", .{t.string});
+        try w.writeAll("\n");
+    };
+
+    const hits = if (obj.get("hits")) |h| (if (h == .array) h.array.items else &.{}) else &.{};
+    if (hits.len == 0) {
+        try w.writeAll("no matches\n");
+        return;
+    }
+    const mode = if (obj.get("mode")) |m| (if (m == .string) m.string else "?") else "?";
+    try w.print("{d} hit(s), mode {s}\n\n", .{ hits.len, mode });
+
+    for (hits, 1..) |h, i| {
+        const o = h.object;
+        try w.print("{d}. {s}/{s}", .{ i, jsonStr(o, "collection"), jsonStr(o, "path") });
+        try w.print("  [score {d:.5}", .{jsonFloat(o, "score")});
+        if (o.get("vec_rank")) |v| if (v == .integer) try w.print(" vec#{d}", .{v.integer});
+        if (o.get("fts_rank")) |v| if (v == .integer) try w.print(" fts#{d}", .{v.integer});
+        try w.print(" chunk {d}]\n", .{jsonInt(o, "chunk_idx")});
+        const heading = jsonStr(o, "heading_path");
+        if (heading.len != 0) try w.print("   {s}\n", .{heading});
+        try w.writeAll("   ");
+        try writeExcerpt(w, jsonStr(o, "text"), if (opts.full) std.math.maxInt(usize) else 220);
+        try w.writeAll("\n\n");
+    }
+}
+
+fn jsonStr(o: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = o.get(key) orelse return "";
+    return switch (v) {
+        .string => |s| s,
+        else => "",
+    };
+}
+
+fn jsonInt(o: std.json.ObjectMap, key: []const u8) i64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => 0,
+    };
+}
+
+fn jsonFloat(o: std.json.ObjectMap, key: []const u8) f64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => 0,
+    };
 }
