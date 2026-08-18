@@ -303,6 +303,11 @@ fn ingestThread(st: *State) void {
         // the running daemon.
         applyRegistrations(st, &s);
 
+        // Housekeeping on zkb's own derived data (SPEC §14.0): a chunk whose
+        // document is gone is unconditionally garbage, and leaving it in costs
+        // one search result per occurrence.
+        _ = s.deleteOrphanChunks(st.gpa) catch 0;
+
         var pass_arena = std.heap.ArenaAllocator.init(st.gpa);
         defer pass_arena.deinit();
         const pass_roots = rootsmod.list(pass_arena.allocator(), st.io, &s) catch &.{};

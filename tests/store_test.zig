@@ -385,3 +385,148 @@ test "listCollections keeps every kind and its id" {
     try testing.expectEqual(store.Store.Kind.memory, rows[1].kind);
     try testing.expectEqual(store.Store.Kind.records, rows[2].kind);
 }
+
+test "deleteOrphanChunks clears all three tables and leaves live chunks alone" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const keep = try s.upsertDocContent(cid, "keep.md", "sha-keep", 10, 1000);
+    const gone = try s.upsertDocContent(cid, "gone.md", "sha-gone", 10, 1000);
+    try addChunks(&s, cid, keep, 3);
+    try addChunks(&s, cid, gone, 4);
+
+    // The corruption this exists for: the document row disappears without its
+    // chunks going with it.
+    //
+    // Fabricating it needs foreign keys off, which is itself the finding — the
+    // `chunks.doc_id REFERENCES docs(id)` constraint makes this unreachable on
+    // any connection that has them on, and every writer in this codebase does
+    // (`schema.migrate` sets the pragma before anything else, and has since the
+    // first ingest commit). A real index still accumulated 1198 such chunks; the
+    // path that produced them was never identified, which is exactly why the
+    // sweep is unconditional rather than guarded by a guess about the cause.
+    try db.exec("PRAGMA foreign_keys = OFF;");
+    try db.exec("DELETE FROM docs WHERE rel_path = 'gone.md';");
+    try db.exec("PRAGMA foreign_keys = ON;");
+
+    var c = try s.counts();
+    try testing.expectEqual(@as(i64, 7), c.chunks);
+    try testing.expectEqual(@as(i64, 7), c.fts_rows);
+
+    const removed = try s.deleteOrphanChunks(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), removed);
+
+    // All three tables, or a search still matches text that is no longer there.
+    c = try s.counts();
+    try testing.expectEqual(@as(i64, 3), c.chunks);
+    try testing.expectEqual(@as(i64, 3), c.fts_rows);
+    try testing.expectEqual(@as(i64, 3), c.vec_rows);
+
+    // The surviving document keeps every chunk it had.
+    try testing.expectEqual(@as(?i64, 3), try db.queryI64("SELECT count(*) FROM chunks"));
+    try testing.expectEqual(
+        @as(?i64, keep),
+        try db.queryI64("SELECT DISTINCT doc_id FROM chunks"),
+    );
+}
+
+test "deleteOrphanChunks is a no-op on a consistent index" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const did = try s.upsertDocContent(cid, "a.md", "sha-a", 10, 1000);
+    try addChunks(&s, cid, did, 3);
+
+    try testing.expectEqual(@as(usize, 0), try s.deleteOrphanChunks(testing.allocator));
+    try testing.expectEqual(@as(i64, 3), (try s.counts()).chunks);
+}
+
+test "deleting a document leaves no orphan behind" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const did = try s.upsertDocContent(cid, "a.md", "sha-a", 10, 1000);
+    try addChunks(&s, cid, did, 3);
+    try s.deleteDoc(did);
+
+    // The forward guarantee: the sweep is for historical residue, not for
+    // covering a delete path that leaks.
+    try testing.expectEqual(@as(usize, 0), try s.deleteOrphanChunks(testing.allocator));
+    try testing.expectEqual(@as(i64, 0), (try s.counts()).chunks);
+}
+
+test "a stale index entry costs its own result, not the whole search" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const keep = try s.upsertDocContent(cid, "keep.md", "sha-keep", 10, 1000);
+    const gone = try s.upsertDocContent(cid, "gone.md", "sha-gone", 10, 1000);
+    try addChunks(&s, cid, keep, 3);
+    try addChunks(&s, cid, gone, 3);
+
+    try db.exec("PRAGMA foreign_keys = OFF;");
+    try db.exec("DELETE FROM docs WHERE rel_path = 'gone.md';");
+    try db.exec("PRAGMA foreign_keys = ON;");
+
+    // Both paths rank the orphaned chunks: they are still in fts_chunks and
+    // vec_chunks, which is exactly why this used to be fatal. `hydrate` mapped
+    // "no row" to `error.SqliteStep`, so one unresolvable candidate turned a
+    // working query into `internal: search failed` — measured on a real index
+    // where `zkb search "交接"` worked and `zkb search "i18n locales"` did not,
+    // purely on which chunks landed in the top-k.
+    var query_vec = dummyVector(0);
+    var res = try zkb.hybrid.search(
+        testing.allocator,
+        &db,
+        .hybrid,
+        "fusion",
+        &query_vec,
+        cid,
+        .{ .top_k = 10 },
+    );
+    defer res.deinit(testing.allocator);
+
+    // Three live chunks come back; the three stale ones are simply absent.
+    try testing.expectEqual(@as(usize, 3), res.hits.len);
+    for (res.hits) |h| {
+        try testing.expectEqual(keep, h.doc_id);
+        try testing.expectEqualStrings("keep.md", h.rel_path);
+    }
+}
+
+test "a search over an index with nothing but stale entries returns empty, not an error" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const gone = try s.upsertDocContent(cid, "gone.md", "sha-gone", 10, 1000);
+    try addChunks(&s, cid, gone, 3);
+
+    try db.exec("PRAGMA foreign_keys = OFF;");
+    try db.exec("DELETE FROM docs WHERE rel_path = 'gone.md';");
+    try db.exec("PRAGMA foreign_keys = ON;");
+
+    // The degenerate case the shrink has to handle: every hit is dropped, so the
+    // slice is realloc'd to zero. Getting this wrong frees the wrong allocation.
+    var query_vec = dummyVector(0);
+    var res = try zkb.hybrid.search(
+        testing.allocator,
+        &db,
+        .hybrid,
+        "fusion",
+        &query_vec,
+        cid,
+        .{ .top_k = 10 },
+    );
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), res.hits.len);
+}

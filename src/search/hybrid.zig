@@ -127,9 +127,13 @@ pub fn search(
         gpa.free(hits);
     }
     for (fused[0..take]) |f| {
-        hits[filled] = try hydrate(gpa, db, f);
+        hits[filled] = try hydrate(gpa, db, f) orelse continue;
         filled += 1;
     }
+    // Shrunk rather than returned as a subslice: `Results.deinit` frees
+    // `self.hits`, and freeing a subslice of a larger allocation is not the same
+    // allocation the allocator handed out.
+    if (filled != hits.len) hits = try gpa.realloc(hits, filled);
 
     return .{
         .mode = mode,
@@ -243,7 +247,21 @@ fn bm25(
 /// Public so `recall` can fuse in a third ranking path (recency) and still
 /// produce Hits identical to the ones this module returns — a second, slightly
 /// different hydration would drift from this one.
-pub fn hydrate(gpa: std.mem.Allocator, db: *sqlite.Db, f: rrf.Fused) !Hit {
+/// Null when the candidate cannot be hydrated: the chunk is in the search
+/// indexes but its document is gone.
+///
+/// This used to return `error.SqliteStep` on a missing row, which is two mistakes
+/// at once. `step()` returning false is "no row", not a sqlite failure — and
+/// mapping it to an error meant one stale index entry aborted the whole query.
+/// Measured on this machine: 1198 of 5213 chunks had no document row (residue
+/// from an older binary during a bulk move), and `zkb search "i18n locales"`
+/// answered `internal: search failed` while `zkb search "交接"` worked, purely
+/// on whether a stale chunk landed in the top-k.
+///
+/// A derived index that has drifted must cost the results it cannot resolve, not
+/// every result. The drift itself is reported by `maintain --check orphan_chunk`,
+/// which is where a caller can act on it.
+pub fn hydrate(gpa: std.mem.Allocator, db: *sqlite.Db, f: rrf.Fused) !?Hit {
     var st = try db.prepare(
         \\SELECT c.doc_id, c.idx, c.heading_path, c.text, c.n_tokens,
         \\       d.rel_path, COALESCE(d.title, ''), col.name
@@ -254,7 +272,7 @@ pub fn hydrate(gpa: std.mem.Allocator, db: *sqlite.Db, f: rrf.Fused) !Hit {
     );
     defer st.finalize();
     try st.bindI64(1, f.chunk_id);
-    if (!try st.step()) return error.SqliteStep;
+    if (!try st.step()) return null;
 
     return .{
         .chunk_id = f.chunk_id,

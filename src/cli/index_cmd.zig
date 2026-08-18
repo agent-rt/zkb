@@ -176,6 +176,12 @@ pub fn run(
         try db.exec("UPDATE docs SET indexed_at = NULL, index_error = NULL;");
     }
 
+    // Before the scan, so a corrupted index cannot make this run's numbers look
+    // consistent while stale rows are still answering queries. Nothing here
+    // produces these; a real index accumulated them from an older binary.
+    const swept = try s.deleteOrphanChunks(gpa);
+    if (swept != 0) try w.print("dropped {d} chunk(s) whose document is gone\n", .{swept});
+
     try w.print("scanning {s}\n", .{root});
     try w.flush();
 

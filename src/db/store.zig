@@ -424,6 +424,50 @@ pub const Store = struct {
     /// after the chunks were already gone, leaving a doc row with no content.
     /// The FK was doing its job; the invariant is that *this* function knows
     /// every table a chunk touches, so anything added later belongs here too.
+    /// Drop chunks whose document no longer exists, returning how many went.
+    ///
+    /// This is the invariant at the top of this file, swept rather than asserted.
+    /// Nothing in the current code produces such a row — `deleteDoc` removes
+    /// chunks before the document, and `upsertDocContent` keeps the id through
+    /// ON CONFLICT — but a real index accumulated 1198 of them (23% of all
+    /// chunks) as residue from an older binary during a bulk move, and they were
+    /// invisible until a query happened to rank one into its top-k.
+    ///
+    /// Reuses `deleteChunks` per document rather than writing a parallel bulk
+    /// delete: the five-table order in there is the whole point of this module,
+    /// and a second copy of it would be a second thing to get wrong.
+    ///
+    /// Cleanup, not diagnosis: the index is derived data and keeping it
+    /// self-consistent is zkb's own job (SPEC §14.0). `maintain` reports the
+    /// condition and modifies nothing; this is what actually fixes it.
+    pub fn deleteOrphanChunks(self: *Store, gpa: std.mem.Allocator) Error!usize {
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(gpa);
+        {
+            var st = try self.db.prepare(
+                \\SELECT DISTINCT c.doc_id FROM chunks c
+                \\LEFT JOIN docs d ON d.id = c.doc_id
+                \\WHERE d.id IS NULL
+            );
+            defer st.finalize();
+            // Collected before deleting: mutating the chunks table while stepping
+            // over a statement that reads it invites a half-done sweep.
+            while (try st.step()) try ids.append(gpa, st.columnI64(0));
+        }
+
+        var removed: usize = 0;
+        for (ids.items) |doc_id| {
+            var st = try self.db.prepare("SELECT count(*) FROM chunks WHERE doc_id = ?1");
+            try st.bindI64(1, doc_id);
+            const n: i64 = if (try st.step()) st.columnI64(0) else 0;
+            st.finalize();
+
+            try self.deleteChunks(doc_id);
+            removed += @intCast(n);
+        }
+        return removed;
+    }
+
     pub fn deleteChunks(self: *Store, doc_id: i64) Error!void {
         // Projections first: they reference chunks, so they must go before the
         // rows they point at.

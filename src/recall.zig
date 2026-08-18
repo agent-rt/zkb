@@ -96,9 +96,11 @@ pub fn assemble(
 
         hits = try gpa.alloc(hybrid.Hit, @min(cfg.candidates, fused.len));
         for (fused[0..hits.len]) |f| {
-            hits[filled] = try hybrid.hydrate(gpa, db, f);
+            hits[filled] = try hybrid.hydrate(gpa, db, f) orelse continue;
             filled += 1;
         }
+        // A memory whose file is gone must cost itself, not the whole recall.
+        if (filled != hits.len) hits = try gpa.realloc(hits, filled);
     }
 
     var ranked: hybrid.Results = .{

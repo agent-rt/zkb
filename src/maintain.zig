@@ -55,6 +55,18 @@ pub const Check = enum {
     island,
     /// Old, and superseded by something newer that says the same thing.
     stale,
+    /// A chunk still in the search indexes whose document no longer exists.
+    ///
+    /// This is the invariant store.zig is written to protect, and until now
+    /// nothing detected a violation of it. Measured on a real index: 1198 of 5213
+    /// chunks (23%) were residue from an older binary during a bulk move, and
+    /// they sat there silently for weeks — the only symptom was `zkb search`
+    /// failing on whichever queries happened to rank one of them into the top-k.
+    ///
+    /// Unlike every other check here, there is no judgment involved: a chunk
+    /// whose document is gone carries no information and cannot be re-derived.
+    /// It is always garbage, which is why this one has a repair.
+    orphan_chunk,
 
     /// Checks that run by default.
     ///
@@ -66,17 +78,17 @@ pub const Check = enum {
     /// Still available via `--check no_frontmatter`.
     pub fn default() []const Check {
         return &.{
-            .index_failed, .broken_link,      .orphan, .not_in_index,
-            .fragment,     .oversized,        .near_duplicate,
-            .duplicate_content,
+            .index_failed,      .broken_link, .orphan,         .not_in_index,
+            .fragment,          .oversized,   .near_duplicate, .duplicate_content,
+            .orphan_chunk,
         };
     }
 
     pub fn all() []const Check {
         return &.{
-            .index_failed,      .broken_link, .orphan, .not_in_index,
-            .fragment,          .oversized,   .island, .near_duplicate,
-            .duplicate_content, .stale,       .no_frontmatter,
+            .index_failed,      .broken_link, .orphan,          .not_in_index,
+            .fragment,          .oversized,   .island,          .near_duplicate,
+            .duplicate_content, .stale,       .no_frontmatter,  .orphan_chunk,
         };
     }
 
@@ -171,6 +183,7 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, opts: Options) !Report {
         .fragment => try checkFragment(gpa, db, &findings, opts.fragment_max_tokens),
         .oversized => try checkOversized(gpa, db, &findings, opts.oversized_chunks),
         .no_frontmatter => try checkNoFrontmatter(gpa, db, &findings),
+        .orphan_chunk => try checkOrphanChunks(gpa, db, &findings),
         // Handled together below: all four read the same KNN pass.
         .near_duplicate, .duplicate_content, .island, .stale => {},
     };
@@ -329,6 +342,36 @@ fn checkOrphans(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Find
 /// A document sitting next to an index.md that does not mention it. This encodes
 /// an actual convention of this knowledge base (one index.md per project), not a
 /// universal rule — which is why it is a separate check that can be turned off.
+/// One finding for the whole condition, not one per chunk.
+///
+/// Per-chunk would be 1198 findings on the index that motivated this, burying
+/// every other check — and there would be nothing to act on per row anyway,
+/// since the document that would give a row a path is exactly what is missing.
+/// The count goes in the key rather than only the detail, so `--since last` treats
+/// a growing leak as news instead of as the same finding.
+fn checkOrphanChunks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
+    var st = try db.prepare(
+        \\SELECT count(*), count(DISTINCT c.doc_id) FROM chunks c
+        \\LEFT JOIN docs d ON d.id = c.doc_id
+        \\WHERE d.id IS NULL
+    );
+    defer st.finalize();
+    if (!try st.step()) return;
+    const chunks = st.columnI64(0);
+    if (chunks == 0) return;
+    const docs = st.columnI64(1);
+
+    var kbuf: [128]u8 = undefined;
+    var dbuf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&kbuf, "orphan_chunk:{d}", .{chunks});
+    const detail = try std.fmt.bufPrint(
+        &dbuf,
+        "{d} chunks from {d} deleted document(s) are still searchable; run: zkb index",
+        .{ chunks, docs },
+    );
+    try add(gpa, out, .orphan_chunk, key, "(index)", detail);
+}
+
 fn checkNotInIndex(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
         \\SELECT d.rel_path, idx.rel_path FROM docs d
