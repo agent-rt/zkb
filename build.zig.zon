@@ -1,6 +1,6 @@
 .{
     .name = .zkb,
-    .version = "0.0.12",
+    .version = "0.0.13",
     .fingerprint = 0x8392868c2cd8fd52, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
