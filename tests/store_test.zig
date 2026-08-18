@@ -307,3 +307,81 @@ test "migrating twice is a no-op" {
     try schema.migrate(&db);
     try schema.migrate(&db);
 }
+
+test "upsertCollection updates the root instead of ignoring it" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    const first = try s.upsertCollection("notes", "/a", .documents, null, null, 1);
+    // Re-registering the same name at a new root used to return the existing row
+    // untouched, so `zkb index --root NEW --collection notes` reported success and
+    // kept scanning the old place.
+    const second = try s.upsertCollection("notes", "/b", .documents, null, null, 2);
+    try testing.expectEqual(first, second);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = try s.listCollections(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("/b", rows[0].root);
+}
+
+test "a null filter keeps what is stored, so a root can be moved alone" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    _ = try s.upsertCollection("m", "/a", .documents, ".md", "*/memory/*.md", 1);
+    _ = try s.upsertCollection("m", "/b", .documents, null, null, 2);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = try s.listCollections(arena.allocator());
+    try testing.expectEqualStrings("/b", rows[0].root);
+    try testing.expectEqualStrings(".md", rows[0].extensions.?);
+    try testing.expectEqualStrings("*/memory/*.md", rows[0].include.?);
+}
+
+test "collections created before v7 have no filters, not empty ones" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    // `ensureCollectionKind` is the pre-v7 path and writes neither column. The
+    // difference matters: null resolves to the kind's defaults, while '' would be
+    // a collection that matches no file at all.
+    _ = try s.ensureCollectionKind("old", "/a", .documents, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = try s.listCollections(arena.allocator());
+    try testing.expect(rows[0].extensions == null);
+    try testing.expect(rows[0].include == null);
+}
+
+test "listCollections keeps every kind and its id" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    const d = try s.upsertCollection("docs", "/d", .documents, null, null, 1);
+    const m = try s.upsertCollection("memory", "/m", .memory, null, null, 1);
+    const k = try s.upsertCollection("kb", "/k", .records, null, null, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = try s.listCollections(arena.allocator());
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    // Ordered by id, which is what makes the daemon's scan order stable.
+    try testing.expectEqual(d, rows[0].id);
+    try testing.expectEqual(m, rows[1].id);
+    try testing.expectEqual(k, rows[2].id);
+    try testing.expectEqual(store.Store.Kind.documents, rows[0].kind);
+    try testing.expectEqual(store.Store.Kind.memory, rows[1].kind);
+    try testing.expectEqual(store.Store.Kind.records, rows[2].kind);
+}

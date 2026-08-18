@@ -24,6 +24,7 @@ test {
     _ = @import("commonmark_spec_test.zig");
     _ = @import("md4c_test.zig");
     _ = @import("glob_test.zig");
+    _ = @import("roots_test.zig");
 }
 
 // ---------------------------------------------------------------------------

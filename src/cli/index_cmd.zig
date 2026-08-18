@@ -8,12 +8,116 @@ const zkb = @import("zkb");
 const Writer = std.Io.Writer;
 
 pub const Options = struct {
-    root: ?[]const u8 = null,
+    /// Repeatable `--root`. Several are folded into one collection root plus
+    /// include patterns (see ingest/roots.zig), because a doc's rel_path is
+    /// relative to a single root and keeping it that way is worth more than
+    /// storing a list.
+    roots: []const []const u8 = &.{},
     collection: []const u8 = "docs",
+    /// Repeatable `--ext`, with or without the dot. Empty means the default set.
+    extensions: []const []const u8 = &.{},
+    /// Repeatable `--include`, glob against the path relative to the root.
+    include: []const []const u8 = &.{},
     model: ?[]const u8 = null,
     /// Re-embed everything, ignoring content hashes.
     force: bool = false,
 };
+
+/// What to register, derived from the flags: exactly one root, and the two
+/// filter lists in the newline-separated form they are stored in.
+const Registration = struct {
+    root: []const u8,
+    extensions: ?[]const u8,
+    include: ?[]const u8,
+};
+
+/// Fold the flags into a single registration, or explain why they cannot be.
+///
+/// `--include` and several `--root`s are refused together on purpose: they are
+/// two ways of saying the same thing, and combining them means inventing a rule
+/// about whether they intersect or union. Narrowing by file type is `--ext`,
+/// which composes with either.
+fn registrationFrom(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    opts: Options,
+    w: *Writer,
+) !?Registration {
+    if (opts.roots.len > 1 and opts.include.len > 0) {
+        try w.writeAll(
+            \\--include cannot be combined with several --root: both select paths.
+            \\  several roots  -> the directories that exist now
+            \\  one --include  -> a pattern, so directories added later match too
+            \\
+        );
+        return error.ConflictingOptions;
+    }
+
+    const default_root = if (opts.roots.len == 0) blk: {
+        const home = env.get("HOME") orelse return error.NoHomeDirectory;
+        break :blk try std.fmt.allocPrint(arena, "{s}/docs", .{home});
+    } else null;
+
+    const given: []const []const u8 = if (default_root) |d| &.{d} else opts.roots;
+
+    // Absolute, because the root is stored and later read by the daemon, whose
+    // working directory has nothing to do with the one this command ran in.
+    var abs: std.ArrayList([]const u8) = .empty;
+    for (given) |p| try abs.append(arena, try absolutize(arena, io, p));
+
+    const folded = zkb.roots.fold(arena, abs.items) catch |e| switch (e) {
+        error.RootsTooDisjoint => {
+            try w.writeAll(
+                \\those roots share no common directory worth scanning.
+                \\register them as separate collections, one --root each.
+                \\
+            );
+            return error.ConflictingOptions;
+        },
+        else => return e,
+    };
+
+    var include: std.ArrayList([]const u8) = .empty;
+    for (folded.include) |p| try include.append(arena, p);
+    for (opts.include) |p| try include.append(arena, p);
+
+    var exts: std.ArrayList([]const u8) = .empty;
+    for (opts.extensions) |e| {
+        // `--ext md` and `--ext .md` mean the same thing; the stored form has the
+        // dot because that is what the matcher compares against.
+        const dotted = if (std.mem.startsWith(u8, e, ".")) e else try std.fmt.allocPrint(arena, ".{s}", .{e});
+        try exts.append(arena, dotted);
+    }
+
+    return .{
+        .root = folded.root,
+        .extensions = try zkb.roots.joinList(arena, exts.items),
+        .include = try zkb.roots.joinList(arena, include.items),
+    };
+}
+
+/// `/a/b/` and `/a/b` are the same directory, and the stored root is compared and
+/// sliced against doc paths, so only one of the two forms may reach the database.
+/// `/` itself keeps its slash — there is nothing left to strip.
+fn stripTrailingSlash(p: []const u8) []const u8 {
+    var end = p.len;
+    while (end > 1 and p[end - 1] == '/') end -= 1;
+    return p[0..end];
+}
+
+/// A root is stored, and later read by a daemon whose working directory has
+/// nothing to do with the one this command ran in, so a relative path has to be
+/// resolved now or it means something different later.
+///
+/// An already-absolute path is stored as given rather than canonicalized: it
+/// would otherwise change under a symlinked `~/docs`, and the roots already in
+/// the database are the uncanonicalized form.
+fn absolutize(arena: std.mem.Allocator, io: std.Io, p: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(p)) return stripTrailingSlash(p);
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(io, stripTrailingSlash(p), arena);
+    return abs;
+}
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -25,20 +129,27 @@ pub fn run(
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Resolved before the daemon is contacted, so a bad flag combination is
+    // rejected here rather than half-applied by whichever path runs.
+    const reg = (registrationFrom(arena, io, env, opts, w) catch |e| switch (e) {
+        error.ConflictingOptions => return 2,
+        else => return e,
+    }) orelse return 2;
+
     // With a daemon running, the ingest thread already owns the only write
     // connection. Opening a second writer here would work — SQLite would
     // serialize it — but it would abandon the invariant the daemon is designed
     // around, and for no gain: the daemon has the model resident and this
     // process would have to load its own.
     if (!opts.force) {
-        if (try viaDaemon(gpa, io, &layout, w)) |code| return code;
+        if (try viaDaemon(gpa, io, &layout, w, opts.collection, reg)) |code| return code;
     }
 
-    const root = opts.root orelse blk: {
-        const home = env.get("HOME") orelse return error.NoHomeDirectory;
-        break :blk try std.fmt.allocPrint(gpa, "{s}/docs", .{home});
-    };
-    defer if (opts.root == null) gpa.free(root);
+    const root = reg.root;
 
     try layout.ensureDirs(io);
 
@@ -49,7 +160,15 @@ pub fn run(
     var s = zkb.store.Store.init(&db);
 
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    const cid = try s.ensureCollection(opts.collection, root, now_ms);
+    const cid = try s.upsertCollection(opts.collection, root, .documents, reg.extensions, reg.include, now_ms);
+    const filters = try zkb.roots.filtersFor(arena, .{
+        .id = cid,
+        .name = opts.collection,
+        .root = root,
+        .kind = .documents,
+        .extensions = reg.extensions,
+        .include = reg.include,
+    });
 
     if (opts.force) {
         // Force means "distrust the hashes": clear the stamps so every doc is
@@ -60,7 +179,7 @@ pub fn run(
     try w.print("scanning {s}\n", .{root});
     try w.flush();
 
-    const report = try zkb.scan.reconcile(gpa, io, &s, cid, root, .{}, now_ms);
+    const report = try zkb.scan.reconcile(gpa, io, &s, cid, root, filters, now_ms);
     try w.print(
         "  seen {d}, unchanged {d}, queued {d}, renamed {d}, touched {d}, deleted {d}",
         .{ report.seen, report.unchanged, report.queued, report.renamed, report.touched, report.deleted },
@@ -78,8 +197,8 @@ pub fn run(
     // Before the pending check, not after: the docs root being up to date says
     // nothing about the memory root, and deciding to skip the model load on the
     // docs count alone would leave new memories unindexed.
-    var kb_roots = kbRoots(&layout);
-    const kb_pending = try reconcileKb(gpa, io, &s, &kb_roots, now_ms);
+    const kb_roots = try otherRoots(arena, io, &s, &layout, cid, now_ms);
+    const kb_pending = try reconcileKb(gpa, io, &s, kb_roots, now_ms);
     if (kb_pending != 0) try w.print("  kb: {d} queued\n", .{kb_pending});
 
     // `counts()` is global, so this covers the docs root and both kb roots.
@@ -111,7 +230,7 @@ pub fn run(
     try w.flush();
 
     const stats = try zkb.indexer.indexPending(gpa, io, &s, &embedder, cid, root, now_ms, .{});
-    try indexKb(gpa, io, &s, &embedder, &kb_roots, now_ms, w);
+    try indexKb(gpa, io, &s, &embedder, kb_roots, now_ms, w);
     try resolveAndReport(gpa, &db, w);
 
     const c = try s.counts();
@@ -158,12 +277,44 @@ pub fn run(
 /// the work in this process. `--force` also takes the local path: re-embedding
 /// everything is a deliberate, long operation whose progress the user wants to
 /// watch, not something to hand to a background thread.
-fn viaDaemon(gpa: std.mem.Allocator, io: std.Io, layout: *const zkb.paths.Layout, w: *Writer) !?u8 {
+fn viaDaemon(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const zkb.paths.Layout,
+    w: *Writer,
+    collection: []const u8,
+    reg: Registration,
+) !?u8 {
     var c = zkb.ipc_client.Client.connect(io, layout.sock) catch return null;
     defer c.close();
 
     {
-        var resp = c.call(gpa, .index, "{}") catch return null;
+        // The request body used to be the constant `"{}"`, so a root the user
+        // named on the command line never crossed the socket: the daemon woke its
+        // ingest thread, which walked the roots it already knew, and the command
+        // reported success having registered nothing.
+        // Allocating rather than a fixed buffer: a shell glob over a directory of
+        // projects turns into one include pattern per match, and a legitimate
+        // sixty-project root must not hit a buffer limit.
+        var bw = std.Io.Writer.Allocating.init(gpa);
+        defer bw.deinit();
+        const pw = &bw.writer;
+
+        try pw.writeAll("{\"collection\":");
+        try std.json.Stringify.value(collection, .{}, pw);
+        try pw.writeAll(",\"root\":");
+        try std.json.Stringify.value(reg.root, .{}, pw);
+        if (reg.extensions) |v| {
+            try pw.writeAll(",\"extensions\":");
+            try std.json.Stringify.value(v, .{}, pw);
+        }
+        if (reg.include) |v| {
+            try pw.writeAll(",\"include\":");
+            try std.json.Stringify.value(v, .{}, pw);
+        }
+        try pw.writeAll("}");
+
+        var resp = c.call(gpa, .index, bw.written()) catch return null;
         defer resp.deinit(gpa);
         if (!resp.ok) return null;
     }
@@ -214,11 +365,13 @@ fn intOf(o: std.json.ObjectMap, key: []const u8) i64 {
     };
 }
 
-/// What zkb itself writes: `~/.zkb/data/memory/*.md` and `~/.zkb/data/*.csv`.
+/// Every root except the documents one just handled above.
 ///
-/// Two collections over nested roots, told apart only by extension — the memory
-/// root is a subdirectory of the data root, and restricting the data collection
-/// to `.csv` is what stops every memory being indexed twice.
+/// Includes what zkb itself writes — `~/.zkb/data/memory/*.md` and
+/// `~/.zkb/data/*.csv`, two collections over nested roots told apart only by
+/// extension, which is what stops every memory being indexed twice — and also
+/// any collection the user registered. Those used to be missing here, so
+/// `zkb index` scanned three roots while `zkb status` listed five.
 ///
 /// Facts are indexed for *retrieval* (so "what do I know about my salary" can
 /// find the fact row); the current value itself is always read straight from the
@@ -232,21 +385,28 @@ const KbRoot = struct {
     pending: usize = 0,
 };
 
-fn kbRoots(layout: *const zkb.paths.Layout) [2]KbRoot {
-    return .{
-        .{
-            .path = layout.memory,
-            .name = "memory",
-            .kind = .memory,
-            .filters = zkb.memory.scan_filters,
-        },
-        .{
-            .path = layout.data,
-            .name = "kb",
-            .kind = .records,
-            .filters = zkb.facts.scan_filters,
-        },
-    };
+fn otherRoots(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    s: *zkb.store.Store,
+    layout: *const zkb.paths.Layout,
+    docs_cid: i64,
+    now_ms: i64,
+) ![]KbRoot {
+    try zkb.roots.ensureOwn(s, layout, now_ms);
+    const rs = try zkb.roots.list(arena, io, s);
+    var out: std.ArrayList(KbRoot) = .empty;
+    for (rs) |r| {
+        if (r.id == docs_cid) continue;
+        try out.append(arena, .{
+            .path = r.path,
+            .name = r.name,
+            .kind = r.kind,
+            .filters = r.filters,
+            .cid = r.id,
+        });
+    }
+    return out.items;
 }
 
 /// Reconcile happens before the model is loaded, so its result can decide

@@ -11,6 +11,7 @@ pub const md4c = @import("ingest/md4c.zig");
 pub const chunk = @import("ingest/chunk.zig");
 pub const scan = @import("ingest/scan.zig");
 pub const glob = @import("ingest/glob.zig");
+pub const roots = @import("ingest/roots.zig");
 pub const csv = @import("ingest/csv.zig");
 pub const indexer = @import("ingest/indexer.zig");
 pub const fts_query = @import("search/fts_query.zig");

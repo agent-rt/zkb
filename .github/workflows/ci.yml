@@ -79,3 +79,30 @@ jobs:
             [ "$rc" -eq 3 ] || { echo "FAIL: $cmd expected exit 3, got $rc"; exit 1; }
             grep -q 'zkb index' <<<"$out" || { echo "FAIL: $cmd should say what to run"; exit 1; }
           done
+
+          # A named root with filters has to actually select files and then stay
+          # registered. Both halves used to be broken in ways that reported
+          # success: the root never reached the daemon, and nothing rescanned a
+          # collection once it had been scanned. Asserting the exact seen count
+          # is what catches a dropped filter, which otherwise just looks like
+          # more results than you expected.
+          tree=$(mktemp -d)
+          mkdir -p "$tree/p1/memory" "$tree/p1/junk"
+          printf '# kept\n'    > "$tree/p1/memory/a.md"
+          printf '# excluded\n' > "$tree/p1/junk/b.md"
+          printf 'noise\n'      > "$tree/p1/memory/c.txt"
+          rc=0
+          out=$("$bin" index --collection sel --root "$tree" --include '*/memory/*.md' --ext md 2>&1) || rc=$?
+          # 4 is "model not found", which happens after the scan this asserts on.
+          [ "$rc" -eq 4 ] || { echo "FAIL: index expected exit 4, got $rc"; echo "$out"; exit 1; }
+          grep -q 'seen 1,' <<<"$out" || { echo "FAIL: --include/--ext should select exactly 1 of 3 files"; echo "$out"; exit 1; }
+
+          out=$("$bin" status 2>&1) || { echo "FAIL: status after an index"; echo "$out"; exit 1; }
+          grep -q 'sel' <<<"$out" || { echo "FAIL: the registered collection is missing"; echo "$out"; exit 1; }
+          grep -q "matching \*/memory/\*.md" <<<"$out" || { echo "FAIL: status should show why the count is 1"; echo "$out"; exit 1; }
+
+          # Disjoint roots would make the collection root '/'. Refusing beats
+          # walking the filesystem and looking like a hang.
+          rc=0
+          out=$("$bin" index --collection bad --root /opt --root /var 2>&1) || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: disjoint roots should be refused with exit 2, got $rc"; echo "$out"; exit 1; }

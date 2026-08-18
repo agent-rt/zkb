@@ -23,6 +23,7 @@ const sqlite = @import("db/sqlite.zig");
 const store = @import("db/store.zig");
 const schema = @import("db/schema.zig");
 const scan = @import("ingest/scan.zig");
+const rootsmod = @import("ingest/roots.zig");
 const indexer = @import("ingest/indexer.zig");
 const hybrid = @import("search/hybrid.zig");
 const packmod = @import("search/pack.zig");
@@ -107,6 +108,18 @@ pub const State = struct {
     /// waiting out the interval, which is the difference between "appended a row
     /// and it is queryable" taking under a second and taking up to 30.
     rescan: std.atomic.Value(bool) = .init(false),
+
+    /// Collections an `index` request asked to register, waiting for the ingest
+    /// thread to write them.
+    ///
+    /// A connection thread cannot write: the ingest thread owns the only write
+    /// connection, and that invariant is what keeps SQLITE_BUSY off the table.
+    /// So the request hands over the intent and the owner performs it. Before
+    /// this existed, `--root` and `--collection` were simply not in the request
+    /// body, and `zkb index --root X --collection Y` against a running daemon
+    /// registered nothing while reporting success.
+    register_mutex: std.Io.Mutex = .init,
+    pending_registers: std.ArrayList(Registration) = .empty,
 
     /// How many times the anti-starvation deadline fired. Surfaced in `stats`
     /// because if this is nonzero and growing, the machine is under enough query
@@ -269,7 +282,9 @@ fn ingestThread(st: *State) void {
     var s = store.Store.init(&db);
 
     const now_ms = nowMs(st.io);
-    st.collection_id = s.ensureCollection(st.opts.collection, st.root, now_ms) catch return;
+    rootsmod.ensureOwn(&s, &st.layout, now_ms) catch return;
+    _ = rootsmod.ensureDocs(&s, st.opts.collection, st.root, st.opts.root != null, now_ms) catch return;
+    st.collection_id = s.findCollection(st.opts.collection) catch return orelse return;
 
     // Bind the model identity on first run; on later runs compare it. Mismatch
     // means the stored vectors were produced by a different model and are not
@@ -280,12 +295,20 @@ fn ingestThread(st: *State) void {
         st.rescan.store(false, .release);
         st.scanning.store(true, .release);
 
-        // Every root zkb knows about, not just the documents one. The kb roots
-        // were previously scanned only by `zkb index`, which meant a records csv
-        // an agent appended to was never picked up by the running daemon.
-        for (ingestRoots(st)) |r| {
-            const cid = s.ensureCollectionKind(r.name, r.path, r.kind, nowMs(st.io)) catch continue;
-            std.Io.Dir.accessAbsolute(st.io, r.path, .{}) catch continue;
+        // Every root zkb knows about, not just the documents one, and read from
+        // the database on every pass rather than from a literal: a collection
+        // registered mid-session is picked up by the next pass, without a
+        // restart. The kb roots were previously scanned only by `zkb index`,
+        // which meant a records csv an agent appended to was never picked up by
+        // the running daemon.
+        applyRegistrations(st, &s);
+
+        var pass_arena = std.heap.ArenaAllocator.init(st.gpa);
+        defer pass_arena.deinit();
+        const pass_roots = rootsmod.list(pass_arena.allocator(), st.io, &s) catch &.{};
+
+        for (pass_roots) |r| {
+            const cid = r.id;
             _ = scan.reconcile(st.gpa, st.io, &s, cid, r.path, r.filters, nowMs(st.io)) catch {};
             if (r.kind == .records) {
                 _ = records.reconcileOverrides(st.gpa, st.io, &db, r.path) catch 0;
@@ -356,39 +379,44 @@ fn maybeRunDailyMaintenance(st: *State, db: *sqlite.Db) !void {
     try maintain.record(st.gpa, db, &report, checks, now_ms);
 }
 
-/// The roots the ingest thread reconciles, in priority order.
-///
-/// Documents first because they are the bulk; memory and records after, because
-/// they are small and change a few times a session.
-fn ingestRoots(st: *State) [3]IngestRoot {
-    return .{
-        .{
-            .name = st.opts.collection,
-            .path = st.root,
-            .kind = .documents,
-            .filters = .{},
-        },
-        .{
-            .name = "memory",
-            .path = st.layout.memory,
-            .kind = .memory,
-            .filters = memorymod.scan_filters,
-        },
-        .{
-            .name = "kb",
-            .path = st.layout.data,
-            .kind = .records,
-            .filters = factsmod.scan_filters,
-        },
-    };
-}
+/// The roots the ingest thread reconciles now come from `collections` — see
+/// ingest/roots.zig for why they stopped being a literal here.
+const IngestRoot = rootsmod.Root;
 
-const IngestRoot = struct {
+/// A collection to register, handed from a connection thread to the writer.
+/// All strings are gpa-owned and freed once applied.
+pub const Registration = struct {
     name: []const u8,
-    path: []const u8,
-    kind: store.Store.Kind,
-    filters: scan.Filters,
+    root: []const u8,
+    /// Newline-separated, or null to keep whatever is stored.
+    extensions: ?[]const u8,
+    include: ?[]const u8,
+
+    fn deinit(self: Registration, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.root);
+        if (self.extensions) |v| gpa.free(v);
+        if (self.include) |v| gpa.free(v);
+    }
 };
+
+/// Write any handed-over registrations. Called by the ingest thread only.
+///
+/// Applied before the pass reads the root list, so a collection registered by
+/// the request that triggered this wake-up is scanned by that same pass rather
+/// than the next one — otherwise `zkb index --root X` would return "nothing
+/// pending" while X had never been looked at.
+fn applyRegistrations(st: *State, s: *store.Store) void {
+    st.register_mutex.lockUncancelable(st.io);
+    const taken = st.pending_registers.toOwnedSlice(st.gpa) catch &.{};
+    st.register_mutex.unlock(st.io);
+
+    defer st.gpa.free(taken);
+    for (taken) |r| {
+        defer r.deinit(st.gpa);
+        _ = s.upsertCollection(r.name, r.root, .documents, r.extensions, r.include, nowMs(st.io)) catch {};
+    }
+}
 
 /// Embed and write pending documents one at a time, re-checking shutdown between
 /// documents so a stop request does not wait for the whole backlog.
@@ -397,6 +425,14 @@ fn drainPending(st: *State, s: *store.Store, collection_id: i64, root: []const u
     while (!st.shuttingDown()) {
         st.waitWhileInteractive();
         if (st.shuttingDown()) return done;
+
+        // Between documents, not only between passes. A registration arriving
+        // while a large backlog is draining would otherwise wait for the whole
+        // pass: measured on a first run over 606 documents, `zkb index --root X`
+        // timed out after 120s with X still absent from `collections`. The row is
+        // what makes the collection exist for `zkb status` and for the next pass,
+        // and one document's embed time is a much better bound than one pass's.
+        applyRegistrations(st, s);
 
         var arena_state = std.heap.ArenaAllocator.init(st.gpa);
         defer arena_state.deinit();
@@ -493,7 +529,7 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
         .search => try handleSearch(st, db, w, &req),
         .query => try handleQuery(st, db, w, &req),
         .recall => try handleRecall(st, db, w, &req),
-        .index => try handleIndex(st, w, req.id),
+        .index => try handleIndex(st, w, req.id, &req),
         .maintain => try handleMaintain(st, db, w, &req),
         .shutdown => {
             try proto.beginOk(w, req.id);
@@ -649,7 +685,23 @@ fn handleMaintain(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const pro
     try proto.finishOk(w);
 }
 
-fn handleIndex(st: *State, w: *std.Io.Writer, id: i64) !void {
+fn handleIndex(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request) !void {
+    // A request naming a root is asking for that root to be part of the index
+    // from now on, not just scanned once. Queue it for the writer; the reply is
+    // still immediate, because the client polls `stats` for completion.
+    if (req.str("root")) |root| {
+        const name = req.str("collection") orelse "docs";
+        const reg: Registration = .{
+            .name = try st.gpa.dupe(u8, name),
+            .root = try st.gpa.dupe(u8, root),
+            .extensions = if (req.str("extensions")) |v| try st.gpa.dupe(u8, v) else null,
+            .include = if (req.str("include")) |v| try st.gpa.dupe(u8, v) else null,
+        };
+        st.register_mutex.lockUncancelable(st.io);
+        defer st.register_mutex.unlock(st.io);
+        st.pending_registers.append(st.gpa, reg) catch reg.deinit(st.gpa);
+    }
+
     // Still no writing from this thread — the ingest thread owns the only write
     // connection, and a second writer would break the single-writer invariant
     // that keeps SQLITE_BUSY off the table. What this does is wake it, which
@@ -813,9 +865,16 @@ pub fn run(
     defer gpa.free(db_path_z);
 
     // Migrate before any reader opens: read-only connections cannot do DDL.
+    // Register the built-in collections in the same window — still before any
+    // thread exists, so the single-writer invariant is not in play yet — because
+    // the watcher below reads the root list back out, and on a first-ever start
+    // it would otherwise find an empty table and watch nothing.
     {
         var db = try store.open(db_path_z, .read_write);
-        db.close();
+        defer db.close();
+        var s = store.Store.init(&db);
+        rootsmod.ensureOwn(&s, &layout, nowMs(io)) catch {};
+        _ = rootsmod.ensureDocs(&s, opts.collection, root, opts.root != null, nowMs(io)) catch {};
     }
 
     var st: State = .{
@@ -858,11 +917,19 @@ pub fn run(
 
     // Watches the same roots the ingest loop scans. Purely an accelerator: if it
     // fails to start, the interval scan still finds everything, just later.
+    var watch_arena = std.heap.ArenaAllocator.init(gpa);
+    defer watch_arena.deinit();
     var watch_roots: std.ArrayList([]const u8) = .empty;
-    defer watch_roots.deinit(gpa);
-    for (ingestRoots(&st)) |r| {
-        std.Io.Dir.accessAbsolute(io, r.path, .{}) catch continue;
-        watch_roots.append(gpa, r.path) catch {};
+    {
+        // Read-only: the ingest thread has not started, but it will own the only
+        // write connection once it does, and this needs nothing more than a list.
+        var db = store.open(db_path_z, .read_only) catch null;
+        if (db) |*d| {
+            defer d.close();
+            var s = store.Store.init(d);
+            const rs = rootsmod.list(watch_arena.allocator(), io, &s) catch &.{};
+            for (rs) |r| watch_roots.append(watch_arena.allocator(), r.path) catch {};
+        }
     }
     var watcher = fsevents.Watcher.start(gpa, watch_roots.items, &st.rescan) catch
         fsevents.Watcher{ .flag = &st.rescan };

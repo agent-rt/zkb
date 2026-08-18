@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 6;
+pub const schema_version: i64 = 7;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -197,6 +197,21 @@ const ddl_v6 =
     \\ALTER TABLE facts ADD COLUMN recorded_at TEXT NOT NULL DEFAULT '';
 ;
 
+/// v7 moves a collection's scan configuration out of the code and into the row.
+///
+/// It used to live in a fixed three-element array inside the daemon, which meant
+/// a collection registered by `zkb index --root X --collection Y` was scanned
+/// exactly once and then forgotten — the daemon had no way to learn it existed.
+/// A root is only usefully a root if whatever rescans knows about it.
+///
+/// Both columns are NULL for "use the built-in default", which is not the same as
+/// the empty string: `extensions = ''` would be a collection that matches no
+/// file, and that has to stay expressible for a caller who really means it.
+const ddl_v7 =
+    \\ALTER TABLE collections ADD COLUMN extensions TEXT;
+    \\ALTER TABLE collections ADD COLUMN include TEXT;
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -216,6 +231,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v4);
         try db.exec(ddl_v5);
         try db.exec(ddl_v6);
+        try db.exec(ddl_v7);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -230,6 +246,19 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 4) try migrateToV4(db);
     if (have < 5) try migrateToV5(db);
     if (have < 6) try migrateToV6(db);
+    if (have < 7) try migrateToV7(db);
+}
+
+/// v6 -> v7: scan configuration becomes per-collection data.
+///
+/// Existing rows keep NULL, which resolves to the same defaults the code applied
+/// before this column existed, so an upgraded database scans exactly as it did.
+fn migrateToV7(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v7);
+    try setMetaInt(db, "schema_version", 7);
+    try db.exec("COMMIT;");
 }
 
 /// v5 -> v6: the second time axis becomes a column.

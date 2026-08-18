@@ -18,7 +18,8 @@ const usage =
     \\
     \\  daemon start [--preload] [--root DIR] [--model PATH]
     \\  daemon stop | status | run | install | uninstall
-    \\  index [--root DIR] [--collection NAME] [--force] [--model PATH]
+    \\  index [--root DIR ...] [--collection NAME] [--ext md ...]
+    \\        [--include GLOB ...] [--force] [--model PATH]
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--json] [--full] [--model PATH]
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
@@ -40,6 +41,13 @@ const usage =
     \\  doctor [--model PATH]
     \\  model pull [--quant q8_0|f16]
     \\  version
+    \\
+    \\A collection remembers its root and filters, so the daemon keeps it fresh:
+    \\  zkb index --collection notes --root ~/notes --ext md
+    \\  zkb index --collection agent-memory --root ~/.claude/projects \
+    \\            --include '*/memory/*.md' --ext md
+    \\Several --root are folded into their shared parent. Prefer --include when
+    \\directories will be added later: several roots name only what exists now.
     \\
 ;
 
@@ -107,11 +115,36 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, cmd, "index")) {
         var opts: index_cmd.Options = .{};
+        // Repeatable flags accumulate. A shell glob is the expected way to give
+        // several roots — `--root ~/.claude/projects/*/memory` arrives already
+        // expanded — so the list has to grow rather than the last one winning.
+        var roots_list: std.ArrayList([]const u8) = .empty;
+        defer roots_list.deinit(gpa);
+        var ext_list: std.ArrayList([]const u8) = .empty;
+        defer ext_list.deinit(gpa);
+        var include_list: std.ArrayList([]const u8) = .empty;
+        defer include_list.deinit(gpa);
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--root")) {
-                opts.root = args.next();
+                const v = args.next() orelse {
+                    try w.writeAll("--root needs a path\n");
+                    return 2;
+                };
+                try roots_list.append(gpa, v);
             } else if (std.mem.eql(u8, a, "--collection")) {
                 opts.collection = args.next() orelse "docs";
+            } else if (std.mem.eql(u8, a, "--ext")) {
+                const v = args.next() orelse {
+                    try w.writeAll("--ext needs an extension, e.g. --ext md\n");
+                    return 2;
+                };
+                try ext_list.append(gpa, v);
+            } else if (std.mem.eql(u8, a, "--include")) {
+                const v = args.next() orelse {
+                    try w.writeAll("--include needs a glob, e.g. --include '*/memory/*.md'\n");
+                    return 2;
+                };
+                try include_list.append(gpa, v);
             } else if (std.mem.eql(u8, a, "--model")) {
                 opts.model = args.next();
             } else if (std.mem.eql(u8, a, "--force")) {
@@ -121,6 +154,9 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
         }
+        opts.roots = roots_list.items;
+        opts.extensions = ext_list.items;
+        opts.include = include_list.items;
         return index_cmd.run(gpa, init.io, init.environ_map, w, opts);
     }
 
@@ -505,6 +541,35 @@ pub fn main(init: std.process.Init) !u8 {
     return 2;
 }
 
+/// Print a stored newline-separated list on one line.
+///
+/// A shell glob over forty projects stores forty patterns, each as long as a
+/// directory name. Listing three of them and a count is worse than useless — the
+/// three are arbitrary, and the line still buries the collection counts this
+/// command exists to show. Past a handful, the count alone is the information.
+fn printList(w: *std.Io.Writer, label: []const u8, stored: []const u8, noun: []const u8) !void {
+    const max_shown = 3;
+    var total: usize = 0;
+    var it = std.mem.splitScalar(u8, stored, '\n');
+    while (it.next()) |part| if (part.len != 0) {
+        total += 1;
+    };
+
+    try w.writeAll(label);
+    if (total > max_shown) {
+        try w.print("{d} {s}s", .{ total, noun });
+        return;
+    }
+    var first = true;
+    it = std.mem.splitScalar(u8, stored, '\n');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (!first) try w.writeAll(", ");
+        try w.writeAll(part);
+        first = false;
+    }
+}
+
 fn status(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -548,7 +613,8 @@ fn status(
     {
         var st = try db.prepare(
             \\SELECT col.name, col.root, count(d.id),
-            \\       COALESCE(sum(d.chunk_count), 0)
+            \\       COALESCE(sum(d.chunk_count), 0),
+            \\       COALESCE(col.extensions, ''), COALESCE(col.include, '')
             \\FROM collections col LEFT JOIN docs d ON d.collection_id = col.id
             \\GROUP BY col.id ORDER BY col.id
         );
@@ -557,6 +623,17 @@ fn status(
             try w.print("  {s}  {d} docs, {d} chunks  ({s})\n", .{
                 st.columnText(0), st.columnI64(2), st.columnI64(3), st.columnText(1),
             });
+            // Without this, "why does this collection only have three documents"
+            // has no answer anywhere in the CLI — the filters that produced the
+            // count would be invisible while the count itself is right there.
+            const exts = st.columnText(4);
+            const include = st.columnText(5);
+            if (exts.len != 0 or include.len != 0) {
+                try w.writeAll("      only");
+                if (exts.len != 0) try printList(w, " ", exts, "extension");
+                if (include.len != 0) try printList(w, " matching ", include, "pattern");
+                try w.writeAll("\n");
+            }
         }
     }
 

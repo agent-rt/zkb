@@ -87,6 +87,102 @@ pub const Store = struct {
         return self.db.lastInsertRowId();
     }
 
+    /// Register a collection, or point an existing one at a new root and scan
+    /// configuration.
+    ///
+    /// Unlike `ensureCollectionKind`, this updates instead of returning early.
+    /// Re-running `zkb index --root NEW --collection existing` used to keep the
+    /// old root and report success, which is the same silent-ignore shape as a
+    /// dropped filter: the command looks like it worked and nothing moved.
+    ///
+    /// The root is not compared to the old one and docs are not deleted. A moved
+    /// root makes every rel_path vanish from disk, and the next reconcile deletes
+    /// them for the ordinary reason — no special case needed here.
+    ///
+    /// `extensions` and `include` are newline-separated. NULL means "the built-in
+    /// default"; passing them through unchanged is what lets a caller update the
+    /// root without having to restate the filters.
+    pub fn upsertCollection(
+        self: *Store,
+        name: []const u8,
+        root: []const u8,
+        kind: Kind,
+        extensions: ?[]const u8,
+        include: ?[]const u8,
+        now_ms: i64,
+    ) Error!i64 {
+        if (try self.findCollection(name)) |id| {
+            var st = try self.db.prepare(
+                \\UPDATE collections
+                \\   SET root = ?2, kind = ?3,
+                \\       extensions = coalesce(?4, extensions),
+                \\       include    = coalesce(?5, include)
+                \\ WHERE id = ?1
+            );
+            defer st.finalize();
+            try st.bindI64(1, id);
+            try st.bindText(2, root);
+            try st.bindText(3, @tagName(kind));
+            if (extensions) |v| try st.bindText(4, v) else try st.bindNull(4);
+            if (include) |v| try st.bindText(5, v) else try st.bindNull(5);
+            _ = try st.step();
+            return id;
+        }
+
+        var st = try self.db.prepare(
+            \\INSERT INTO collections(name, root, kind, created_at, extensions, include)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        );
+        defer st.finalize();
+        try st.bindText(1, name);
+        try st.bindText(2, root);
+        try st.bindText(3, @tagName(kind));
+        try st.bindI64(4, now_ms);
+        if (extensions) |v| try st.bindText(5, v) else try st.bindNull(5);
+        if (include) |v| try st.bindText(6, v) else try st.bindNull(6);
+        _ = try st.step();
+        return self.db.lastInsertRowId();
+    }
+
+    /// One row of what to scan. Strings are owned by the caller's arena.
+    pub const CollectionRow = struct {
+        id: i64,
+        name: []const u8,
+        root: []const u8,
+        kind: Kind,
+        /// Newline-separated, or null for the built-in default.
+        extensions: ?[]const u8,
+        include: ?[]const u8,
+    };
+
+    /// Every collection, ordered by id so the built-ins keep coming first and the
+    /// scan order stays stable across runs.
+    ///
+    /// This is the list the ingest loop walks. It being a query rather than a
+    /// literal is the whole point of v7: a collection registered by any means is
+    /// picked up by whatever rescans, without that code having to be edited.
+    pub fn listCollections(
+        self: *Store,
+        arena: std.mem.Allocator,
+    ) Error![]CollectionRow {
+        var out: std.ArrayList(CollectionRow) = .empty;
+        var st = try self.db.prepare(
+            "SELECT id, name, root, kind, extensions, include FROM collections ORDER BY id",
+        );
+        defer st.finalize();
+        while (try st.step()) {
+            try out.append(arena, .{
+                .id = st.columnI64(0),
+                .name = try arena.dupe(u8, st.columnText(1)),
+                .root = try arena.dupe(u8, st.columnText(2)),
+                .kind = std.meta.stringToEnum(Kind, st.columnText(3)) orelse .documents,
+                .extensions = if (st.columnIsNull(4)) null else try arena.dupe(u8, st.columnText(4)),
+                .include = if (st.columnIsNull(5)) null else try arena.dupe(u8, st.columnText(5)),
+            });
+        }
+        return out.items;
+    }
+
     pub fn collectionKind(self: *Store, id: i64) Error!Kind {
         var st = try self.db.prepare("SELECT kind FROM collections WHERE id = ?1");
         defer st.finalize();

@@ -58,6 +58,29 @@ each session's agent has no idea what the last one wrote.
 Memories are markdown files with frontmatter, one per memory. `forget` moves a
 file to `archive/` and drops it from the index; nothing is ever deleted.
 
+## Collections
+
+A collection is a root plus the filters that select files under it. Both live in
+the database, so the daemon keeps every collection fresh — registering one is not
+a one-off import.
+
+```
+zkb index --collection notes --root ~/notes --ext md
+zkb index --collection agent-memory --root ~/.claude/projects \
+          --include '*/memory/*.md' --ext md
+zkb search "how did I decide that" --collection agent-memory
+```
+
+`--include` globs the path relative to the root: `*` and `?` stop at a `/`, `**`
+spans whole directories. It also prunes the walk, which is the difference between
+scanning a directory of projects and scanning only the parts you asked for — on a
+6020-file tree, 20 files seen in 2.3s instead of 6020 in 10.8s.
+
+`--root` may be repeated, which suits a shell glob
+(`--root ~/.claude/projects/*/memory`); the paths are folded into their shared
+parent. Prefer `--include` when directories will be added later, since several
+roots name only what exists now.
+
 ## Numbers
 
 Three kinds of number exist and are not stored the same way:
