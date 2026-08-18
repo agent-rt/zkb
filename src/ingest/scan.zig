@@ -28,6 +28,15 @@ pub const Report = struct {
     deleted: usize = 0,
     /// Files that could not be read; skipped rather than aborting the run.
     unreadable: usize = 0,
+    /// Entries an ignore rule removed, files and directories both.
+    ///
+    /// Counted so "seen 0" can be told apart from "seen 0 because a `.gitignore`
+    /// above this root excludes it". Both look identical in the output otherwise,
+    /// and the second is a configuration surprise rather than an empty directory:
+    /// a root inside a repo's ignored subtree indexes nothing, correctly and
+    /// silently. Found by putting a test tree under `.zig-cache`, which this
+    /// project's own `.gitignore` excludes.
+    ignored: usize = 0,
 };
 
 pub const Filters = struct {
@@ -95,9 +104,12 @@ pub fn reconcile(
                 // An ignored subtree is not entered at all, which is both the
                 // cheap thing to do and what makes a negation inside it unable to
                 // bring anything back — git's own rule.
+                if (ignorer.isIgnored(entry.path, true)) {
+                    report.ignored += 1;
+                    continue;
+                }
                 if (!isExcluded(entry.basename, filters.exclude_dirs) and
-                    glob.matchAnyPrefix(filters.include, entry.path) and
-                    !ignorer.isIgnored(entry.path, true))
+                    glob.matchAnyPrefix(filters.include, entry.path))
                 {
                     // Its own rules load only after it survives the parent's:
                     // an ignored directory is never opened, which is also why a
@@ -122,7 +134,10 @@ pub fn reconcile(
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
         if (!glob.matchAny(filters.include, entry.path)) continue;
-        if (ignorer.isIgnored(entry.path, false)) continue;
+        if (ignorer.isIgnored(entry.path, false)) {
+            report.ignored += 1;
+            continue;
+        }
         // macOS resource forks and editor droppings are not documents.
         if (std.mem.startsWith(u8, entry.basename, "._")) continue;
 
@@ -163,12 +178,33 @@ pub fn reconcile(
                 report.touched += 1;
                 continue;
             }
-        } else if (try s.findDocByShaExcludingPath(collection_id, &digest, rel_path)) |moved_id| {
-            // Same bytes, different path, and nothing recorded here: a rename.
-            // Re-embedding identical content would be pure waste.
-            try s.moveDoc(moved_id, rel_path, mtime_ms);
-            report.renamed += 1;
-            continue;
+        } else if (try s.findDocByShaExcludingPath(arena, collection_id, &digest, rel_path)) |match| {
+            // Same bytes at another path is only a rename if that path is gone.
+            //
+            // Without the check, two byte-identical files in one collection make
+            // the second look like a move of the first, and `moveDoc` repoints the
+            // single record — leaving one real file with no row at all. Measured on
+            // ~/.claude/projects: 315 files on disk, 314 indexed, and the missing
+            // one was a memory written identically in two projects.
+            //
+            // The filesystem is asked rather than the `seen` set, because the old
+            // path may simply not have been walked yet this pass.
+            const old_gone = if (std.mem.eql(u8, match.rel_path, rel_path))
+                false
+            else blk: {
+                dir.access(io, match.rel_path, .{}) catch break :blk true;
+                break :blk false;
+            };
+            if (old_gone) {
+                // Re-embedding identical content would be pure waste.
+                try s.moveDoc(match.id, rel_path, mtime_ms);
+                report.renamed += 1;
+                continue;
+            }
+            // Falls through to insert: a genuine second copy. If several documents
+            // share the sha, the query returns an arbitrary one, so a real rename
+            // can be missed here and pay for a re-embed. That is the safe
+            // direction — correct content at a cost, rather than a missing file.
         }
 
         _ = try s.upsertDocContent(collection_id, rel_path, &digest, size, mtime_ms);

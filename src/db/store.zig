@@ -227,14 +227,24 @@ pub const Store = struct {
     /// Look for a doc with this content anywhere in the collection whose file no
     /// longer exists at its recorded path — i.e. a rename. Returns its id so the
     /// caller can move the path instead of re-embedding identical content.
+    /// A document elsewhere in this collection with the same bytes.
+    ///
+    /// The path comes back with the id because same content at another path is not
+    /// proof of a rename — the caller has to check whether that path still exists.
+    /// Two byte-identical files in one collection is an ordinary thing (the same
+    /// memory written in two projects), and treating the second as a move of the
+    /// first left one of them out of the index entirely.
+    pub const ShaMatch = struct { id: i64, rel_path: []const u8 };
+
     pub fn findDocByShaExcludingPath(
         self: *Store,
+        arena: std.mem.Allocator,
         collection_id: i64,
         sha: []const u8,
         exclude_rel_path: []const u8,
-    ) Error!?i64 {
+    ) Error!?ShaMatch {
         var st = try self.db.prepare(
-            \\SELECT id FROM docs
+            \\SELECT id, rel_path FROM docs
             \\WHERE collection_id = ?1 AND content_sha = ?2 AND rel_path != ?3
             \\LIMIT 1
         );
@@ -243,7 +253,7 @@ pub const Store = struct {
         try st.bindText(2, sha);
         try st.bindText(3, exclude_rel_path);
         if (!try st.step()) return null;
-        return st.columnI64(0);
+        return .{ .id = st.columnI64(0), .rel_path = try arena.dupe(u8, st.columnText(1)) };
     }
 
     /// Record a file's identity (path + content fingerprint) and mark it as

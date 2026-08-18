@@ -191,6 +191,9 @@ pub fn run(
         .{ report.seen, report.unchanged, report.queued, report.renamed, report.touched, report.deleted },
     );
     if (report.unreadable != 0) try w.print(", unreadable {d}", .{report.unreadable});
+    // Printed whenever it is nonzero, not only when nothing was seen: a root that
+    // suddenly indexes less deserves the same one-word explanation.
+    if (report.ignored != 0) try w.print(", ignored {d}", .{report.ignored});
     try w.writeAll("\n");
     try w.flush();
 

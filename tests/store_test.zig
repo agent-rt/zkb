@@ -179,9 +179,14 @@ test "rename keeps the doc id and its vectors" {
     try addChunks(&s, cid, did, 3);
     try s.markIndexed(did, 3, 1000);
 
-    // Same content found at a different path is a rename, not new content.
-    const found = try s.findDocByShaExcludingPath(cid, "sha-x", "new.md");
-    try testing.expectEqual(@as(?i64, did), found);
+    // Same content at a different path *may* be a rename; whether it is depends on
+    // the old path still existing, which only the scanner can answer. This layer
+    // hands back the path so it can (see tests/scan_test.zig).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const found = (try s.findDocByShaExcludingPath(arena.allocator(), cid, "sha-x", "new.md")).?;
+    try testing.expectEqual(did, found.id);
+    try testing.expectEqualStrings("old.md", found.rel_path);
 
     try s.moveDoc(did, "new.md", 2000);
 
