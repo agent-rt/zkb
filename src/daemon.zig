@@ -633,13 +633,10 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
             w, req.id, .bad_request, "unknown collection", "zkb status lists them"),
         else => return proto.writeError(w, req.id, .internal, "search failed", null),
     };
-    var results = hybrid.search(st.gpa, db, mode, query, vec, coll orelse null, .{
-        // Read off the request like every other parameter. A filter the daemon
-        // path silently dropped is the single most repeated bug in this codebase.
-        .path = req.str("path"),
-        .top_k = cfg.candidates,
-        .candidates = @max(50, cfg.candidates),
-    }) catch return proto.writeError(w, req.id, .internal, "search failed", null);
+    var scfg = searchConfig(req, cfg.candidates);
+    scfg.candidates = @max(50, cfg.candidates);
+    var results = hybrid.search(st.gpa, db, mode, query, vec, coll orelse null, scfg) catch
+        return proto.writeError(w, req.id, .internal, "search failed", null);
     defer results.deinit(st.gpa);
     st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
 
@@ -822,12 +819,30 @@ fn handleSearch(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
                     return proto.writeError(w, req.id, .model_unavailable, "embedding failed", null);
                 }
                 // Hybrid keeps working without the vector path.
-                return searchAndWrite(st, db, w, req.id, .keyword, query, null, k, coll);
+                return searchAndWrite(st, db, w, req.id, .keyword, query, null, coll, searchConfig(req, k));
             };
             vec = buf;
         }
     }
-    return searchAndWrite(st, db, w, req.id, mode, query, vec, k, coll);
+    return searchAndWrite(st, db, w, req.id, mode, query, vec, coll, searchConfig(req, k));
+}
+
+/// Every retrieval filter a request can carry, in one place.
+///
+/// Adding a filter to `hybrid.Config` and forgetting to read it here is the most
+/// repeated bug in this codebase, and it happened again with `--path`: the field
+/// was wired into the query handler by mistake, so `zkb search --path` filtered
+/// nothing whenever a daemon was running while working perfectly without one. The
+/// unit tests could not catch it — they call the library directly — and CI cannot
+/// either, because `daemon run` resolves a model at startup and CI has none.
+///
+/// So the guard is structural rather than a test: both handlers build their config
+/// from this function, so a new filter is read once or not at all, never once.
+fn searchConfig(req: *const proto.Request, top_k: usize) hybrid.Config {
+    return .{
+        .top_k = top_k,
+        .path = req.str("path"),
+    };
 }
 
 fn searchAndWrite(
@@ -838,11 +853,11 @@ fn searchAndWrite(
     mode: hybrid.Mode,
     query: []const u8,
     vec: ?[]const f32,
-    k: usize,
     collection_id: ?i64,
+    cfg: hybrid.Config,
 ) !void {
     const t0 = nowMs(st.io);
-    var results = hybrid.search(st.gpa, db, mode, query, vec, collection_id, .{ .top_k = k }) catch
+    var results = hybrid.search(st.gpa, db, mode, query, vec, collection_id, cfg) catch
         return proto.writeError(w, id, .internal, "search failed", null);
     defer results.deinit(st.gpa);
     st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
