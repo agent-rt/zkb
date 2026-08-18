@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 9;
+pub const schema_version: i64 = 10;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -212,6 +212,20 @@ const ddl_v7 =
     \\ALTER TABLE collections ADD COLUMN include TEXT;
 ;
 
+/// v10 renames the `kb` collection to `numbers`.
+///
+/// `kb` read as "knowledge base", which is the whole product; the collection holds
+/// csv — facts and growing series. `numbers` is what README and `zkb skill` have
+/// always called this layer, and it names the property that actually separates it
+/// from every other collection: it is not in the vector index and is queried with
+/// SQL, because "what is my salary" is a comparison, not a similarity.
+///
+/// An UPDATE rather than a fresh row: the collection already owns documents, and
+/// inserting a second one would leave the first orphaned with its chunks.
+const ddl_v10 =
+    \\UPDATE collections SET name = 'numbers' WHERE name = 'kb';
+;
+
 /// v9 removes it again, after `.zkbignore` replaced it. See ignore.zig: exclude
 /// rules belong in the corpus, where they are versioned with the documents and
 /// unset by deleting a line. This column could be set and never cleared —
@@ -274,6 +288,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 7) try migrateToV7(db);
     if (have < 8) try migrateToV8(db);
     if (have < 9) try migrateToV9(db);
+    if (have < 10) try migrateToV10(db);
+}
+
+/// v9 -> v10: rename `kb` to `numbers`.
+fn migrateToV10(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v10);
+    try setMetaInt(db, "schema_version", 10);
+    try db.exec("COMMIT;");
 }
 
 /// v8 -> v9: drop the exclude column.

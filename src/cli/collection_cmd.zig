@@ -28,14 +28,6 @@ pub fn rm(
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
-    // zkb's own write areas would be recreated by the next ingest pass, so
-    // accepting the request would report a success that does not survive.
-    if (std.mem.eql(u8, opts.name, "memory") or std.mem.eql(u8, opts.name, "kb")) {
-        try w.print("{s} is one of zkb's own collections\n", .{opts.name});
-        try w.writeAll("it would be recreated on the next scan\n");
-        return 2;
-    }
-
     if (try viaDaemon(gpa, io, &layout, w, opts.name)) |code| return code;
 
     std.Io.Dir.accessAbsolute(io, layout.db, .{}) catch {
@@ -53,6 +45,16 @@ pub fn rm(
         try w.writeAll("zkb status lists them\n");
         return 3;
     };
+
+    // Checked by kind rather than against a list of names: zkb's own write areas
+    // are recreated by the next scan, so accepting would report a success that
+    // does not survive. A hardcoded name list is a thing to forget updating, which
+    // renaming `kb` to `numbers` proved.
+    if ((try s.collectionKind(id)) != .documents) {
+        try w.print("{s} is one of zkb's own collections\n", .{opts.name});
+        try w.writeAll("it would be recreated on the next scan\n");
+        return 2;
+    }
 
     const n = try s.deleteCollection(gpa, id);
     try w.print("removed collection {s} ({d} document(s) unindexed)\n", .{ opts.name, n });

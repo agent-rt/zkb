@@ -828,7 +828,7 @@ test "索引失败的 csv 能被查出来，而不是只留下一个计数" {
     defer db.close();
     var s = zkb.store.Store.init(&db);
 
-    const cid = try s.ensureCollection("kb", "/tmp/kb", 1000);
+    const cid = try s.ensureCollection("numbers", "/tmp/numbers", 1000);
     const bad = try s.upsertDocContent(cid, "records/mixed/a.csv", "sha-a", 10, 1000);
     _ = try s.upsertDocContent(cid, "records/ok/b.csv", "sha-b", 10, 1000);
     // records 之外的失败不该混进这个提示里。

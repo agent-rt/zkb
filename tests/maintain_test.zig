@@ -508,7 +508,7 @@ test "orphan is a documents-collection finding, not a memory one" {
 
     const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
     const mem = try s.ensureCollectionKind("memory", "/tmp/mem", .memory, 1000);
-    const kb = try s.ensureCollectionKind("kb", "/tmp/kb", .records, 1000);
+    const kb = try s.ensureCollectionKind("numbers", "/tmp/numbers", .records, 1000);
 
     // Nothing links to any of these.
     _ = try s.upsertDocContent(docs, "lonely.md", "sha1", 10, 1000);

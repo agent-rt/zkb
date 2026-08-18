@@ -376,7 +376,7 @@ test "listCollections keeps every kind and its id" {
 
     const d = try s.upsertCollection("docs", "/d", .documents, null, null, 1);
     const m = try s.upsertCollection("memory", "/m", .memory, null, null, 1);
-    const k = try s.upsertCollection("kb", "/k", .records, null, null, 1);
+    const k = try s.upsertCollection("numbers", "/n", .records, null, null, 1);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

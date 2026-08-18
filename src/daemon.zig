@@ -745,21 +745,21 @@ fn handleCollectionRm(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.
     const name = req.str("collection") orelse
         return proto.writeError(w, id, .bad_request, "collection_rm requires a collection", null);
 
-    // Refused rather than silently recreated: these two are zkb's own write areas
-    // and the next ingest pass would put them straight back, so reporting success
-    // would be a lie about what happened.
-    if (std.mem.eql(u8, name, "memory") or std.mem.eql(u8, name, "kb")) {
-        return proto.writeError(w, id, .bad_request, "memory and kb are zkb's own collections", "they are recreated on the next scan");
-    }
-
     {
         var db = store.open(st.db_path_z, .read_only) catch
             return proto.writeError(w, id, .internal, "cannot open index", null);
         defer db.close();
         var s = store.Store.init(&db);
-        const found = s.findCollection(name) catch null;
-        if (found == null) {
+        const found = s.findCollection(name) catch null orelse
             return proto.writeError(w, id, .not_found, "no such collection", "zkb status lists them");
+
+        // Refused by kind, not by name. These are zkb's own write areas and the
+        // next ingest pass recreates them, so reporting success would be a lie
+        // about what happened — and a name list is a thing to forget updating,
+        // which renaming `kb` to `numbers` proved.
+        const kind = s.collectionKind(found) catch .documents;
+        if (kind != .documents) {
+            return proto.writeError(w, id, .bad_request, "that is one of zkb's own collections", "it is recreated on the next scan");
         }
     }
 

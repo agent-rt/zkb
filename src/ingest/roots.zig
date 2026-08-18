@@ -157,7 +157,7 @@ fn componentCount(path: []const u8) usize {
 /// override and nothing to update on a later run.
 pub fn ensureOwn(s: *store.Store, layout: *const paths.Layout, now_ms: i64) !void {
     _ = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);
-    _ = try s.ensureCollectionKind("kb", layout.data, .records, now_ms);
+    _ = try s.ensureCollectionKind("numbers", layout.data, .records, now_ms);
 }
 
 /// Guarantee the documents collection exists.

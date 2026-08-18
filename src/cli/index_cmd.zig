@@ -208,7 +208,9 @@ pub fn run(
     // docs count alone would leave new memories unindexed.
     const kb_roots = try otherRoots(arena, io, &s, &layout, cid, now_ms);
     const kb_pending = try reconcileKb(gpa, io, &s, kb_roots, now_ms);
-    if (kb_pending != 0) try w.print("  kb: {d} queued\n", .{kb_pending});
+    // "other" rather than a collection name: this counts every root except the
+    // documents one, which since 0.0.11 includes whatever the user registered.
+    if (kb_pending != 0) try w.print("  other collections: {d} queued\n", .{kb_pending});
 
     // `counts()` is global, so this covers the docs root and both kb roots.
     const pending_before = (try s.counts()).pending;
