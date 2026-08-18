@@ -102,13 +102,23 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, sub, "run")) {
             // Foreground: this is what launchd supervises and what `start` spawns.
             try w.flush();
-            try zkb.daemon.run(gpa, init.io, init.environ_map, .{
+            zkb.daemon.run(gpa, init.io, init.environ_map, .{
                 .preload_model = opts.preload_model,
                 .scan_interval_s = opts.scan_interval_s,
                 .collection = opts.collection,
                 .root = opts.root,
                 .model_path = opts.model,
-            });
+            }) catch |err| switch (err) {
+                // A second daemon is a configuration mistake, not a crash. Under
+                // launchd it is also the common case during an upgrade, and a
+                // stack trace in a log file is a worse answer than one line.
+                error.AlreadyRunning => {
+                    try w.writeAll("a daemon is already running for this ZKB_HOME\n");
+                    try w.writeAll("stop it first: zkb daemon stop\n");
+                    return 3;
+                },
+                else => return err,
+            };
             return 0;
         }
         try w.print("unknown daemon subcommand: {s}\n", .{sub});

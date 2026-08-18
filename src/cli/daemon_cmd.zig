@@ -220,7 +220,26 @@ pub fn status(
 // launchd
 // ---------------------------------------------------------------------------
 
-const plist_label = "io.zkb.daemon";
+/// Reverse DNS of a namespace that actually exists and is actually ours.
+///
+/// Was `io.zkb.daemon`, which claims `zkb.io` — a domain nobody here owns. The
+/// GitHub form is the one with a real owner: `agent-rt.github.io` is the Pages
+/// namespace that comes with the org, so its reverse is `io.github.agent-rt`.
+/// Note it is *not* `com.github.agent-rt`: that would reverse to
+/// `agent-rt.github.com`, which does not exist.
+///
+/// `.daemon` stays on the end because a project can grow a second agent, and a
+/// label that names the role is cheaper than renaming again later.
+const plist_label = "io.github.agent-rt.zkb.daemon";
+
+/// The label used up to 0.0.15.
+///
+/// Kept so `install` can unload it and `uninstall` can clean it up. Without that,
+/// upgrading writes a second plist and leaves the first loaded — two launchd
+/// agents both running `zkb daemon run` against one index. That used to mean two
+/// writers; `daemon run` now refuses, so it means the new agent fails to start
+/// and launchd retries it forever. Either way the fix belongs in `install`.
+const legacy_plist_label = "io.zkb.daemon";
 
 pub fn install(
     gpa: std.mem.Allocator,
@@ -279,6 +298,13 @@ pub fn install(
     try writer.interface.flush();
 
     try w.print("wrote {s}\n", .{path});
+
+    // Done after the new plist is on disk, so a failure here leaves the machine
+    // with a working agent rather than none.
+    if (try removeLegacyPlist(gpa, io, home)) {
+        try w.print("removed the old {s}.plist\n", .{legacy_plist_label});
+        try w.print("unload it too: launchctl bootout gui/$(id -u)/{s}\n", .{legacy_plist_label});
+    }
     try w.print("load with: launchctl bootstrap gui/$(id -u) {s}\n", .{path});
     return 0;
 }
@@ -292,13 +318,36 @@ pub fn uninstall(
     const home = env.get("HOME") orelse return error.NoHomeDirectory;
     const path = try std.fmt.allocPrint(gpa, "{s}/Library/LaunchAgents/{s}.plist", .{ home, plist_label });
     defer gpa.free(path);
-    std.Io.Dir.deleteFileAbsolute(io, path) catch {
-        try w.writeAll("no LaunchAgent plist to remove\n");
-        return 0;
-    };
-    try w.print("removed {s}\n", .{path});
-    try w.print("unload with: launchctl bootout gui/$(id -u)/{s}\n", .{plist_label});
+
+    var removed = false;
+    if (std.Io.Dir.deleteFileAbsolute(io, path)) |_| {
+        try w.print("removed {s}\n", .{path});
+        try w.print("unload with: launchctl bootout gui/$(id -u)/{s}\n", .{plist_label});
+        removed = true;
+    } else |_| {}
+
+    // A machine that upgraded but never re-ran `install` still has only the old
+    // one, so uninstall has to know about it or it silently leaves it behind.
+    if (try removeLegacyPlist(gpa, io, home)) {
+        try w.print("removed the old {s}.plist\n", .{legacy_plist_label});
+        try w.print("unload with: launchctl bootout gui/$(id -u)/{s}\n", .{legacy_plist_label});
+        removed = true;
+    }
+
+    if (!removed) try w.writeAll("no LaunchAgent plist to remove\n");
     return 0;
+}
+
+/// Delete the pre-0.0.16 plist if present. Returns whether it was there.
+///
+/// Only the file is removed; unloading needs `launchctl`, which is the caller's
+/// to print rather than ours to run — spawning launchctl from a CLI that may be
+/// running under launchd itself is a good way to fight the supervisor.
+fn removeLegacyPlist(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !bool {
+    const legacy = try std.fmt.allocPrint(gpa, "{s}/Library/LaunchAgents/{s}.plist", .{ home, legacy_plist_label });
+    defer gpa.free(legacy);
+    std.Io.Dir.deleteFileAbsolute(io, legacy) catch return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

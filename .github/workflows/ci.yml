@@ -136,3 +136,20 @@ jobs:
           rc=0
           out=$("$bin" collection rm memory 2>&1) || rc=$?
           [ "$rc" -eq 2 ] || { echo "FAIL: dropping a built-in should exit 2, got $rc"; exit 1; }
+
+          # The LaunchAgent label changed in 0.0.16, so install has to clean up the
+          # old plist. Leaving it behind means two launchd agents for one index.
+          fakehome=$(mktemp -d)
+          mkdir -p "$fakehome/Library/LaunchAgents"
+          : > "$fakehome/Library/LaunchAgents/io.zkb.daemon.plist"
+          out=$(HOME="$fakehome" "$bin" daemon install 2>&1) || { echo "FAIL: daemon install"; echo "$out"; exit 1; }
+          [ -f "$fakehome/Library/LaunchAgents/io.github.agent-rt.zkb.daemon.plist" ] || { echo "FAIL: new plist missing"; echo "$out"; exit 1; }
+          [ -f "$fakehome/Library/LaunchAgents/io.zkb.daemon.plist" ] && { echo "FAIL: legacy plist left behind"; exit 1; }
+          grep -q 'io.github.agent-rt.zkb.daemon' "$fakehome/Library/LaunchAgents/io.github.agent-rt.zkb.daemon.plist" || { echo "FAIL: label not in plist"; exit 1; }
+
+          # And uninstall has to know about the old one, for a machine that
+          # upgraded without re-running install.
+          : > "$fakehome/Library/LaunchAgents/io.zkb.daemon.plist"
+          out=$(HOME="$fakehome" "$bin" daemon uninstall 2>&1) || { echo "FAIL: daemon uninstall"; echo "$out"; exit 1; }
+          n=$(ls "$fakehome/Library/LaunchAgents" | wc -l | tr -d ' ')
+          [ "$n" -eq 0 ] || { echo "FAIL: $n plist(s) left after uninstall"; exit 1; }

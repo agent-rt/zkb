@@ -30,6 +30,7 @@ const packmod = @import("search/pack.zig");
 const embed = @import("embed/llama.zig");
 const equeue = @import("embed/queue.zig");
 const proto = @import("ipc/proto.zig");
+const ipc_client = @import("ipc/client.zig");
 const paths = @import("util/paths.zig");
 const registry = @import("embed/registry.zig");
 const fsevents = @import("util/fsevents.zig");
@@ -964,8 +965,26 @@ pub fn run(
         .trace = tracemod.Writer.init(io, env, layout.trace),
     };
 
-    // A stale socket from a killed daemon would block bind; nothing is listening
-    // on it by definition, since we checked the pid file first.
+    // Refuse rather than take over. `deleteFileAbsolute` below removes the socket
+    // path unconditionally, so without this a second `daemon run` unlinks a live
+    // daemon's socket and binds its own: both processes stay alive, both hold a
+    // write connection to the same database, and the single-writer invariant this
+    // whole design rests on is gone with nothing to show for it. Reproduced on an
+    // isolated home — two pids, both listed by lsof on the socket path.
+    //
+    // `daemon start` has always probed for this; `run` had not, and `run` is what
+    // launchd invokes. The old comment here claimed the pid file had been checked
+    // first, which was true of `start` and never of this function.
+    //
+    // Liveness is probed by connecting, not by reading the pid file: a pid file
+    // can be stale, deleted, or reused, and the question being asked is whether
+    // something answers on that socket right now.
+    // Reported by the caller, which knows whether it is talking to a terminal or
+    // to a launchd log.
+    if (isLive(gpa, io, layout.sock)) return error.AlreadyRunning;
+
+    // A stale socket from a dead daemon would block bind, and nothing is
+    // listening on it — just checked.
     std.Io.Dir.deleteFileAbsolute(io, layout.sock) catch {};
 
     const addr = std.Io.net.UnixAddress.init(layout.sock) catch |err| {
@@ -1047,6 +1066,18 @@ pub fn run(
     var db = store.open(db_path_z, .read_write) catch return;
     defer db.close();
     db.exec("PRAGMA wal_checkpoint(TRUNCATE);") catch {};
+}
+
+/// Does something answer on this socket right now?
+///
+/// Mirrors `daemon_cmd.isRunning`; kept here rather than shared because that one
+/// lives outside the `zkb` module and this file is inside it.
+fn isLive(gpa: std.mem.Allocator, io: std.Io, sock: []const u8) bool {
+    var c = ipc_client.Client.connect(io, sock) catch return false;
+    defer c.close();
+    var resp = c.call(gpa, .health, "{}") catch return false;
+    defer resp.deinit(gpa);
+    return resp.ok;
 }
 
 fn writePidFile(io: std.Io, path: []const u8) !void {
