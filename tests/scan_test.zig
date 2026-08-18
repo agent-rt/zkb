@@ -168,3 +168,83 @@ test "a vanished file loses its row" {
         }
     }.run);
 }
+
+test "default patterns keep the usual junk out, and a corpus can override them" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            try tree.write("notes.md", "# 甲\n");
+            // 806 markdown files live under node_modules in one real repo, so the
+            // default has to hold even where no .gitignore exists.
+            try tree.write("node_modules/pkg/README.md", "# 依赖的说明\n");
+            try tree.write("dist/out.md", "# 构建产物\n");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            var r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+            try testing.expect(r.ignored >= 2);
+
+            // The whole reason these moved out of a hardcoded list: a corpus that
+            // means it can say so. `exclude_dirs` was checked outside the ignore
+            // matcher, so nothing could override it.
+            try tree.write(".zkbignore", "!node_modules/\n");
+            r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 2000);
+            try testing.expectEqual(@as(usize, 2), r.seen);
+        }
+    }.run);
+}
+
+test "a version-control directory is never walked, whatever the rules say" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            try tree.write("notes.md", "# 甲\n");
+            try tree.write(".git/COMMIT_EDITMSG.md", "# 不该被索引\n");
+            // `.git` appears in no ignore file anywhere — git excludes it
+            // structurally — so a negation must not bring it back.
+            try tree.write(".zkbignore", "!.git/\n");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+            try testing.expect((try s.findDoc(cid, ".git/COMMIT_EDITMSG.md")) == null);
+        }
+    }.run);
+}
+
+test "forget stays irreversible: archive cannot be re-included" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            try tree.write("live.md", "# 活着的记忆\n");
+            try tree.write("archive/forgotten.md", "# 已经忘掉的\n");
+            // A `.zkbignore` able to switch this back on would let a forgotten
+            // memory return through a keyword or vector hit, which is the one
+            // thing forgetting has to prevent.
+            try tree.write(".zkbignore", "!archive/\n");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("m", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, zkb.memory.scan_filters, 1000);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+            try testing.expect((try s.findDoc(cid, "archive/forgotten.md")) == null);
+        }
+    }.run);
+}

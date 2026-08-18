@@ -42,16 +42,21 @@ pub const Report = struct {
 pub const Filters = struct {
     /// Matched against the file extension including the dot.
     extensions: []const []const u8 = &.{ ".md", ".txt", ".mdx" },
+    /// Directory basenames this collection must never descend into, on top of the
+    /// version-control ones.
+    ///
+    /// Not expressible as an ignore pattern on purpose: the memory collection
+    /// excludes `archive/`, and that is what makes `forget` mean something. A
+    /// `.zkbignore` able to switch it back on would let a forgotten memory return,
+    /// which is the one thing forgetting has to prevent. Everything a corpus may
+    /// legitimately change its mind about lives in `ignore.default_patterns`
+    /// instead.
+    skip_dirs: []const []const u8 = &.{},
     /// Glob patterns against the path relative to the root. Empty means no
     /// include filter — the common case, and the reason the empty list cannot
     /// mean "allow nothing": a collection with no patterns must scan everything,
     /// or every existing caller would silently index zero files.
     include: []const []const u8 = &.{},
-    /// Directory basenames never descended into.
-    exclude_dirs: []const []const u8 = &.{
-        ".git",  ".jj",         "node_modules", ".zig-cache", "zig-out", "target",
-        ".venv", "__pycache__", ".next",        "dist",       "build",
-    },
     /// Hard ceiling per file. Larger files are skipped: a multi-megabyte single
     /// document is not prose, and chunking it would flood the index.
     max_file_bytes: u64 = 4 * 1024 * 1024,
@@ -84,6 +89,8 @@ pub fn reconcile(
     // and this root, then this root's own files, then each subdirectory's as it
     // is entered.
     var ignore_patterns: std.ArrayList(ignoremod.Pattern) = .empty;
+    // Seeded before any file, so a `.gitignore` or `.zkbignore` rule beats them.
+    try ignoremod.seedDefaults(arena, &ignore_patterns);
     const ignore_prefix = try loadAncestorIgnores(arena, io, root, &ignore_patterns);
     try loadIgnoreFiles(arena, io, dir, ignore_prefix, &ignore_patterns);
 
@@ -108,7 +115,8 @@ pub fn reconcile(
                     report.ignored += 1;
                     continue;
                 }
-                if (!isExcluded(entry.basename, filters.exclude_dirs) and
+                if (!isAlwaysExcluded(entry.basename) and
+                    !inList(entry.basename, filters.skip_dirs) and
                     glob.matchAnyPrefix(filters.include, entry.path))
                 {
                     // Its own rules load only after it survives the parent's:
@@ -330,7 +338,12 @@ fn hashFile(io: std.Io, dir: std.Io.Dir, basename: []const u8) !hash.Sha256Hex {
     return out;
 }
 
-fn isExcluded(basename: []const u8, list: []const []const u8) bool {
+/// A version-control directory, which no ignore rule may switch back on.
+fn isAlwaysExcluded(basename: []const u8) bool {
+    return inList(basename, &ignoremod.always_excluded_dirs);
+}
+
+fn inList(basename: []const u8, list: []const []const u8) bool {
     for (list) |d| if (std.mem.eql(u8, basename, d)) return true;
     return false;
 }

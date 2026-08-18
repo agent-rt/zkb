@@ -27,9 +27,13 @@ const utf8 = @import("util/utf8.zig");
 /// on `status: archived` alone would not do it — the frontmatter keeps archived
 /// memories out of the recency and duplicate paths, but a keyword or vector hit
 /// would still surface one, so a forgotten memory would keep coming back.
+/// `archive/` is in `skip_dirs` rather than an ignore pattern because a
+/// `.zkbignore` must not be able to switch it back on: `~/.zkb/data` is not a repo
+/// and `forget` has to stay irreversible from the index's point of view. `.git`
+/// and `.jj` are excluded for every collection and need not be repeated.
 pub const scan_filters: scan.Filters = .{
     .extensions = &.{".md"},
-    .exclude_dirs = &.{ ".git", ".jj", "archive" },
+    .skip_dirs = &.{"archive"},
 };
 
 pub const Type = enum {

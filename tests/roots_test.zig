@@ -125,7 +125,7 @@ test "kind decides the defaults a row overrides" {
         .include = null,
     });
     var has_archive = false;
-    for (mem.exclude_dirs) |d| if (std.mem.eql(u8, d, "archive")) {
+    for (mem.skip_dirs) |d| if (std.mem.eql(u8, d, "archive")) {
         has_archive = true;
     };
     try testing.expect(has_archive);

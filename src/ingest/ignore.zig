@@ -238,5 +238,42 @@ fn trimUnescapedTrailingSpace(line: []const u8) []const u8 {
 /// committing is not knowledge worth indexing, and the hardcoded `exclude_dirs`
 /// list in scan.zig (`node_modules`, `target`, `dist`, ...) is really a guess at
 /// what the repo has already declared.
+/// Directories no corpus wants indexed, as ignore patterns rather than a separate
+/// mechanism.
+///
+/// These used to be `scan.Filters.exclude_dirs`, checked by basename outside the
+/// ignore matcher — which meant a `.zkbignore` could not override them. Measured
+/// on a real repo: `node_modules` holds 806 markdown files, so dropping the list
+/// entirely would pull all of them into a root that has no `.gitignore`. As
+/// patterns they are seeded first, so under last-match-wins any `.gitignore` or
+/// `.zkbignore` rule beats them — `!node_modules/` now means what it says.
+///
+/// `.git` and `.jj` are **not** here; see `always_excluded_dirs`.
+pub const default_patterns = [_][]const u8{
+    "node_modules/",
+    ".zig-cache/",
+    "zig-out/",
+    "target/",
+    ".venv/",
+    "__pycache__/",
+    ".next/",
+    "dist/",
+    "build/",
+};
+
+/// Never walked, and not overridable.
+///
+/// git excludes its own directory structurally rather than through `.gitignore` —
+/// `.git` appears in no ignore file anywhere, and on one real repo it holds 2763
+/// files. Same for `.jj`. Indexing a version-control object store is not something
+/// anyone means to ask for, so unlike the list above these are not expressible as
+/// patterns a corpus could switch back on.
+pub const always_excluded_dirs = [_][]const u8{ ".git", ".jj" };
+
+/// Seed a pattern list with the defaults, before any file-based rules.
+pub fn seedDefaults(arena: std.mem.Allocator, out: *std.ArrayList(Pattern)) !void {
+    for (default_patterns) |line| try parseInto(arena, out, "", line);
+}
+
 pub const file_names = [_][]const u8{ ".gitignore", ".zkbignore" };
 pub const file_name = ".zkbignore";
