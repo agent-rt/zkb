@@ -202,25 +202,91 @@ pub fn slug(gpa: std.mem.Allocator, body: []const u8, fallback: []const u8) ![]u
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
-    var words: usize = 0;
+    // CJK 也要参与取名。只认 ASCII 字母数字的话，一条纯中文的记忆一个字符都取不到，
+    // 文件名退回日期——而日期作为文件名没有任何信息量，一天记两条就变成 2026-08-18
+    // 和 2026-08-18-2。中日混排更糟：只捞到夹缝里的英文词，得到 `bug-bug` 这种名字。
+    //
+    // 一个自带 CJK 分词器的工具不该在取名这里把 CJK 当空白。
+    //
+    // 取前 16 个「有意义的字符」：ASCII 字母数字按词切分，CJK 逐字收（它们本来就没有
+    // 词边界，而文件名只需要可辨认，不需要正确分词）。
+    //
+    // 上限对中文和英文的效果差很多：16 个汉字够认出一条记忆，16 个字母只有两三个词。
+    // 取中文那侧的够用值——文件名是用来一眼分辨的，不是用来读的。
+    const max_chars: usize = 16;
+
+    // 中文标点处提前收尾，避免名字断在半句话上（`…拿` 这种）。
+    const stop_marks = [_][]const u8{ "。", "：", "，", "、", "；", "——", "？", "！" };
+
+    var chars: usize = 0;
     var i: usize = 0;
     var in_word = false;
-    while (i < body.len and words < 6) : (i += 1) {
+    while (i < body.len and chars < max_chars) {
         const c = body[i];
         if (std.ascii.isAlphanumeric(c)) {
             if (!in_word and out.items.len != 0) try out.append(gpa, '-');
             try out.append(gpa, std.ascii.toLower(c));
             in_word = true;
-        } else if (in_word) {
-            in_word = false;
-            words += 1;
+            chars += 1;
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        // 一句话结束了就停：后面的内容对辨认这条记忆没有帮助。
+        if (out.items.len >= 6) {
+            var hit = false;
+            for (stop_marks) |m| {
+                if (i + m.len <= body.len and std.mem.eql(u8, body[i..][0..m.len], m)) hit = true;
+            }
+            if (hit) break;
+        }
+        if (n > 1 and i + n <= body.len and isCjk(body[i..][0..n])) {
+            if (!in_word and out.items.len != 0) try out.append(gpa, '-');
+            try out.appendSlice(gpa, body[i..][0..n]);
+            in_word = true;
+            chars += 1;
+            i += n;
+            continue;
+        }
+        in_word = false;
+        i += n;
+    }
+
+    // 到上限时英文词可能被切在中间（`seven` 变成 `se`）。CJK 逐字收所以怎么停都成词，
+    // 拉丁词不是——退回上一个词边界，宁可短一点也不要一个不成词的残片。
+    if (chars >= max_chars and in_word and out.items.len != 0 and
+        std.ascii.isAlphanumeric(out.items[out.items.len - 1]))
+    {
+        const last_dash = std.mem.lastIndexOfScalar(u8, out.items, '-');
+        // 只有当被切的确实是拉丁词、且退回后还剩得下东西时才退。
+        if (last_dash) |d| {
+            var all_ascii = true;
+            for (out.items[d + 1 ..]) |ch| {
+                if (!std.ascii.isAlphanumeric(ch)) all_ascii = false;
+            }
+            if (all_ascii and d >= 3) out.shrinkRetainingCapacity(d);
         }
     }
+
+    // 结尾可能停在连字符上。
+    while (out.items.len != 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
+
     if (out.items.len < 3) {
         out.clearRetainingCapacity();
         try out.appendSlice(gpa, fallback);
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// 汉字、假名、朝鲜文。范围与 fts5_cjk.c 的分词器保持一致——同一套判断只该有一个定义，
+/// 两处不一致会让「能搜到」和「叫什么名字」对不上。
+fn isCjk(bytes: []const u8) bool {
+    const cp = std.unicode.utf8Decode(bytes) catch return false;
+    return (cp >= 0x3040 and cp <= 0x30FF) // 平假名、片假名
+        or (cp >= 0x3400 and cp <= 0x4DBF) // 扩展 A
+        or (cp >= 0x4E00 and cp <= 0x9FFF) // 基本汉字
+        or (cp >= 0xF900 and cp <= 0xFAFF) // 兼容汉字
+        or (cp >= 0xAC00 and cp <= 0xD7AF); // 谚文
 }
 
 // ---------------------------------------------------------------------------

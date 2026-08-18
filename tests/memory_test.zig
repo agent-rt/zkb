@@ -153,21 +153,43 @@ test "subjects normalize from both list syntaxes" {
 // slug
 // ---------------------------------------------------------------------------
 
-test "slug uses ASCII words, and falls back when there are none" {
+test "slug 取 ASCII 词与 CJK 字，两者混排时都保留" {
+    // 这个测试原本断言「纯中文取不到可用内容，用日期当名字」——那是把 bug 写成了规格。
+    // 一个自带 CJK 分词器的工具不该在取名这里把 CJK 当空白：一天记两条纯中文记忆，
+    // 文件名就变成 2026-08-18 和 2026-08-18-2，谁都认不出哪条是哪条。
     const s1 = try zkb.memory.slug(gpa, "用户偏好使用 jj 管理 git 仓库", "2026-08-15");
     defer gpa.free(s1);
-    try testing.expectEqualStrings("jj-git", s1);
+    try testing.expectEqualStrings("用户偏好使用-jj-管理-git-仓库", s1);
 
-    // Chinese-only text yields nothing usable; the date is the name.
+    // 纯中文要能取出名字，而不是退回日期。中文标点处收尾：名字不该断在半句话上。
     const s2 = try zkb.memory.slug(gpa, "禁止打补丁：不查根因就改症状", "2026-08-15");
     defer gpa.free(s2);
-    try testing.expectEqualStrings("2026-08-15", s2);
+    try testing.expectEqualStrings("禁止打补丁", s2);
+
+    // 日文同理。
+    const s3 = try zkb.memory.slug(gpa, "障害報告書のテンプレート", "2026-08-15");
+    defer gpa.free(s3);
+    try testing.expectEqualStrings("障害報告書のテンプレート", s3);
+
+    // 真的没有可用字符时才退回。
+    const s4 = try zkb.memory.slug(gpa, "!!! ??? ...", "2026-08-15");
+    defer gpa.free(s4);
+    try testing.expectEqualStrings("2026-08-15", s4);
 }
 
 test "slug stays short on a long body" {
     const s = try zkb.memory.slug(gpa, "one two three four five six seven eight nine", "x");
     defer gpa.free(s);
-    try testing.expectEqualStrings("one-two-three-four-five-six", s);
+    try testing.expectEqualStrings("one-two-three-four", s);
+}
+
+test "slug 不会在多字节字符中间截断" {
+    // 上限按字符数算，不是字节数：从中间切开会写出非法 UTF-8 的文件名。
+    const long = "根因分析与最小可证伪实验是排查问题的基本手段而不是可选项目再多写一些";
+    const s = try zkb.memory.slug(gpa, long, "x");
+    defer gpa.free(s);
+    try testing.expect(std.unicode.utf8ValidateSlice(s));
+    try testing.expect(s.len > 3);
 }
 
 // ---------------------------------------------------------------------------
