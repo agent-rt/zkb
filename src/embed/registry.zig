@@ -91,7 +91,15 @@ pub fn resolve(
     override: ?[]const u8,
     q: Quant,
 ) !Resolved {
-    if (override) |o| return .{ .path = try gpa.dupe(u8, o), .source = .override };
+    // Checked like every other branch. This was the one path handed back without
+    // verifying it exists, so `--model /typo` got all the way to llama_model_load
+    // and surfaced as an unhandled `error.LoadFailed` with a stack trace, while
+    // having no model at all produced a clean message. Same command, two failure
+    // shapes, and the ugly one was the case where the user had typed something.
+    if (override) |o| {
+        std.Io.Dir.accessAbsolute(io, o, .{}) catch return error.ModelNotFound;
+        return .{ .path = try gpa.dupe(u8, o), .source = .override };
+    }
 
     const s = spec(q);
     const local = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ layout.models, s.file });
