@@ -338,7 +338,7 @@ fn recallViaDaemon(
 
     if (!resp.ok) {
         try w.print("{s}: {s}\n", .{ resp.code, resp.message });
-        return 4;
+        return zkb.proto.ErrorCode.exitCodeOf(resp.code);
     }
     if (opts.format == .json) {
         try w.print("{s}\n", .{resp.line});

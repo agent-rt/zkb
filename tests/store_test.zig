@@ -614,3 +614,32 @@ test "a path filter scopes retrieval without splitting the corpus" {
         try testing.expectEqual(@as(usize, 0), res.hits.len);
     }
 }
+
+test "one exit code per error, whichever path produced it" {
+    const EC = zkb.proto.ErrorCode;
+
+    // The contract the CI smoke test asserts, pinned here so a new error code has
+    // to choose deliberately rather than inherit whatever the last one used.
+    try testing.expectEqual(@as(u8, 2), EC.bad_request.exitCode());
+    try testing.expectEqual(@as(u8, 3), EC.not_found.exitCode());
+    try testing.expectEqual(@as(u8, 3), EC.indexing.exitCode());
+    try testing.expectEqual(@as(u8, 4), EC.model_mismatch.exitCode());
+    try testing.expectEqual(@as(u8, 4), EC.model_unavailable.exitCode());
+    try testing.expectEqual(@as(u8, 3), EC.internal.exitCode());
+
+    // Clients see the code as text off the wire.
+    try testing.expectEqual(@as(u8, 2), EC.exitCodeOf("bad_request"));
+    try testing.expectEqual(@as(u8, 4), EC.exitCodeOf("model_mismatch"));
+
+    // A name from a newer daemon is not something this client can act on, so it
+    // gets "nothing to act on" rather than "your request was wrong".
+    try testing.expectEqual(@as(u8, 3), EC.exitCodeOf("something_new"));
+
+    // Every code has to be mapped: a new variant left out of the switch would not
+    // compile, and this loop keeps the enum and the contract in one test.
+    inline for (std.meta.fields(EC)) |f| {
+        const code: EC = @enumFromInt(f.value);
+        const n = code.exitCode();
+        try testing.expect(n >= 1 and n <= 4);
+    }
+}

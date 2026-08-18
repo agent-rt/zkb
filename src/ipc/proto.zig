@@ -43,6 +43,40 @@ pub const ErrorCode = enum {
     internal,
     version_mismatch,
 
+    /// Process exit code for this error.
+    ///
+    /// One mapping, because there were four. Every `viaDaemon` picked its own
+    /// constant — `collection rm` returned 3, search/query/memory returned 4 — so
+    /// the same refusal exited differently depending on whether a daemon happened
+    /// to be running, and differently again from the in-process path that produced
+    /// the same message. Refusing to delete a built-in collection was 2 standalone
+    /// and 3 over IPC.
+    ///
+    /// The contract these follow, already asserted by the CI smoke test:
+    ///
+    ///   2  the request was wrong — usage, bad flags, a refusal
+    ///   3  nothing to act on — no index, no such thing, daemon unavailable
+    ///   4  the embedding model is missing or does not match the index
+    ///   1  the index is inconsistent with itself
+    pub fn exitCode(self: ErrorCode) u8 {
+        return switch (self) {
+            .bad_request => 2,
+            .not_found, .indexing => 3,
+            .model_mismatch, .model_unavailable => 4,
+            // A daemon-side failure the caller cannot act on. Not 2: the request
+            // was fine.
+            .internal, .version_mismatch => 3,
+        };
+    }
+
+    /// Exit code for a code that arrived as text, which is how a client sees it.
+    /// An unrecognised name means a newer daemon, and 3 is the honest answer:
+    /// nothing this client can do about it.
+    pub fn exitCodeOf(name: []const u8) u8 {
+        const c = std.meta.stringToEnum(ErrorCode, name) orelse return 3;
+        return c.exitCode();
+    }
+
     pub fn text(self: ErrorCode) []const u8 {
         return @tagName(self);
     }

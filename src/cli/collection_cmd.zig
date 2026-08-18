@@ -89,7 +89,7 @@ fn viaDaemon(
     if (!resp.ok) {
         try w.print("{s}: {s}\n", .{ resp.code, resp.message });
         if (resp.hint) |h| try w.print("hint: {s}\n", .{h});
-        return 3;
+        return zkb.proto.ErrorCode.exitCodeOf(resp.code);
     }
     try w.print("queued removal of {s}; the daemon applies it within a second\n", .{name});
     try w.writeAll("the files themselves are untouched\n");

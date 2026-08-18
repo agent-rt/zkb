@@ -59,7 +59,7 @@ fn viaDaemon(
     if (!resp.ok) {
         try w.print("{s}: {s}\n", .{ resp.code, resp.message });
         if (resp.hint) |h| try w.print("hint: {s}\n", .{h});
-        return 4;
+        return zkb.proto.ErrorCode.exitCodeOf(resp.code);
     }
     if (opts.format == .json) {
         // The daemon's JSON is the canonical shape; passing it through unchanged
