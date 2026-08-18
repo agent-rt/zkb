@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 10;
+pub const schema_version: i64 = 11;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -212,6 +212,16 @@ const ddl_v7 =
     \\ALTER TABLE collections ADD COLUMN include TEXT;
 ;
 
+/// v11 adds `rec_memory.scope`, so recall can filter in SQL.
+///
+/// The column is derived from the memory's frontmatter like every other column
+/// here, so it needs no backfill: re-indexing rewrites the projection. NULL means
+/// the memory has no scope and is universal.
+const ddl_v11 =
+    \\ALTER TABLE rec_memory ADD COLUMN scope TEXT;
+    \\CREATE INDEX rec_memory_scope ON rec_memory(scope);
+;
+
 /// v10 renames the `kb` collection to `numbers`.
 ///
 /// `kb` read as "knowledge base", which is the whole product; the collection holds
@@ -270,6 +280,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v5);
         try db.exec(ddl_v6);
         try db.exec(ddl_v7);
+        try db.exec(ddl_v11);
         // v8 added `exclude` and v9 dropped it; a fresh database skips both.
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
@@ -289,6 +300,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 8) try migrateToV8(db);
     if (have < 9) try migrateToV9(db);
     if (have < 10) try migrateToV10(db);
+    if (have < 11) try migrateToV11(db);
+}
+
+/// v10 -> v11: a scope column on the memory projection.
+fn migrateToV11(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v11);
+    try setMetaInt(db, "schema_version", 11);
+    try db.exec("COMMIT;");
 }
 
 /// v9 -> v10: rename `kb` to `numbers`.

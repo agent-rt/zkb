@@ -65,12 +65,24 @@ pub const Meta = struct {
     subjects: []const u8 = "",
     /// Comma-joined `fact:` / `doc:` references.
     refs: []const u8 = "",
+    /// Which context this memory belongs to, or empty for "any".
+    ///
+    /// An opaque label: zkb does not know what `work` or `personal` mean, only how
+    /// to compare them. Encoding a meaning here would bake one person's directory
+    /// layout into a general tool — and inferring the scope from the working
+    /// directory would do the same thing less visibly.
+    ///
+    /// Empty is universal and always injected. A non-empty scope is injected only
+    /// when the caller names it, which makes labelling opt-in and monotonic:
+    /// labelling something can only ever reduce where it appears, never widen it.
+    scope: []const u8 = "",
 
     pub fn deinit(self: Meta, gpa: std.mem.Allocator) void {
         gpa.free(self.created);
         gpa.free(self.source);
         gpa.free(self.subjects);
         gpa.free(self.refs);
+        gpa.free(self.scope);
     }
 };
 
@@ -83,6 +95,7 @@ pub fn parseMeta(gpa: std.mem.Allocator, frontmatter: ?[]const u8) !Meta {
         .source = try gpa.dupe(u8, ""),
         .subjects = try gpa.dupe(u8, ""),
         .refs = try gpa.dupe(u8, ""),
+        .scope = try gpa.dupe(u8, ""),
     };
     const fm = frontmatter orelse return m;
 
@@ -109,6 +122,9 @@ pub fn parseMeta(gpa: std.mem.Allocator, frontmatter: ?[]const u8) !Meta {
         } else if (std.mem.eql(u8, key, "refs")) {
             gpa.free(m.refs);
             m.refs = try normalizeList(gpa, val);
+        } else if (std.mem.eql(u8, key, "scope")) {
+            gpa.free(m.scope);
+            m.scope = try gpa.dupe(u8, val);
         }
     }
     return m;
@@ -140,8 +156,8 @@ pub fn replaceMeta(db: *sqlite.Db, doc_id: i64, chunk_id: i64, m: Meta) !void {
         _ = try st.step();
     }
     var st = try db.prepare(
-        \\INSERT INTO rec_memory(chunk_id, doc_id, type, status, created, source, subjects, refs)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\INSERT INTO rec_memory(chunk_id, doc_id, type, status, created, source, subjects, refs, scope)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
     );
     defer st.finalize();
     try st.bindI64(1, chunk_id);
@@ -152,6 +168,9 @@ pub fn replaceMeta(db: *sqlite.Db, doc_id: i64, chunk_id: i64, m: Meta) !void {
     try st.bindText(6, m.source);
     try st.bindText(7, m.subjects);
     try st.bindText(8, m.refs);
+    // NULL rather than '' for an unscoped memory, so `scope IS NULL` reads as
+    // "universal" in SQL without a string comparison.
+    if (m.scope.len == 0) try st.bindNull(9) else try st.bindText(9, m.scope);
     _ = try st.step();
 }
 
@@ -190,6 +209,12 @@ pub fn render(
         try w.app(&out, gpa, "\nrefs: [");
         try w.app(&out, gpa, m.refs);
         try w.app(&out, gpa, "]");
+    }
+    // Written only when set, so an unscoped memory's file is byte-identical to
+    // what earlier versions produced and nothing needs re-writing.
+    if (m.scope.len != 0) {
+        try w.app(&out, gpa, "\nscope: ");
+        try w.app(&out, gpa, m.scope);
     }
     try w.app(&out, gpa, "\n---\n\n");
     try w.app(&out, gpa, std.mem.trim(u8, body, " \t\r\n"));
@@ -306,21 +331,43 @@ fn isCjk(bytes: []const u8) bool {
 ///
 /// Only used by `recall`. In `search` the user asked for something specific, and
 /// letting the newest memory outrank the relevant one would be wrong.
+/// Is this chunk's memory visible in `scope`?
+///
+/// A chunk that is not a memory at all answers true: the caller may be fusing
+/// results from several collections, and a document has no scope to violate.
+pub fn chunkInScope(db: *sqlite.Db, chunk_id: i64, scope: ?[]const u8) !bool {
+    var st = try db.prepare("SELECT scope FROM rec_memory WHERE chunk_id = ?1");
+    defer st.finalize();
+    try st.bindI64(1, chunk_id);
+    if (!try st.step()) return true;
+    if (st.columnIsNull(0)) return true;
+    const want = scope orelse return false;
+    return std.mem.eql(u8, st.columnText(0), want);
+}
+
+/// Most recent active memories, restricted to `scope`.
+///
+/// `null` scope means universal only. Filtered in SQL rather than after fusing:
+/// a scoped memory that made the candidate list would consume a slot in the
+/// budget even if dropped later, quietly starving the ones that belong.
 pub fn recencyRanked(
     gpa: std.mem.Allocator,
     db: *sqlite.Db,
     limit: usize,
+    scope: ?[]const u8,
 ) ![]i64 {
     var out: std.ArrayList(i64) = .empty;
     errdefer out.deinit(gpa);
     var st = try db.prepare(
         \\SELECT chunk_id FROM rec_memory
         \\WHERE status = 'active'
+        \\  AND (scope IS NULL OR scope = ?2)
         \\ORDER BY created DESC, chunk_id DESC
         \\LIMIT ?1
     );
     defer st.finalize();
     try st.bindI64(1, @intCast(limit));
+    if (scope) |sc| try st.bindText(2, sc) else try st.bindNull(2);
     while (try st.step()) try out.append(gpa, st.columnI64(0));
     return out.toOwnedSlice(gpa);
 }

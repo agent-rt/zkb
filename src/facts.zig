@@ -34,7 +34,7 @@ const sqlite = @import("db/sqlite.zig");
 const csvmod = @import("ingest/csv.zig");
 const scan = @import("ingest/scan.zig");
 
-pub const columns = [_][]const u8{ "key", "value", "at", "recorded_at", "src", "note" };
+pub const columns = [_][]const u8{ "key", "value", "at", "recorded_at", "src", "note", "scope" };
 
 /// The kb root holds `facts.csv` (and later `records/*.csv`) beside `memory/`.
 /// Restricting this collection to `.csv` is what keeps the memory markdown from
@@ -59,6 +59,13 @@ pub const Fact = struct {
     recorded_at: []const u8,
     src: []const u8,
     note: []const u8,
+    /// Which context this fact belongs to, or empty for "any".
+    ///
+    /// Same rule as a memory's scope: empty is universal and always injected, a
+    /// label is injected only when the caller names it. `recall` attaches every
+    /// current fact unconditionally, so before this column a work fact reached
+    /// every session in every project — including one whose output is public.
+    scope: []const u8,
 };
 
 /// Parse `facts.csv`. The six columns are built in — no `_schema.json` needed.
@@ -90,6 +97,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
     const i_recorded = table.columnIndex("recorded_at");
     const i_src = table.columnIndex("src");
     const i_note = table.columnIndex("note");
+    const i_scope = table.columnIndex("scope");
 
     var out: std.ArrayList(Fact) = .empty;
     errdefer {
@@ -100,6 +108,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
             gpa.free(f.recorded_at);
             gpa.free(f.src);
             gpa.free(f.note);
+            gpa.free(f.scope);
         }
         out.deinit(gpa);
     }
@@ -116,6 +125,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
             .recorded_at = try gpa.dupe(u8, if (i_recorded) |i| row[i] else ""),
             .src = try gpa.dupe(u8, if (i_src) |i| row[i] else ""),
             .note = try gpa.dupe(u8, if (i_note) |i| row[i] else ""),
+            .scope = try gpa.dupe(u8, if (i_scope) |i| row[i] else ""),
         });
     }
 
@@ -168,6 +178,7 @@ pub const Current = struct {
     at: []const u8,
     recorded_at: []const u8,
     note: []const u8,
+    scope: []const u8,
 
     pub fn deinit(self: Current, gpa: std.mem.Allocator) void {
         gpa.free(self.key);
@@ -175,6 +186,19 @@ pub const Current = struct {
         gpa.free(self.at);
         gpa.free(self.recorded_at);
         gpa.free(self.note);
+        gpa.free(self.scope);
+    }
+
+    /// Does this fact belong in a recall for `want`?
+    ///
+    /// Empty scope is universal. A labelled fact needs the caller to name that
+    /// exact label — no prefix or hierarchy matching, because a scope is an opaque
+    /// string and inventing a hierarchy would mean zkb deciding that `work` and
+    /// `work/acme` are related.
+    pub fn inScope(self: Current, want: ?[]const u8) bool {
+        if (self.scope.len == 0) return true;
+        const w = want orelse return false;
+        return std.mem.eql(u8, self.scope, w);
     }
 };
 
@@ -250,6 +274,10 @@ pub fn currentAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Curre
             existing.at = try gpa.dupe(u8, f.at);
             existing.recorded_at = try gpa.dupe(u8, f.recorded_at);
             existing.note = try gpa.dupe(u8, f.note);
+            gpa.free(existing.scope);
+            // The winning row's scope, not a merge: a fact corrected into a
+            // narrower scope must not keep the old wider one.
+            existing.scope = try gpa.dupe(u8, f.scope);
             break;
         } else {
             try out.append(gpa, .{
@@ -258,6 +286,7 @@ pub fn currentAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Curre
                 .at = try gpa.dupe(u8, f.at),
                 .recorded_at = try gpa.dupe(u8, f.recorded_at),
                 .note = try gpa.dupe(u8, f.note),
+                .scope = try gpa.dupe(u8, f.scope),
             });
         }
     }
@@ -296,6 +325,7 @@ pub fn history(
             .at = try gpa.dupe(u8, f.at),
             .recorded_at = try gpa.dupe(u8, f.recorded_at),
             .note = try gpa.dupe(u8, f.note),
+            .scope = try gpa.dupe(u8, f.scope),
         });
     }
     // File order is already chronological in practice; sorting makes it so even
@@ -323,6 +353,7 @@ pub fn append(
     recorded_at: []const u8,
     src: []const u8,
     note: []const u8,
+    scope: []const u8,
 ) !void {
     const exists = blk: {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch break :blk false;
@@ -339,7 +370,7 @@ pub fn append(
     const w = &writer.interface;
 
     if (!exists or end == 0) try csvmod.writeRow(w, &columns);
-    try csvmod.writeRow(w, &.{ key, value, at, recorded_at, src, note });
+    try csvmod.writeRow(w, &.{ key, value, at, recorded_at, src, note, scope });
     try w.flush();
 }
 

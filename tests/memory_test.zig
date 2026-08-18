@@ -8,6 +8,16 @@ const zkb = @import("zkb");
 
 const testing = std.testing;
 const gpa = testing.allocator;
+// 这些测试要写 rec_memory，需要一个真库和一个向量。store_test 里有同名 helper，
+// 但那是另一个文件的私有函数——复制两行胜过为此导出。
+const store = zkb.store;
+const dim: usize = @intCast(zkb.schema.embedding_dim);
+fn dummyVector(seed: u8) [dim]f32 {
+    var v: [dim]f32 = @splat(0);
+    v[@as(usize, seed) % dim] = 1.0;
+    return v;
+}
+
 
 // ---------------------------------------------------------------------------
 // facts: current value and history
@@ -78,6 +88,7 @@ test "the embedded text excludes the value" {
         .recorded_at = "2026-08-17",
         .src = "user",
         .note = "调薪后",
+        .scope = "",
     };
     const text = try zkb.facts.renderForEmbedding(gpa, f);
     defer gpa.free(text);
@@ -253,4 +264,101 @@ test "a file predating the column still parses, with the axis simply absent" {
     defer parsed.deinit(gpa);
     try testing.expectEqualStrings("2026-04-01", parsed.facts[0].at);
     try testing.expectEqualStrings("", parsed.facts[0].recorded_at);
+}
+
+test "an unscoped fact is universal, a scoped one needs to be asked for" {
+    const uni: zkb.facts.Current = .{
+        .key = "wife.birthday", .value = "1993-07-23", .at = "1993-07-23",
+        .recorded_at = "2026-08-17", .note = "", .scope = "",
+    };
+    const work: zkb.facts.Current = .{
+        .key = "vpn.endpoint", .value = "x", .at = "2026-08-01",
+        .recorded_at = "2026-08-01", .note = "", .scope = "work",
+    };
+
+    // Empty scope is injected everywhere, including into a recall that names none.
+    try testing.expect(uni.inScope(null));
+    try testing.expect(uni.inScope("work"));
+    try testing.expect(uni.inScope("personal"));
+
+    // A label is the opposite: only when named. This is the direction that
+    // matters — `recall` attaches facts unconditionally, so before this a work
+    // fact reached every session including ones whose output is public.
+    try testing.expect(!work.inScope(null));
+    try testing.expect(work.inScope("work"));
+    try testing.expect(!work.inScope("personal"));
+
+    // No prefix or hierarchy matching: a scope is an opaque string, and deciding
+    // that `work` contains `work/acme` would be zkb inventing a meaning it has no
+    // business having.
+    try testing.expect(!work.inScope("work/acme"));
+    try testing.expect(!work.inScope("wor"));
+}
+
+test "labelling a memory only ever narrows where it appears" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollectionKind("memory", "/tmp/m", .memory, 1000);
+    const did = try s.upsertDocContent(cid, "m.md", "sha-m", 10, 1000);
+    var vec = dummyVector(1);
+    const chunk = try s.insertChunk(cid, did, .{
+        .idx = 0, .heading_path = "", .byte_start = 0, .byte_end = 10,
+        .n_tokens = 5, .text = "记忆正文",
+    }, &vec);
+
+    // Unscoped: visible in every scope.
+    try zkb.memory.replaceMeta(&db, did, chunk, .{
+        .type = .feedback, .status = .active, .created = "2026-08-18",
+        .source = "test", .subjects = "", .refs = "", .scope = "",
+    });
+    try testing.expect(try zkb.memory.chunkInScope(&db, chunk, null));
+    try testing.expect(try zkb.memory.chunkInScope(&db, chunk, "work"));
+
+    // Re-projected with a scope: gone from the unscoped recall, still there for
+    // the one that names it. Monotonic — labelling cannot widen exposure.
+    try zkb.memory.replaceMeta(&db, did, chunk, .{
+        .type = .feedback, .status = .active, .created = "2026-08-18",
+        .source = "test", .subjects = "", .refs = "", .scope = "work",
+    });
+    try testing.expect(!try zkb.memory.chunkInScope(&db, chunk, null));
+    try testing.expect(try zkb.memory.chunkInScope(&db, chunk, "work"));
+    try testing.expect(!try zkb.memory.chunkInScope(&db, chunk, "personal"));
+
+    // A chunk that is no memory at all has no scope to violate: recall fuses
+    // results across collections, and a document must not be dropped for lacking
+    // a field it never had.
+    try testing.expect(try zkb.memory.chunkInScope(&db, 99999, null));
+}
+
+test "recency ranking respects the scope" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollectionKind("memory", "/tmp/m", .memory, 1000);
+    // Two documents, not two chunks of one: `replaceMeta` deletes by doc_id, so
+    // one memory per file is the shape it is written for — which is also how
+    // `remember` writes them.
+    const d_uni = try s.upsertDocContent(cid, "uni.md", "sha-u", 10, 1000);
+    const d_work = try s.upsertDocContent(cid, "work.md", "sha-w", 10, 1000);
+    var v1 = dummyVector(1);
+    var v2 = dummyVector(2);
+    const c_uni = try s.insertChunk(cid, d_uni, .{ .idx = 0, .heading_path = "", .byte_start = 0, .byte_end = 5, .n_tokens = 5, .text = "通用" }, &v1);
+    const c_work = try s.insertChunk(cid, d_work, .{ .idx = 0, .heading_path = "", .byte_start = 0, .byte_end = 5, .n_tokens = 5, .text = "工作" }, &v2);
+
+    try zkb.memory.replaceMeta(&db, d_uni, c_uni, .{ .type = .feedback, .status = .active, .created = "2026-08-17", .source = "t", .subjects = "", .refs = "", .scope = "" });
+    try zkb.memory.replaceMeta(&db, d_work, c_work, .{ .type = .feedback, .status = .active, .created = "2026-08-18", .source = "t", .subjects = "", .refs = "", .scope = "work" });
+
+    // Filtered in SQL, not after fusing: a dropped candidate would still have
+    // consumed a slot in the budget and starved one that belongs.
+    const none = try zkb.memory.recencyRanked(gpa, &db, 10, null);
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 1), none.len);
+    try testing.expectEqual(c_uni, none[0]);
+
+    const work = try zkb.memory.recencyRanked(gpa, &db, 10, "work");
+    defer gpa.free(work);
+    try testing.expectEqual(@as(usize, 2), work.len);
 }

@@ -26,8 +26,8 @@ const usage =
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
     \\
     \\  remember <text> [--type user|feedback|decision|project|reference]
-    \\                  [--subjects a,b] [--refs a,b] [--force]
-    \\  recall [query] [--budget N] [--json]
+    \\                  [--subjects a,b] [--refs a,b] [--scope NAME] [--force]
+    \\  recall [query] [--budget N] [--scope NAME] [--json]
     \\  forget <memory-file>
     \\  facts [key] [--history]
     \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
@@ -270,6 +270,8 @@ pub fn main(init: std.process.Init) !u8 {
                     try w.print("unknown type: {s} (user|feedback|decision|project|reference)\n", .{v});
                     return 2;
                 };
+            } else if (std.mem.eql(u8, a, "--scope")) {
+                opts.scope = args.next() orelse "";
             } else if (std.mem.eql(u8, a, "--subjects")) {
                 opts.subjects = args.next() orelse "";
             } else if (std.mem.eql(u8, a, "--refs")) {
@@ -308,6 +310,8 @@ pub fn main(init: std.process.Init) !u8 {
                 if (query == null) query = a;
             } else if (std.mem.eql(u8, a, "--budget")) {
                 opts.budget = std.fmt.parseInt(usize, args.next() orelse "1500", 10) catch 1500;
+            } else if (std.mem.eql(u8, a, "--scope")) {
+                opts.scope = args.next();
             } else if (std.mem.eql(u8, a, "--json")) {
                 opts.format = .json;
             } else if (std.mem.eql(u8, a, "--model")) {
@@ -342,11 +346,14 @@ pub fn main(init: std.process.Init) !u8 {
         var n: usize = 0;
         var at: ?[]const u8 = null;
         var note: []const u8 = "";
+        var scope: []const u8 = "";
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--at")) {
                 at = args.next();
             } else if (std.mem.eql(u8, a, "--note")) {
                 note = args.next() orelse "";
+            } else if (std.mem.eql(u8, a, "--scope")) {
+                scope = args.next() orelse "";
             } else if (!std.mem.startsWith(u8, a, "--")) {
                 if (n < positional.len) {
                     positional[n] = a;
@@ -358,7 +365,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         if (n != 2) {
-            try w.writeAll("usage: zkb remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]\n");
+            try w.writeAll("usage: zkb remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT] [--scope NAME]\n");
             return 2;
         }
         return memory_cmd.rememberFact(
@@ -370,6 +377,7 @@ pub fn main(init: std.process.Init) !u8 {
             positional[1].?,
             at,
             note,
+            scope,
         );
     }
 

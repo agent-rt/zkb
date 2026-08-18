@@ -28,6 +28,8 @@ pub const RememberOptions = struct {
     /// Record anyway. The agent's explicit override *after* seeing candidates —
     /// which is why the duplicate report exits non-zero rather than prompting.
     force: bool = false,
+    /// Empty means universal. See memory.Meta.scope.
+    scope: []const u8 = "",
     model: ?[]const u8 = null,
 };
 
@@ -106,6 +108,7 @@ pub fn remember(
         .source = opts.source,
         .subjects = opts.subjects,
         .refs = opts.refs,
+        .scope = opts.scope,
     };
     const content = try zkb.memory.render(gpa, meta, opts.body);
     defer gpa.free(content);
@@ -228,6 +231,12 @@ pub const RecallOptions = struct {
     candidates: usize = 20,
     recency_depth: usize = 20,
     format: Format = .markdown,
+    /// Which scope this session is in. Null means universal only.
+    ///
+    /// Passed in rather than inferred from the working directory: guessing would
+    /// bake one person's layout into the tool, and guessing wrong would leak
+    /// exactly what the scope exists to contain.
+    scope: ?[]const u8 = null,
     model: ?[]const u8 = null,
 };
 
@@ -262,7 +271,18 @@ pub fn recall(
     // The most important line in the memory system: numeric facts are
     // *injected*, never retrieved (SPEC §15.5, §16.5). Read from the csv, so it
     // works with no model loaded and no index built.
-    const current = zkb.facts.currentAll(gpa, io, layout.facts) catch &.{};
+    const all_current = zkb.facts.currentAll(gpa, io, layout.facts) catch &.{};
+    // Filtered before rendering, not inside the renderer: `zkb facts` shows
+    // everything on purpose (you asked for it), while recall is injected without
+    // anyone asking — which is the whole reason a scope exists.
+    const current = blk: {
+        var keep: std.ArrayList(zkb.facts.Current) = .empty;
+        for (all_current) |c| {
+            if (c.inScope(opts.scope)) try keep.append(gpa, c);
+        }
+        break :blk try keep.toOwnedSlice(gpa);
+    };
+    defer gpa.free(current);
     defer {
         for (current) |f| f.deinit(gpa);
         gpa.free(current);
@@ -291,6 +311,7 @@ pub fn recall(
         .budget_tokens = opts.budget,
         .candidates = opts.candidates,
         .recency_depth = opts.recency_depth,
+        .scope = opts.scope,
     });
     defer r.deinit(gpa);
 
@@ -466,6 +487,7 @@ pub fn rememberFact(
     value: []const u8,
     at: ?[]const u8,
     note: []const u8,
+    scope: []const u8,
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
@@ -484,7 +506,7 @@ pub fn rememberFact(
     var today_buf: [32]u8 = undefined;
     const recorded = try isoDate(&today_buf, io);
 
-    try zkb.facts.append(io, layout.facts, key, value, effective, recorded, "user", note);
+    try zkb.facts.append(io, layout.facts, key, value, effective, recorded, "user", note, scope);
     try w.print("{s} = {s}  (effective {s}, recorded {s})\n", .{ key, value, effective, recorded });
     try w.print("appended to {s}\n", .{layout.facts});
     try warnIfUnversioned(io, w, layout.data);

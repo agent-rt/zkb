@@ -33,6 +33,12 @@ pub const Config = struct {
     budget_tokens: usize = 1500,
     candidates: usize = 20,
     recency_depth: usize = 20,
+    /// Which context this recall is for. Null means universal memories only.
+    ///
+    /// zkb does not infer this from the working directory: guessing would bake one
+    /// person's layout into the tool, and guessing wrong would leak exactly what
+    /// the scope exists to contain. The caller knows where it is.
+    scope: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -78,10 +84,18 @@ pub fn assemble(
                 .candidates = @max(50, cfg.candidates),
             });
             defer results.deinit(gpa);
-            for (results.hits) |h| try search_ids.append(gpa, h.chunk_id);
+            // Filtered here rather than inside `hybrid.search`: a scope is a
+            // property of a memory, not of retrieval, and threading it into search
+            // would put the same filter on a second code path — the shape that has
+            // gone wrong repeatedly in this codebase.
+            for (results.hits) |h| {
+                if (try memory.chunkInScope(db, h.chunk_id, cfg.scope)) {
+                    try search_ids.append(gpa, h.chunk_id);
+                }
+            }
         }
 
-        const recency = try memory.recencyRanked(gpa, db, cfg.recency_depth);
+        const recency = try memory.recencyRanked(gpa, db, cfg.recency_depth, cfg.scope);
         defer gpa.free(recency);
 
         // Fusing an already-fused list with a third is legitimate: RRF consumes
