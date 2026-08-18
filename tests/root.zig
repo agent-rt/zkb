@@ -23,6 +23,7 @@ test {
     _ = @import("saved_sql_test.zig");
     _ = @import("commonmark_spec_test.zig");
     _ = @import("md4c_test.zig");
+    _ = @import("glob_test.zig");
 }
 
 // ---------------------------------------------------------------------------

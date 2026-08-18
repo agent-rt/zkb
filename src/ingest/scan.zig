@@ -13,6 +13,7 @@
 const std = @import("std");
 const store = @import("../db/store.zig");
 const hash = @import("../util/hash.zig");
+const glob = @import("glob.zig");
 
 pub const Report = struct {
     seen: usize = 0,
@@ -31,6 +32,11 @@ pub const Report = struct {
 pub const Filters = struct {
     /// Matched against the file extension including the dot.
     extensions: []const []const u8 = &.{ ".md", ".txt", ".mdx" },
+    /// Glob patterns against the path relative to the root. Empty means no
+    /// include filter — the common case, and the reason the empty list cannot
+    /// mean "allow nothing": a collection with no patterns must scan everything,
+    /// or every existing caller would silently index zero files.
+    include: []const []const u8 = &.{},
     /// Directory basenames never descended into.
     exclude_dirs: []const []const u8 = &.{
         ".git",  ".jj",         "node_modules", ".zig-cache", "zig-out", "target",
@@ -71,7 +77,14 @@ pub fn reconcile(
             .directory => {
                 // Selective walking: only descend where we want to look. Entering
                 // .git on a real repo would dwarf the actual work.
-                if (!isExcluded(entry.basename, filters.exclude_dirs)) {
+                //
+                // Include patterns prune here too, not only at the file check.
+                // With `*/memory/*.md` over ~/.claude/projects, filtering only
+                // files would still walk every project's tool-results directory —
+                // orders of magnitude more entries than the ones being kept.
+                if (!isExcluded(entry.basename, filters.exclude_dirs) and
+                    glob.matchAnyPrefix(filters.include, entry.path))
+                {
                     try walker.enter(io, entry);
                 }
                 continue;
@@ -81,6 +94,7 @@ pub fn reconcile(
         }
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
+        if (!glob.matchAny(filters.include, entry.path)) continue;
         // macOS resource forks and editor droppings are not documents.
         if (std.mem.startsWith(u8, entry.basename, "._")) continue;
 
