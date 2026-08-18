@@ -19,7 +19,7 @@ const usage =
     \\  daemon start [--preload] [--root DIR] [--model PATH]
     \\  daemon stop | status | run | install | uninstall
     \\  index [--root DIR ...] [--collection NAME] [--ext md ...]
-    \\        [--include GLOB ...] [--force] [--model PATH]
+    \\        [--include GLOB ...] [--exclude GLOB ...] [--force] [--model PATH]
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--json] [--full] [--model PATH]
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
@@ -124,6 +124,8 @@ pub fn main(init: std.process.Init) !u8 {
         defer ext_list.deinit(gpa);
         var include_list: std.ArrayList([]const u8) = .empty;
         defer include_list.deinit(gpa);
+        var exclude_list: std.ArrayList([]const u8) = .empty;
+        defer exclude_list.deinit(gpa);
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--root")) {
                 const v = args.next() orelse {
@@ -145,6 +147,12 @@ pub fn main(init: std.process.Init) !u8 {
                     return 2;
                 };
                 try include_list.append(gpa, v);
+            } else if (std.mem.eql(u8, a, "--exclude")) {
+                const v = args.next() orelse {
+                    try w.writeAll("--exclude needs a glob, e.g. --exclude 'agents/handoffs/**'\n");
+                    return 2;
+                };
+                try exclude_list.append(gpa, v);
             } else if (std.mem.eql(u8, a, "--model")) {
                 opts.model = args.next();
             } else if (std.mem.eql(u8, a, "--force")) {
@@ -157,6 +165,7 @@ pub fn main(init: std.process.Init) !u8 {
         opts.roots = roots_list.items;
         opts.extensions = ext_list.items;
         opts.include = include_list.items;
+        opts.exclude = exclude_list.items;
         return index_cmd.run(gpa, init.io, init.environ_map, w, opts);
     }
 
@@ -614,7 +623,8 @@ fn status(
         var st = try db.prepare(
             \\SELECT col.name, col.root, count(d.id),
             \\       COALESCE(sum(d.chunk_count), 0),
-            \\       COALESCE(col.extensions, ''), COALESCE(col.include, '')
+            \\       COALESCE(col.extensions, ''), COALESCE(col.include, ''),
+            \\       COALESCE(col.exclude, '')
             \\FROM collections col LEFT JOIN docs d ON d.collection_id = col.id
             \\GROUP BY col.id ORDER BY col.id
         );
@@ -628,10 +638,15 @@ fn status(
             // count would be invisible while the count itself is right there.
             const exts = st.columnText(4);
             const include = st.columnText(5);
+            const exclude = st.columnText(6);
             if (exts.len != 0 or include.len != 0) {
                 try w.writeAll("      only");
                 if (exts.len != 0) try printList(w, " ", exts, "extension");
                 if (include.len != 0) try printList(w, " matching ", include, "pattern");
+                try w.writeAll("\n");
+            }
+            if (exclude.len != 0) {
+                try printList(w, "      except ", exclude, "pattern");
                 try w.writeAll("\n");
             }
         }

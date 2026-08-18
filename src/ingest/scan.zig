@@ -37,6 +37,14 @@ pub const Filters = struct {
     /// mean "allow nothing": a collection with no patterns must scan everything,
     /// or every existing caller would silently index zero files.
     include: []const []const u8 = &.{},
+    /// Glob patterns that remove a path even when `include` would keep it.
+    ///
+    /// The complement of `include`, and not expressible with it: a whitelist
+    /// cannot say "everything except this subtree" without enumerating the rest,
+    /// which then misses whatever is added later. Exclusion wins over inclusion,
+    /// because the useful combination is a broad include narrowed by a specific
+    /// exclude, never the reverse.
+    exclude: []const []const u8 = &.{},
     /// Directory basenames never descended into.
     exclude_dirs: []const []const u8 = &.{
         ".git",  ".jj",         "node_modules", ".zig-cache", "zig-out", "target",
@@ -82,8 +90,12 @@ pub fn reconcile(
                 // With `*/memory/*.md` over ~/.claude/projects, filtering only
                 // files would still walk every project's tool-results directory —
                 // orders of magnitude more entries than the ones being kept.
+                // An excluded subtree is not entered at all: `agents/handoffs/**`
+                // must stop the walk at the directory, not filter its files one
+                // by one after paying to list them.
                 if (!isExcluded(entry.basename, filters.exclude_dirs) and
-                    glob.matchAnyPrefix(filters.include, entry.path))
+                    glob.matchAnyPrefix(filters.include, entry.path) and
+                    !glob.matchAnyStrict(filters.exclude, entry.path))
                 {
                     try walker.enter(io, entry);
                 }
@@ -95,6 +107,7 @@ pub fn reconcile(
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
         if (!glob.matchAny(filters.include, entry.path)) continue;
+        if (glob.matchAnyStrict(filters.exclude, entry.path)) continue;
         // macOS resource forks and editor droppings are not documents.
         if (std.mem.startsWith(u8, entry.basename, "._")) continue;
 

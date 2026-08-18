@@ -42,6 +42,22 @@ pub fn matchAnyPrefix(patterns: []const []const u8, dir: []const u8) bool {
     return false;
 }
 
+/// Like `matchAny`, but an empty list matches *nothing*.
+///
+/// A separate function rather than a flag because the empty case means the
+/// opposite thing in the two uses, and sharing one made an exclude list of zero
+/// patterns reject every path: a scan with no `--exclude` saw 0 of 5 files. The
+/// unit tests missed it because they only ever passed non-empty exclude lists —
+/// the end-to-end run is what caught it.
+///
+/// Read the names as what they defend: `matchAny` answers "is this allowed",
+/// where no rules means yes; `matchAnyStrict` answers "is this forbidden", where
+/// no rules means no.
+pub fn matchAnyStrict(patterns: []const []const u8, path: []const u8) bool {
+    for (patterns) |p| if (match(p, path)) return true;
+    return false;
+}
+
 const Mode = enum { exact, prefix };
 
 /// Component-wise match with `**` backtracking.

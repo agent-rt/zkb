@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 7;
+pub const schema_version: i64 = 8;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -212,6 +212,20 @@ const ddl_v7 =
     \\ALTER TABLE collections ADD COLUMN include TEXT;
 ;
 
+/// v8 adds the other half of path selection.
+///
+/// `include` is a whitelist, which cannot express "everything except this
+/// subtree". The case that forced it: `~/docs/agents/handoffs` was registered as
+/// its own collection so handoff search could be scoped, and because the
+/// directory also lives under the `~/docs` root, all 26 documents were then
+/// indexed twice — inflating `broken_link` and `orphan` by exactly those 26 and
+/// putting the same text in search results under two paths. Whitelisting
+/// everything else in `~/docs` instead would silently miss any directory added
+/// later.
+const ddl_v8 =
+    \\ALTER TABLE collections ADD COLUMN exclude TEXT;
+;
+
 /// Bring `db` to `schema_version`, creating it if empty. Idempotent.
 pub fn migrate(db: *sqlite.Db) Error!void {
     try db.exec("PRAGMA foreign_keys = ON;");
@@ -232,6 +246,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v5);
         try db.exec(ddl_v6);
         try db.exec(ddl_v7);
+        try db.exec(ddl_v8);
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -247,6 +262,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 5) try migrateToV5(db);
     if (have < 6) try migrateToV6(db);
     if (have < 7) try migrateToV7(db);
+    if (have < 8) try migrateToV8(db);
+}
+
+/// v7 -> v8: exclude patterns. NULL keeps the previous behaviour exactly.
+fn migrateToV8(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v8);
+    try setMetaInt(db, "schema_version", 8);
+    try db.exec("COMMIT;");
 }
 
 /// v6 -> v7: scan configuration becomes per-collection data.
