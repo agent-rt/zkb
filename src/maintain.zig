@@ -323,10 +323,23 @@ fn checkBrokenLinks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(
     }
 }
 
+/// Only for `documents` collections.
+///
+/// "Nothing links here" is a finding about a corpus that is supposed to be
+/// interlinked. It is not a finding about a memory or a records row: `remember`
+/// writes one file per memory and no index ever points at them, so every memory
+/// zkb has ever written is an orphan by construction. Measured on this index, 35
+/// of 69 orphans were memories and 1 was `facts.csv` — more than half the check's
+/// output was it disagreeing with how the other half of zkb works.
+///
+/// The kind is the right discriminator rather than a path prefix: it is what
+/// already says who writes a collection and how it is parsed.
 fn checkOrphans(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
         \\SELECT d.rel_path FROM docs d
-        \\WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.target_doc_id = d.id)
+        \\JOIN collections c ON c.id = d.collection_id
+        \\WHERE c.kind = 'documents'
+        \\  AND NOT EXISTS (SELECT 1 FROM links l WHERE l.target_doc_id = d.id)
         \\ORDER BY d.rel_path
     );
     defer st.finalize();
@@ -339,9 +352,6 @@ fn checkOrphans(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Find
     }
 }
 
-/// A document sitting next to an index.md that does not mention it. This encodes
-/// an actual convention of this knowledge base (one index.md per project), not a
-/// universal rule — which is why it is a separate check that can be turned off.
 /// One finding for the whole condition, not one per chunk.
 ///
 /// Per-chunk would be 1198 findings on the index that motivated this, burying
@@ -372,6 +382,9 @@ fn checkOrphanChunks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList
     try add(gpa, out, .orphan_chunk, key, "(index)", detail);
 }
 
+/// A document sitting next to an index.md that does not mention it. This encodes
+/// an actual convention of this knowledge base (one index.md per project), not a
+/// universal rule — which is why it is a separate check that can be turned off.
 fn checkNotInIndex(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
         \\SELECT d.rel_path, idx.rel_path FROM docs d

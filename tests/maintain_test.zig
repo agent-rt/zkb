@@ -500,3 +500,29 @@ test "太短的 chunk 不参与相似度比较" {
     defer r2.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), r2.pairs.len);
 }
+
+test "orphan is a documents-collection finding, not a memory one" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
+    const mem = try s.ensureCollectionKind("memory", "/tmp/mem", .memory, 1000);
+    const kb = try s.ensureCollectionKind("kb", "/tmp/kb", .records, 1000);
+
+    // Nothing links to any of these.
+    _ = try s.upsertDocContent(docs, "lonely.md", "sha1", 10, 1000);
+    _ = try s.upsertDocContent(mem, "a-memory.md", "sha2", 10, 1000);
+    _ = try s.upsertDocContent(kb, "facts.csv", "sha3", 10, 1000);
+
+    // The graph has to look built, or every link check is skipped as meaningless.
+    try schema.setMeta(&db, "links_extracted", "1");
+
+    var report = try zkb.maintain.run(gpa, &db, .{ .checks = &.{.orphan} });
+    defer report.deinit(gpa);
+
+    // A memory with no inbound link is not a finding: `remember` writes one file
+    // per memory and no index ever points at them, so every memory would be one.
+    try testing.expectEqual(@as(usize, 1), report.count(.orphan));
+    try testing.expectEqualStrings("lonely.md", report.findings[0].path);
+}
