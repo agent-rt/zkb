@@ -314,11 +314,11 @@ test "upsertCollection updates the root instead of ignoring it" {
     try schema.migrate(&db);
     var s = store.Store.init(&db);
 
-    const first = try s.upsertCollection("notes", "/a", .documents, null, null, null, 1);
+    const first = try s.upsertCollection("notes", "/a", .documents, null, null, 1);
     // Re-registering the same name at a new root used to return the existing row
     // untouched, so `zkb index --root NEW --collection notes` reported success and
     // kept scanning the old place.
-    const second = try s.upsertCollection("notes", "/b", .documents, null, null, null, 2);
+    const second = try s.upsertCollection("notes", "/b", .documents, null, null, 2);
     try testing.expectEqual(first, second);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -334,8 +334,8 @@ test "a null filter keeps what is stored, so a root can be moved alone" {
     try schema.migrate(&db);
     var s = store.Store.init(&db);
 
-    _ = try s.upsertCollection("m", "/a", .documents, ".md", "*/memory/*.md", null, 1);
-    _ = try s.upsertCollection("m", "/b", .documents, null, null, null, 2);
+    _ = try s.upsertCollection("m", "/a", .documents, ".md", "*/memory/*.md", 1);
+    _ = try s.upsertCollection("m", "/b", .documents, null, null, 2);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -369,9 +369,9 @@ test "listCollections keeps every kind and its id" {
     try schema.migrate(&db);
     var s = store.Store.init(&db);
 
-    const d = try s.upsertCollection("docs", "/d", .documents, null, null, null, 1);
-    const m = try s.upsertCollection("memory", "/m", .memory, null, null, null, 1);
-    const k = try s.upsertCollection("kb", "/k", .records, null, null, null, 1);
+    const d = try s.upsertCollection("docs", "/d", .documents, null, null, 1);
+    const m = try s.upsertCollection("memory", "/m", .memory, null, null, 1);
+    const k = try s.upsertCollection("kb", "/k", .records, null, null, 1);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

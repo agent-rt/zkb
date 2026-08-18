@@ -1,0 +1,212 @@
+# 由 scripts/gen-gitignore-cases.sh 生成，oracle 是 git check-ignore。
+# 手改无意义——重新生成即可。格式：group / rules / 每行一个 path=verdict
+# git version: 2.54.0
+
+GROUP basename
+RULE *.log
+CASE 0 a.log ignore
+CASE 0 b.log ignore
+CASE 0 a/b.log ignore
+CASE 0 a/b/c.log ignore
+CASE 0 notes.md keep
+
+GROUP anchored_root
+RULE /build
+CASE 0 build ignore
+CASE 1 build ignore
+CASE 0 a/build keep
+CASE 0 a/build/x.o keep
+
+GROUP anchored_mid
+RULE doc/*.md
+CASE 0 doc/a.md ignore
+CASE 0 doc/sub/a.md keep
+CASE 0 other/a.md keep
+
+GROUP dir_only
+RULE logs/
+CASE 1 logs ignore
+CASE 0 logs/a.txt ignore
+CASE 1 a/logs ignore
+CASE 0 a/logs/b.txt ignore
+
+GROUP dir_only_vs_file
+RULE logs/
+CASE 0 logs keep
+
+GROUP negation
+RULE *.md
+RULE !keep.md
+CASE 0 a.md ignore
+CASE 0 keep.md keep
+CASE 0 sub/keep.md keep
+CASE 0 sub/a.md ignore
+
+GROUP negation_order
+RULE !keep.md
+RULE *.md
+CASE 0 a.md ignore
+CASE 0 keep.md ignore
+
+GROUP double_star_lead
+RULE **/tmp
+CASE 0 tmp ignore
+CASE 0 a/tmp ignore
+CASE 0 a/b/tmp ignore
+CASE 0 a/tmpx keep
+
+GROUP double_star_trail
+RULE build/**
+CASE 0 build/a ignore
+CASE 0 build/a/b ignore
+CASE 1 build keep
+CASE 0 other/build/a keep
+
+GROUP double_star_mid
+RULE a/**/b
+CASE 0 a/b ignore
+CASE 0 a/x/b ignore
+CASE 0 a/x/y/b ignore
+CASE 0 b keep
+CASE 0 a/b/c ignore
+
+GROUP question
+RULE ?.md
+CASE 0 a.md ignore
+CASE 0 ab.md keep
+CASE 0 sub/a.md ignore
+
+GROUP charclass
+RULE [abc].md
+CASE 0 a.md ignore
+CASE 0 b.md ignore
+CASE 0 d.md keep
+CASE 0 sub/a.md ignore
+
+GROUP charclass_range
+RULE x[0-9].md
+CASE 0 x1.md ignore
+CASE 0 x9.md ignore
+CASE 0 xa.md keep
+
+GROUP charclass_neg
+RULE [!a]bc
+CASE 0 abc keep
+CASE 0 bbc ignore
+CASE 0 cbc ignore
+
+GROUP escaped_star
+RULE a\\*b
+CASE 0 a*b keep
+CASE 0 axb keep
+
+GROUP comment
+RULE # not a rule
+RULE *.tmp
+CASE 0 a.tmp ignore
+CASE 0 # keep
+
+GROUP trailing_space
+RULE *.md   
+CASE 0 a.md ignore
+CASE 0 b.txt keep
+
+GROUP nested_negate_in_ignored_dir
+RULE build/
+RULE !build/keep.md
+CASE 0 build/keep.md ignore
+CASE 0 build/other.md ignore
+CASE 1 build ignore
+
+GROUP star_no_cross
+RULE a/*/c
+CASE 0 a/b/c ignore
+CASE 0 a/b/x/c keep
+
+GROUP deep_anchored
+RULE /a/b
+CASE 0 a/b ignore
+CASE 0 a/b/c ignore
+CASE 0 x/a/b keep
+
+GROUP both
+RULE *.md
+RULE !/README.md
+CASE 0 README.md keep
+CASE 0 sub/README.md ignore
+CASE 0 a.md ignore
+
+GROUP reinclude_dir
+RULE *
+RULE !*/
+RULE !*.md
+CASE 0 a.md keep
+CASE 1 sub keep
+CASE 0 sub/b.md keep
+CASE 0 a.txt ignore
+
+GROUP double_star_only
+RULE **
+CASE 0 a ignore
+CASE 0 a/b ignore
+CASE 1 a ignore
+
+GROUP anchor_vs_basename
+RULE a/b
+RULE c
+CASE 0 a/b ignore
+CASE 0 x/a/b keep
+CASE 0 c ignore
+CASE 0 x/c ignore
+CASE 0 a/b/c ignore
+
+GROUP dir_then_negate_file
+RULE node_modules/
+RULE !node_modules/keep.md
+CASE 0 node_modules/keep.md ignore
+CASE 1 node_modules ignore
+
+GROUP negate_then_dir
+RULE !keep/
+RULE build/
+CASE 1 keep keep
+CASE 1 build ignore
+CASE 0 build/x ignore
+CASE 0 keep/x keep
+
+GROUP trailing_slash_root
+RULE /logs/
+CASE 1 logs ignore
+CASE 0 logs/a ignore
+CASE 1 a/logs keep
+
+GROUP star_dot
+RULE *.
+CASE 0 a. ignore
+CASE 0 a.md keep
+CASE 0 ab. ignore
+
+GROUP leading_star_slash
+RULE */tmp
+CASE 0 a/tmp ignore
+CASE 0 tmp keep
+CASE 0 a/b/tmp keep
+
+GROUP escaped_bang
+RULE \\!important
+CASE 0 !important keep
+CASE 0 important keep
+
+GROUP middle_double_star_deep
+RULE src/**/test
+CASE 0 src/test ignore
+CASE 0 src/a/test ignore
+CASE 0 src/a/b/test ignore
+CASE 0 test keep
+
+GROUP class_in_dir
+RULE log[0-9]/
+CASE 1 log1 ignore
+CASE 1 logx keep
+CASE 0 log1/a.txt ignore
+

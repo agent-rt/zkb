@@ -109,7 +109,6 @@ pub const Store = struct {
         kind: Kind,
         extensions: ?[]const u8,
         include: ?[]const u8,
-        exclude: ?[]const u8,
         now_ms: i64,
     ) Error!i64 {
         if (try self.findCollection(name)) |id| {
@@ -117,8 +116,7 @@ pub const Store = struct {
                 \\UPDATE collections
                 \\   SET root = ?2, kind = ?3,
                 \\       extensions = coalesce(?4, extensions),
-                \\       include    = coalesce(?5, include),
-                \\       exclude    = coalesce(?6, exclude)
+                \\       include    = coalesce(?5, include)
                 \\ WHERE id = ?1
             );
             defer st.finalize();
@@ -127,14 +125,13 @@ pub const Store = struct {
             try st.bindText(3, @tagName(kind));
             if (extensions) |v| try st.bindText(4, v) else try st.bindNull(4);
             if (include) |v| try st.bindText(5, v) else try st.bindNull(5);
-            if (exclude) |v| try st.bindText(6, v) else try st.bindNull(6);
             _ = try st.step();
             return id;
         }
 
         var st = try self.db.prepare(
-            \\INSERT INTO collections(name, root, kind, created_at, extensions, include, exclude)
-            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            \\INSERT INTO collections(name, root, kind, created_at, extensions, include)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         );
         defer st.finalize();
         try st.bindText(1, name);
@@ -143,7 +140,6 @@ pub const Store = struct {
         try st.bindI64(4, now_ms);
         if (extensions) |v| try st.bindText(5, v) else try st.bindNull(5);
         if (include) |v| try st.bindText(6, v) else try st.bindNull(6);
-        if (exclude) |v| try st.bindText(7, v) else try st.bindNull(7);
         _ = try st.step();
         return self.db.lastInsertRowId();
     }
@@ -157,7 +153,6 @@ pub const Store = struct {
         /// Newline-separated, or null for the built-in default.
         extensions: ?[]const u8,
         include: ?[]const u8,
-        exclude: ?[]const u8,
     };
 
     /// Every collection, ordered by id so the built-ins keep coming first and the
@@ -172,7 +167,7 @@ pub const Store = struct {
     ) Error![]CollectionRow {
         var out: std.ArrayList(CollectionRow) = .empty;
         var st = try self.db.prepare(
-            "SELECT id, name, root, kind, extensions, include, exclude FROM collections ORDER BY id",
+            "SELECT id, name, root, kind, extensions, include FROM collections ORDER BY id",
         );
         defer st.finalize();
         while (try st.step()) {
@@ -183,7 +178,6 @@ pub const Store = struct {
                 .kind = std.meta.stringToEnum(Kind, st.columnText(3)) orelse .documents,
                 .extensions = if (st.columnIsNull(4)) null else try arena.dupe(u8, st.columnText(4)),
                 .include = if (st.columnIsNull(5)) null else try arena.dupe(u8, st.columnText(5)),
-                .exclude = if (st.columnIsNull(6)) null else try arena.dupe(u8, st.columnText(6)),
             });
         }
         return out.items;

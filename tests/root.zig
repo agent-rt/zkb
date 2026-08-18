@@ -25,6 +25,7 @@ test {
     _ = @import("md4c_test.zig");
     _ = @import("glob_test.zig");
     _ = @import("roots_test.zig");
+    _ = @import("gitignore_spec_test.zig");
 }
 
 // ---------------------------------------------------------------------------

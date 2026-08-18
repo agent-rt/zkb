@@ -97,17 +97,3 @@ test "matchAny is a union" {
     try testing.expect(glob.matchAnyPrefix(pats, "p"));
     try testing.expect(!glob.matchAnyPrefix(pats, "p/other"));
 }
-
-test "an empty exclude list forbids nothing, unlike an empty include list" {
-    const none: []const []const u8 = &.{};
-    // The bug this pins: sharing `matchAny` for both made a scan with no
-    // --exclude see 0 of 5 files, because an empty list means "no rules" and
-    // "no rules" reads as allow-all for include and forbid-all for exclude.
-    try testing.expect(glob.matchAny(none, "anything.md"));
-    try testing.expect(!glob.matchAnyStrict(none, "anything.md"));
-
-    const pats: []const []const u8 = &.{"agents/handoffs/**"};
-    try testing.expect(glob.matchAnyStrict(pats, "agents/handoffs/a.md"));
-    try testing.expect(glob.matchAnyStrict(pats, "agents/handoffs"));
-    try testing.expect(!glob.matchAnyStrict(pats, "agents/notes/a.md"));
-}

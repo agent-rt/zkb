@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 8;
+pub const schema_version: i64 = 9;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -212,6 +212,16 @@ const ddl_v7 =
     \\ALTER TABLE collections ADD COLUMN include TEXT;
 ;
 
+/// v9 removes it again, after `.zkbignore` replaced it. See ignore.zig: exclude
+/// rules belong in the corpus, where they are versioned with the documents and
+/// unset by deleting a line. This column could be set and never cleared —
+/// `coalesce(?, exclude)` keeps what is stored — so undoing a wrong exclude meant
+/// rebuilding the index. It existed for one release and only ever held one value,
+/// written by me, which is why dropping it outright beats keeping two mechanisms.
+const ddl_v9 =
+    \\ALTER TABLE collections DROP COLUMN exclude;
+;
+
 /// v8 adds the other half of path selection.
 ///
 /// `include` is a whitelist, which cannot express "everything except this
@@ -246,7 +256,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v5);
         try db.exec(ddl_v6);
         try db.exec(ddl_v7);
-        try db.exec(ddl_v8);
+        // v8 added `exclude` and v9 dropped it; a fresh database skips both.
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
         try setMetaInt(db, "schema_version", schema_version);
@@ -263,6 +273,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 6) try migrateToV6(db);
     if (have < 7) try migrateToV7(db);
     if (have < 8) try migrateToV8(db);
+    if (have < 9) try migrateToV9(db);
+}
+
+/// v8 -> v9: drop the exclude column.
+fn migrateToV9(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v9);
+    try setMetaInt(db, "schema_version", 9);
+    try db.exec("COMMIT;");
 }
 
 /// v7 -> v8: exclude patterns. NULL keeps the previous behaviour exactly.

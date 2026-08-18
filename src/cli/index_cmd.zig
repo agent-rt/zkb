@@ -18,9 +18,6 @@ pub const Options = struct {
     extensions: []const []const u8 = &.{},
     /// Repeatable `--include`, glob against the path relative to the root.
     include: []const []const u8 = &.{},
-    /// Repeatable `--exclude`. Wins over `--include`; the useful combination is a
-    /// broad include narrowed by a specific exclude.
-    exclude: []const []const u8 = &.{},
     model: ?[]const u8 = null,
     /// Re-embed everything, ignoring content hashes.
     force: bool = false,
@@ -32,7 +29,6 @@ const Registration = struct {
     root: []const u8,
     extensions: ?[]const u8,
     include: ?[]const u8,
-    exclude: ?[]const u8,
 };
 
 /// Fold the flags into a single registration, or explain why they cannot be.
@@ -98,7 +94,6 @@ fn registrationFrom(
         .root = folded.root,
         .extensions = try zkb.roots.joinList(arena, exts.items),
         .include = try zkb.roots.joinList(arena, include.items),
-        .exclude = try zkb.roots.joinList(arena, opts.exclude),
     };
 }
 
@@ -165,7 +160,7 @@ pub fn run(
     var s = zkb.store.Store.init(&db);
 
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    const cid = try s.upsertCollection(opts.collection, root, .documents, reg.extensions, reg.include, reg.exclude, now_ms);
+    const cid = try s.upsertCollection(opts.collection, root, .documents, reg.extensions, reg.include, now_ms);
     const filters = try zkb.roots.filtersFor(arena, .{
         .id = cid,
         .name = opts.collection,
@@ -173,7 +168,6 @@ pub fn run(
         .kind = .documents,
         .extensions = reg.extensions,
         .include = reg.include,
-        .exclude = reg.exclude,
     });
 
     if (opts.force) {
@@ -322,10 +316,6 @@ fn viaDaemon(
         }
         if (reg.include) |v| {
             try pw.writeAll(",\"include\":");
-            try std.json.Stringify.value(v, .{}, pw);
-        }
-        if (reg.exclude) |v| {
-            try pw.writeAll(",\"exclude\":");
             try std.json.Stringify.value(v, .{}, pw);
         }
         try pw.writeAll("}");

@@ -14,6 +14,7 @@ const std = @import("std");
 const store = @import("../db/store.zig");
 const hash = @import("../util/hash.zig");
 const glob = @import("glob.zig");
+const ignoremod = @import("ignore.zig");
 
 pub const Report = struct {
     seen: usize = 0,
@@ -37,14 +38,6 @@ pub const Filters = struct {
     /// mean "allow nothing": a collection with no patterns must scan everything,
     /// or every existing caller would silently index zero files.
     include: []const []const u8 = &.{},
-    /// Glob patterns that remove a path even when `include` would keep it.
-    ///
-    /// The complement of `include`, and not expressible with it: a whitelist
-    /// cannot say "everything except this subtree" without enumerating the rest,
-    /// which then misses whatever is added later. Exclusion wins over inclusion,
-    /// because the useful combination is a broad include narrowed by a specific
-    /// exclude, never the reverse.
-    exclude: []const []const u8 = &.{},
     /// Directory basenames never descended into.
     exclude_dirs: []const []const u8 = &.{
         ".git",  ".jj",         "node_modules", ".zig-cache", "zig-out", "target",
@@ -77,10 +70,19 @@ pub fn reconcile(
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true });
     defer dir.close(io);
 
+    // Rules accumulate outermost-first, which is what makes last-match-wins mean
+    // "deeper and later overrides": any `.gitignore` between the git repo root
+    // and this root, then this root's own files, then each subdirectory's as it
+    // is entered.
+    var ignore_patterns: std.ArrayList(ignoremod.Pattern) = .empty;
+    const ignore_prefix = try loadAncestorIgnores(arena, io, root, &ignore_patterns);
+    try loadIgnoreFiles(arena, io, dir, ignore_prefix, &ignore_patterns);
+
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
 
     while (try walker.next(io)) |entry| {
+        const ignorer: ignoremod.Matcher = .{ .patterns = ignore_patterns.items, .prefix = ignore_prefix };
         switch (entry.kind) {
             .directory => {
                 // Selective walking: only descend where we want to look. Entering
@@ -90,13 +92,26 @@ pub fn reconcile(
                 // With `*/memory/*.md` over ~/.claude/projects, filtering only
                 // files would still walk every project's tool-results directory —
                 // orders of magnitude more entries than the ones being kept.
-                // An excluded subtree is not entered at all: `agents/handoffs/**`
-                // must stop the walk at the directory, not filter its files one
-                // by one after paying to list them.
+                // An ignored subtree is not entered at all, which is both the
+                // cheap thing to do and what makes a negation inside it unable to
+                // bring anything back — git's own rule.
                 if (!isExcluded(entry.basename, filters.exclude_dirs) and
                     glob.matchAnyPrefix(filters.include, entry.path) and
-                    !glob.matchAnyStrict(filters.exclude, entry.path))
+                    !ignorer.isIgnored(entry.path, true))
                 {
+                    // Its own rules load only after it survives the parent's:
+                    // an ignored directory is never opened, which is also why a
+                    // `!` inside one cannot bring anything back (git's rule).
+                    var sub = entry.dir.openDir(io, entry.basename, .{}) catch {
+                        try walker.enter(io, entry);
+                        continue;
+                    };
+                    defer sub.close(io);
+                    const sub_base = if (ignore_prefix.len == 0)
+                        try arena.dupe(u8, entry.path)
+                    else
+                        try std.fmt.allocPrint(arena, "{s}/{s}", .{ ignore_prefix, entry.path });
+                    try loadIgnoreFiles(arena, io, sub, sub_base, &ignore_patterns);
                     try walker.enter(io, entry);
                 }
                 continue;
@@ -107,7 +122,7 @@ pub fn reconcile(
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
         if (!glob.matchAny(filters.include, entry.path)) continue;
-        if (glob.matchAnyStrict(filters.exclude, entry.path)) continue;
+        if (ignorer.isIgnored(entry.path, false)) continue;
         // macOS resource forks and editor droppings are not documents.
         if (std.mem.startsWith(u8, entry.basename, "._")) continue;
 
@@ -174,6 +189,90 @@ pub fn reconcile(
 
     _ = now_ms;
     return report;
+}
+
+/// Load every `.gitignore` between the enclosing git repo root and `root`,
+/// returning `root`'s path relative to the outermost one that was read.
+///
+/// Needed because a repo's rules usually sit above a collection root: a
+/// collection rooted at `<repo>/docs` has its `.gitignore` at `<repo>`. Reading only
+/// at or below the root would respect some of `.gitignore` and silently not the
+/// rest, which is the lookalike failure this whole feature is trying to avoid.
+///
+/// Stops at the directory holding `.git`, or at the filesystem root if there is
+/// none. Returns `""` when nothing above `root` had rules, which keeps the
+/// no-repo case allocation-free and the matcher on its fast path.
+fn loadAncestorIgnores(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    out: *std.ArrayList(ignoremod.Pattern),
+) ![]const u8 {
+    // Walk up collecting candidates, then load them outermost-first.
+    var dirs: std.ArrayList([]const u8) = .empty;
+    var cur = std.mem.trimEnd(u8, root, "/");
+    var found_repo = false;
+    while (std.fs.path.dirname(cur)) |parent| {
+        if (parent.len == 0) break;
+        try dirs.append(arena, parent);
+        var probe = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break;
+        defer probe.close(io);
+        if (probe.access(io, ".git", .{})) |_| {
+            found_repo = true;
+            break;
+        } else |_| {}
+        cur = parent;
+    }
+    // Without a repo boundary, walking to `/` would pick up unrelated rules from
+    // a home directory or a volume root.
+    if (!found_repo) return "";
+
+    const outermost = dirs.items[dirs.items.len - 1];
+    var i = dirs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const d = dirs.items[i];
+        var dh = std.Io.Dir.openDirAbsolute(io, d, .{}) catch continue;
+        defer dh.close(io);
+        const base = if (d.len > outermost.len) d[outermost.len + 1 ..] else "";
+        try loadIgnoreFiles(arena, io, dh, base, out);
+    }
+    return root[outermost.len + 1 ..];
+}
+
+/// Read `<dir>/.gitignore` then `<dir>/.zkbignore` and append their patterns.
+///
+/// A missing file is the common case and not an error. An unreadable one is
+/// skipped rather than failing the scan: losing a filter is better than losing
+/// the whole pass, and the file being absent from the pattern list is visible in
+/// what gets indexed.
+fn loadIgnoreFiles(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    base: []const u8,
+    out: *std.ArrayList(ignoremod.Pattern),
+) !void {
+    // Order matters: `.gitignore` first so `.zkbignore` can override it.
+    for (ignoremod.file_names) |name| try loadOneIgnoreFile(arena, io, dir, base, name, out);
+}
+
+fn loadOneIgnoreFile(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    base: []const u8,
+    name: []const u8,
+    out: *std.ArrayList(ignoremod.Pattern),
+) !void {
+    var file = dir.openFile(io, name, .{}) catch return;
+    defer file.close(io);
+    const st = file.stat(io) catch return;
+    if (st.size > 256 * 1024) return;
+    const text = arena.alloc(u8, @intCast(st.size)) catch return;
+    var reader = file.reader(io, text);
+    reader.interface.readSliceAll(text) catch return;
+    try ignoremod.parseInto(arena, out, base, text);
 }
 
 fn hashFile(io: std.Io, dir: std.Io.Dir, basename: []const u8) !hash.Sha256Hex {

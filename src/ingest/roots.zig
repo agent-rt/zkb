@@ -77,7 +77,6 @@ pub fn filtersFor(arena: std.mem.Allocator, row: store.Store.CollectionRow) !sca
         if (exts.len != 0) f.extensions = exts;
     }
     if (row.include) |raw| f.include = try splitList(arena, raw);
-    if (row.exclude) |raw| f.exclude = try splitList(arena, raw);
     return f;
 }
 
@@ -176,7 +175,7 @@ pub fn ensureDocs(
     explicit: bool,
     now_ms: i64,
 ) !i64 {
-    if (explicit) return s.upsertCollection(name, root, .documents, null, null, null, now_ms);
+    if (explicit) return s.upsertCollection(name, root, .documents, null, null, now_ms);
     return s.ensureCollectionKind(name, root, .documents, now_ms);
 }
 

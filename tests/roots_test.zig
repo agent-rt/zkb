@@ -98,7 +98,6 @@ test "kind decides the defaults a row overrides" {
         .kind = .documents,
         .extensions = null,
         .include = null,
-        .exclude = null,
     });
     try testing.expectEqual(@as(usize, 3), plain.extensions.len);
     try testing.expectEqual(@as(usize, 0), plain.include.len);
@@ -110,7 +109,6 @@ test "kind decides the defaults a row overrides" {
         .kind = .documents,
         .extensions = ".md",
         .include = "*/memory/**",
-        .exclude = null,
     });
     try testing.expectEqual(@as(usize, 1), narrowed.extensions.len);
     try testing.expectEqualStrings(".md", narrowed.extensions[0]);
@@ -125,7 +123,6 @@ test "kind decides the defaults a row overrides" {
         .kind = .memory,
         .extensions = ".md\n.txt",
         .include = null,
-        .exclude = null,
     });
     var has_archive = false;
     for (mem.exclude_dirs) |d| if (std.mem.eql(u8, d, "archive")) {
@@ -142,48 +139,12 @@ test "kind decides the defaults a row overrides" {
         .kind = .documents,
         .extensions = "",
         .include = null,
-        .exclude = null,
     });
     try testing.expectEqual(@as(usize, 3), empty.extensions.len);
 }
 
-test "exclude wins over include, and survives a root-only update" {
-    var a = std.heap.ArenaAllocator.init(testing.allocator);
-    defer a.deinit();
-    const al = arena(&a);
-
-    // The case that forced the column: a broad root with one subtree carved out.
-    // A whitelist cannot say this without enumerating everything else, which then
-    // misses whatever directory is added later.
-    const f = try roots.filtersFor(al, .{
-        .id = 1,
-        .name = "docs",
-        .root = "/d",
-        .kind = .documents,
-        .extensions = null,
-        .include = null,
-        .exclude = "agents/handoffs/**",
-    });
-    try testing.expectEqual(@as(usize, 1), f.exclude.len);
-    try testing.expectEqualStrings("agents/handoffs/**", f.exclude[0]);
-
-    // Both lists resolved together: exclude is checked after include, so a path
-    // matching both is out.
-    const both = try roots.filtersFor(al, .{
-        .id = 2,
-        .name = "x",
-        .root = "/x",
-        .kind = .documents,
-        .extensions = null,
-        .include = "agents/**",
-        .exclude = "agents/handoffs/**",
-    });
-    try testing.expect(zkb.glob.matchAny(both.include, "agents/handoffs/a.md"));
-    try testing.expect(zkb.glob.matchAny(both.exclude, "agents/handoffs/a.md"));
-    try testing.expect(!zkb.glob.matchAny(both.exclude, "agents/notes/a.md"));
-}
-
-test "an excluded directory is prunable, not just its files" {
+test "an ignored directory is prunable, not just its files" {
+    // 仍然是 .zkbignore 依赖的 glob 性质：目录层剪枝要能在目录自身上判定。
     // The prune check asks matchAny on the directory path itself. A trailing `**`
     // matches zero components, so `agents/handoffs/**` stops the walk at the
     // directory rather than listing it and rejecting each file.

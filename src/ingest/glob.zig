@@ -42,22 +42,6 @@ pub fn matchAnyPrefix(patterns: []const []const u8, dir: []const u8) bool {
     return false;
 }
 
-/// Like `matchAny`, but an empty list matches *nothing*.
-///
-/// A separate function rather than a flag because the empty case means the
-/// opposite thing in the two uses, and sharing one made an exclude list of zero
-/// patterns reject every path: a scan with no `--exclude` saw 0 of 5 files. The
-/// unit tests missed it because they only ever passed non-empty exclude lists —
-/// the end-to-end run is what caught it.
-///
-/// Read the names as what they defend: `matchAny` answers "is this allowed",
-/// where no rules means yes; `matchAnyStrict` answers "is this forbidden", where
-/// no rules means no.
-pub fn matchAnyStrict(patterns: []const []const u8, path: []const u8) bool {
-    for (patterns) |p| if (match(p, path)) return true;
-    return false;
-}
-
 const Mode = enum { exact, prefix };
 
 /// Component-wise match with `**` backtracking.
@@ -134,21 +118,51 @@ const Components = struct {
     }
 };
 
-/// `*` (any run, not crossing `/` — components never contain one) and `?`.
+/// `*`, `?`, `[...]` and backslash escapes, within one path component.
+///
+/// Character classes are here because gitignore has them, and `.zkbignore` claims
+/// gitignore semantics — a class that silently failed to match would be a claim
+/// the implementation does not honour.
 fn matchComponent(pattern: []const u8, name: []const u8) bool {
     var pi: usize = 0;
     var ni: usize = 0;
+    // Resume point for the most recent `*`, which is what keeps this linear.
     var star_pi: ?usize = null;
     var star_ni: usize = 0;
 
     while (ni < name.len) {
-        if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            pi += 1;
-            star_ni = ni;
-            continue;
-        }
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == name[ni])) {
+        if (pi < pattern.len) switch (pattern[pi]) {
+            '*' => {
+                star_pi = pi;
+                pi += 1;
+                star_ni = ni;
+                continue;
+            },
+            '?' => {
+                pi += 1;
+                ni += 1;
+                continue;
+            },
+            '[' => {
+                if (classMatch(pattern[pi..], name[ni])) |used| {
+                    pi += used;
+                    ni += 1;
+                    continue;
+                }
+                // An unterminated `[` is a literal bracket, which is what git
+                // does rather than rejecting the pattern.
+            },
+            '\\' => {
+                // Escapes the next byte, so `\*` is a literal asterisk.
+                if (pi + 1 < pattern.len and pattern[pi + 1] == name[ni]) {
+                    pi += 2;
+                    ni += 1;
+                    continue;
+                }
+            },
+            else => {},
+        };
+        if (pi < pattern.len and pattern[pi] == name[ni]) {
             pi += 1;
             ni += 1;
             continue;
@@ -163,4 +177,44 @@ fn matchComponent(pattern: []const u8, name: []const u8) bool {
     }
     while (pi < pattern.len and pattern[pi] == '*') pi += 1;
     return pi == pattern.len;
+}
+
+/// Match `c` against a `[...]` class at the start of `pattern`.
+///
+/// Returns how many pattern bytes the class occupies, or null when it does not
+/// match (or is unterminated, which makes the `[` a literal).
+fn classMatch(pattern: []const u8, c: u8) ?usize {
+    std.debug.assert(pattern[0] == '[');
+    var i: usize = 1;
+    // Both spellings of negation, as git accepts either.
+    const negated = i < pattern.len and (pattern[i] == '!' or pattern[i] == '^');
+    if (negated) i += 1;
+
+    var hit = false;
+    var first = true;
+    while (i < pattern.len) {
+        // A `]` in the first position is a literal, not the terminator.
+        if (pattern[i] == ']' and !first) {
+            const matched = hit != negated;
+            return if (matched) i + 1 else null;
+        }
+        first = false;
+
+        var lo = pattern[i];
+        if (lo == '\\' and i + 1 < pattern.len) {
+            i += 1;
+            lo = pattern[i];
+        }
+        // `a-z`, but a trailing `-` before `]` is a literal dash.
+        if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
+            const hi = pattern[i + 2];
+            if (c >= lo and c <= hi) hit = true;
+            i += 3;
+            continue;
+        }
+        if (c == lo) hit = true;
+        i += 1;
+    }
+    // Unterminated: caller falls back to treating `[` literally.
+    return null;
 }

@@ -396,14 +396,12 @@ pub const Registration = struct {
     /// Newline-separated, or null to keep whatever is stored.
     extensions: ?[]const u8,
     include: ?[]const u8,
-    exclude: ?[]const u8,
 
     fn deinit(self: Registration, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
         gpa.free(self.root);
         if (self.extensions) |v| gpa.free(v);
         if (self.include) |v| gpa.free(v);
-        if (self.exclude) |v| gpa.free(v);
     }
 };
 
@@ -421,7 +419,7 @@ fn applyRegistrations(st: *State, s: *store.Store) void {
     defer st.gpa.free(taken);
     for (taken) |r| {
         defer r.deinit(st.gpa);
-        _ = s.upsertCollection(r.name, r.root, .documents, r.extensions, r.include, r.exclude, nowMs(st.io)) catch {};
+        _ = s.upsertCollection(r.name, r.root, .documents, r.extensions, r.include, nowMs(st.io)) catch {};
     }
 }
 
@@ -703,7 +701,6 @@ fn handleIndex(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request
             .root = try st.gpa.dupe(u8, root),
             .extensions = if (req.str("extensions")) |v| try st.gpa.dupe(u8, v) else null,
             .include = if (req.str("include")) |v| try st.gpa.dupe(u8, v) else null,
-            .exclude = if (req.str("exclude")) |v| try st.gpa.dupe(u8, v) else null,
         };
         st.register_mutex.lockUncancelable(st.io);
         defer st.register_mutex.unlock(st.io);
