@@ -214,7 +214,14 @@ fn viaDaemon(
     var pw = std.Io.Writer.fixed(&pbuf);
     try pw.writeAll("{\"query\":");
     try std.json.Stringify.value(opts.query, .{}, &pw);
-    try pw.print(",\"k\":{d},\"mode\":\"{t}\"}}", .{ opts.top_k, opts.mode });
+    try pw.print(",\"k\":{d},\"mode\":\"{t}\"", .{ opts.top_k, opts.mode });
+    // 不带上 collection 的话，`--collection x` 在有 daemon 时被静默忽略：命令照常
+    // 返回结果，只是过滤没生效——比报错更难发现，因为输出看起来完全正常。
+    if (opts.collection) |name| {
+        try pw.writeAll(",\"collection\":");
+        try std.json.Stringify.value(name, .{}, &pw);
+    }
+    try pw.writeAll("}");
 
     var resp = c.call(gpa, .search, pw.buffered()) catch return null;
     defer resp.deinit(gpa);

@@ -568,7 +568,12 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
     }
 
     const t0 = nowMs(st.io);
-    var results = hybrid.search(st.gpa, db, mode, query, vec, null, .{
+    const coll = requestedCollection(db, req) catch |e| switch (e) {
+        error.UnknownCollection => return proto.writeError(
+            w, req.id, .bad_request, "unknown collection", "zkb status lists them"),
+        else => return proto.writeError(w, req.id, .internal, "search failed", null),
+    };
+    var results = hybrid.search(st.gpa, db, mode, query, vec, coll orelse null, .{
         .top_k = cfg.candidates,
         .candidates = @max(50, cfg.candidates),
     }) catch return proto.writeError(w, req.id, .internal, "search failed", null);
@@ -659,10 +664,26 @@ fn handleIndex(st: *State, w: *std.Io.Writer, id: i64) !void {
     try proto.finishOk(w);
 }
 
+/// 请求里的 collection 名解析成 id。名字不存在返回 null 之外的 error，让调用方能报错而
+/// 不是静默返回全库结果——`--collection` 被无视时命令看起来完全正常，只是过滤没生效。
+fn requestedCollection(db: *sqlite.Db, req: *const proto.Request) !??i64 {
+    const name = req.str("collection") orelse return @as(??i64, null);
+    var st = try db.prepare("SELECT id FROM collections WHERE name = ?1");
+    defer st.finalize();
+    try st.bindText(1, name);
+    if (!try st.step()) return error.UnknownCollection;
+    return @as(??i64, st.columnI64(0));
+}
+
 fn handleSearch(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.Request) !void {
     const query = req.str("query") orelse
         return proto.writeError(w, req.id, .bad_request, "search requires a query", null);
     const k: usize = @intCast(@max(1, req.int("k") orelse 10));
+    const coll = requestedCollection(db, req) catch |e| switch (e) {
+        error.UnknownCollection => return proto.writeError(
+            w, req.id, .bad_request, "unknown collection", "zkb status lists them"),
+        else => return proto.writeError(w, req.id, .internal, "search failed", null),
+    } orelse null;
     var mode: hybrid.Mode = if (req.str("mode")) |m|
         std.meta.stringToEnum(hybrid.Mode, m) orelse
             return proto.writeError(w, req.id, .bad_request, "mode must be hybrid, vector or keyword", null)
@@ -689,12 +710,12 @@ fn handleSearch(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
                     return proto.writeError(w, req.id, .model_unavailable, "embedding failed", null);
                 }
                 // Hybrid keeps working without the vector path.
-                return searchAndWrite(st, db, w, req.id, .keyword, query, null, k);
+                return searchAndWrite(st, db, w, req.id, .keyword, query, null, k, coll);
             };
             vec = buf;
         }
     }
-    return searchAndWrite(st, db, w, req.id, mode, query, vec, k);
+    return searchAndWrite(st, db, w, req.id, mode, query, vec, k, coll);
 }
 
 fn searchAndWrite(
@@ -706,9 +727,10 @@ fn searchAndWrite(
     query: []const u8,
     vec: ?[]const f32,
     k: usize,
+    collection_id: ?i64,
 ) !void {
     const t0 = nowMs(st.io);
-    var results = hybrid.search(st.gpa, db, mode, query, vec, null, .{ .top_k = k }) catch
+    var results = hybrid.search(st.gpa, db, mode, query, vec, collection_id, .{ .top_k = k }) catch
         return proto.writeError(w, id, .internal, "search failed", null);
     defer results.deinit(st.gpa);
     st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
