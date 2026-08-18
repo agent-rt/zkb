@@ -81,6 +81,37 @@ scanning a directory of projects and scanning only the parts you asked for — o
 parent. Prefer `--include` when directories will be added later, since several
 roots name only what exists now.
 
+A collection is also reversible, which it was not at first:
+
+```
+zkb collection rm agent-memory      # forgets the index; the files stay
+```
+
+**Do not make a subdirectory of a collection into its own collection.** A
+collection is the identity `zkb://` links resolve against, so carving one out of a
+linked tree severs the graph in both directions. To narrow a search, narrow the
+search:
+
+```
+zkb search "where did I leave off" --path 'agents/handoffs/**'
+```
+
+The filter is exact rather than a post-filter on a global top-k: the document set
+is resolved by glob, BM25 restricts inside its own query, and the vector side
+scores that subset directly.
+
+## Ignoring files
+
+`.zkbignore` uses gitignore syntax — the real one, checked against
+`git check-ignore` across 102 cases, including `!` negation, anchoring, `**`,
+character classes, and per-directory nesting.
+
+The repo's own `.gitignore` is respected too, including files above the collection
+root, since a file not worth committing is rarely knowledge worth indexing. Rules
+live in the corpus rather than the database, so they are versioned with the
+documents and unset by deleting a line. `.zkbignore` loads after `.gitignore`, so
+it can override it — `!drafts/` indexes a directory git ignores.
+
 ## Numbers
 
 Three kinds of number exist and are not stored the same way:

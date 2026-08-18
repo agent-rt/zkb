@@ -106,3 +106,33 @@ jobs:
           rc=0
           out=$("$bin" index --collection bad --root /opt --root /var 2>&1) || rc=$?
           [ "$rc" -eq 2 ] || { echo "FAIL: disjoint roots should be refused with exit 2, got $rc"; echo "$out"; exit 1; }
+
+          # .zkbignore, with the repo's own .gitignore respected from above the
+          # collection root. Both were shipped as gitignore-compatible, so the
+          # exact seen count is the assertion that matters.
+          igroot=$(mktemp -d)
+          ( cd "$igroot" && git init -q . && git config core.excludesfile /dev/null )
+          mkdir -p "$igroot/docs/notes" "$igroot/docs/drafts"
+          printf '# keep\n'   > "$igroot/docs/top.md"
+          printf '# keep\n'   > "$igroot/docs/notes/a.md"
+          printf '# drop\n'   > "$igroot/docs/drafts/d.md"
+          printf 'noise\n'    > "$igroot/docs/notes/x.log"
+          printf 'docs/drafts/\n*.log\n' > "$igroot/.gitignore"
+          rc=0
+          out=$("$bin" index --collection ig --root "$igroot/docs" --ext md --ext log 2>&1) || rc=$?
+          [ "$rc" -eq 4 ] || { echo "FAIL: index expected exit 4, got $rc"; echo "$out"; exit 1; }
+          grep -q 'seen 2,' <<<"$out" || { echo "FAIL: ancestor .gitignore should leave 2 of 4 files"; echo "$out"; exit 1; }
+
+          # .zkbignore overrides .gitignore, because it loads after it.
+          printf '!drafts/\n' > "$igroot/docs/.zkbignore"
+          rc=0
+          out=$("$bin" index --collection ig2 --root "$igroot/docs" --ext md --ext log 2>&1) || rc=$?
+          grep -q 'seen 3,' <<<"$out" || { echo "FAIL: !drafts/ should re-include the gitignored directory"; echo "$out"; exit 1; }
+
+          # A collection has to be removable; it was not, and that cost a rebuild.
+          out=$("$bin" collection rm ig2 2>&1) || { echo "FAIL: collection rm"; echo "$out"; exit 1; }
+          grep -q 'untouched' <<<"$out" || { echo "FAIL: rm should say the files survive"; echo "$out"; exit 1; }
+          "$bin" status 2>&1 | grep -q ' ig2 ' && { echo "FAIL: ig2 still listed"; exit 1; }
+          rc=0
+          out=$("$bin" collection rm memory 2>&1) || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: dropping a built-in should exit 2, got $rc"; exit 1; }
