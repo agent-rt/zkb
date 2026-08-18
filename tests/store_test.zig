@@ -530,3 +530,82 @@ test "a search over an index with nothing but stale entries returns empty, not a
     defer res.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), res.hits.len);
 }
+
+test "deleteCollection leaves no residue in any of the three tables" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const keep = try s.ensureCollection("keep", "/tmp/keep", 1000);
+    const drop = try s.ensureCollection("drop", "/tmp/drop", 1000);
+    const k1 = try s.upsertDocContent(keep, "a.md", "sha-a", 10, 1000);
+    const d1 = try s.upsertDocContent(drop, "b.md", "sha-b", 10, 1000);
+    const d2 = try s.upsertDocContent(drop, "c.md", "sha-c", 10, 1000);
+    try addChunks(&s, keep, k1, 2);
+    try addChunks(&s, drop, d1, 3);
+    try addChunks(&s, drop, d2, 4);
+
+    try testing.expectEqual(@as(i64, 9), (try s.counts()).chunks);
+
+    const n = try s.deleteCollection(testing.allocator, drop);
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // The collection row is gone, and so is every chunk it owned — in all three
+    // tables, or search would still match text whose document no longer exists.
+    try testing.expectEqual(@as(?i64, null), try s.findCollection("drop"));
+    const c = try s.counts();
+    try testing.expectEqual(@as(i64, 2), c.chunks);
+    try testing.expectEqual(@as(i64, 2), c.fts_rows);
+    try testing.expectEqual(@as(i64, 2), c.vec_rows);
+
+    // And no orphaned chunks, which is the residue this whole class of bug leaves.
+    try testing.expectEqual(@as(usize, 0), try s.deleteOrphanChunks(testing.allocator));
+
+    // The other collection is untouched.
+    try testing.expectEqual(@as(?i64, keep), try s.findCollection("keep"));
+    try testing.expectEqual(@as(?i64, 2), try db.queryI64("SELECT count(*) FROM chunks"));
+}
+
+test "a path filter scopes retrieval without splitting the corpus" {
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const inside = try s.upsertDocContent(cid, "agents/handoffs/h1.md", "sha-h", 10, 1000);
+    const outside = try s.upsertDocContent(cid, "projects/spec.md", "sha-s", 10, 1000);
+    try addChunks(&s, cid, inside, 2);
+    try addChunks(&s, cid, outside, 2);
+
+    var query_vec = dummyVector(0);
+
+    // Unscoped: both documents are reachable.
+    {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{ .top_k = 10 });
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 4), res.hits.len);
+    }
+
+    // Scoped: only the subtree, and exactly its chunks rather than whatever
+    // survived a post-filter on a global top-k.
+    {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+            .top_k = 10,
+            .path = "agents/handoffs/**",
+        });
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 2), res.hits.len);
+        for (res.hits) |h| try testing.expectEqual(inside, h.doc_id);
+    }
+
+    // A pattern matching nothing returns nothing rather than falling back to
+    // everything — the empty-list inversion that cost a release once already.
+    {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+            .top_k = 10,
+            .path = "nowhere/**",
+        });
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), res.hits.len);
+    }
+}

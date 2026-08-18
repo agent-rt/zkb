@@ -13,6 +13,9 @@ pub const Options = struct {
     mode: zkb.hybrid.Mode = .hybrid,
     top_k: usize = 10,
     collection: ?[]const u8 = null,
+    /// Restrict to documents whose path matches this glob, without splitting the
+    /// corpus into another collection.
+    path: ?[]const u8 = null,
     model: ?[]const u8 = null,
     json: bool = false,
     /// Print the full chunk text rather than a leading excerpt.
@@ -94,6 +97,7 @@ pub fn run(
 
     const trace_t0: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
     var results = try zkb.hybrid.search(gpa, &db, mode, opts.query, query_vec, collection_id, .{
+        .path = opts.path,
         .top_k = opts.top_k,
     });
     defer results.deinit(gpa);
@@ -220,6 +224,10 @@ fn viaDaemon(
     if (opts.collection) |name| {
         try pw.writeAll(",\"collection\":");
         try std.json.Stringify.value(name, .{}, &pw);
+    }
+    if (opts.path) |pat| {
+        try pw.writeAll(",\"path\":");
+        try std.json.Stringify.value(pat, .{}, &pw);
     }
     try pw.writeAll("}");
 

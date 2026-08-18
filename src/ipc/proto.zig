@@ -23,6 +23,9 @@ pub const Method = enum {
     /// SQLITE_BUSY off the table (see `handleIndex`).
     recall,
     index,
+    /// Remove a collection and everything indexed under it. A write, so it is
+    /// handed to the ingest thread rather than done here — same reason as `index`.
+    collection_rm,
     maintain,
     shutdown,
 

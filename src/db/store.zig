@@ -468,6 +468,36 @@ pub const Store = struct {
         return removed;
     }
 
+    /// Remove a collection and every document in it.
+    ///
+    /// Per document rather than by bulk DELETE, because `deleteDoc` is what knows
+    /// the five-table order and the link fixups; a second copy of that is a second
+    /// thing to get wrong. Returns how many documents went.
+    ///
+    /// Nothing could remove a collection before this. `zkb index --collection X`
+    /// created one and there was no way back, so undoing a collection registered
+    /// by mistake meant deleting the index and re-embedding everything — which is
+    /// exactly what a wrongly-registered subdirectory of ~/docs cost.
+    pub fn deleteCollection(self: *Store, gpa: std.mem.Allocator, id: i64) Error!usize {
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(gpa);
+        {
+            var st = try self.db.prepare("SELECT id FROM docs WHERE collection_id = ?1");
+            defer st.finalize();
+            try st.bindI64(1, id);
+            // Collected first: deleting while stepping over the same table is a
+            // half-done sweep waiting to happen.
+            while (try st.step()) try ids.append(gpa, st.columnI64(0));
+        }
+        for (ids.items) |doc_id| try self.deleteDoc(doc_id);
+
+        var st = try self.db.prepare("DELETE FROM collections WHERE id = ?1");
+        defer st.finalize();
+        try st.bindI64(1, id);
+        _ = try st.step();
+        return ids.items.len;
+    }
+
     pub fn deleteChunks(self: *Store, doc_id: i64) Error!void {
         // Projections first: they reference chunks, so they must go before the
         // rows they point at.

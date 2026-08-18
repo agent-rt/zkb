@@ -9,6 +9,7 @@ const query_cmd = @import("cli/query_cmd.zig");
 const memory_cmd = @import("cli/memory_cmd.zig");
 const records_cmd = @import("cli/records_cmd.zig");
 const skill_cmd = @import("cli/skill_cmd.zig");
+const collection_cmd = @import("cli/collection_cmd.zig");
 const mcp = @import("mcp/server.zig");
 
 const usage =
@@ -21,7 +22,7 @@ const usage =
     \\  index [--root DIR ...] [--collection NAME] [--ext md ...]
     \\        [--include GLOB ...] [--force] [--model PATH]
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
-    \\                 [--json] [--full] [--model PATH]
+    \\                 [--path GLOB] [--json] [--full] [--model PATH]
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
     \\
     \\  remember <text> [--type user|feedback|decision|project|reference]
@@ -35,6 +36,7 @@ const usage =
     \\  sql <select ...> [--json]
     \\
     \\  status
+    \\  collection rm NAME           drop a collection; the files are untouched
     \\  maintain [--since last] [--check NAME] [--all] [--json]
     \\  mcp                          stdio MCP server (for Claude Code etc.)
     \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
@@ -184,6 +186,12 @@ pub fn main(init: std.process.Init) !u8 {
                 };
             } else if (std.mem.eql(u8, a, "--collection")) {
                 opts.collection = args.next();
+            } else if (std.mem.eql(u8, a, "--path")) {
+                const v = args.next() orelse {
+                    try w.writeAll("--path needs a glob, e.g. --path 'agents/handoffs/**'\n");
+                    return 2;
+                };
+                opts.path = v;
             } else if (std.mem.eql(u8, a, "--model")) {
                 opts.model = args.next();
             } else if (std.mem.eql(u8, a, "--json")) {
@@ -440,6 +448,22 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, cmd, "skill")) {
         return skill_cmd.run(gpa, init.io, init.environ_map, w);
+    }
+
+    if (std.mem.eql(u8, cmd, "collection")) {
+        const sub = args.next() orelse {
+            try w.writeAll("usage: zkb collection rm NAME\n");
+            return 2;
+        };
+        if (!std.mem.eql(u8, sub, "rm")) {
+            try w.print("unknown collection subcommand: {s}\n", .{sub});
+            return 2;
+        }
+        const name = args.next() orelse {
+            try w.writeAll("usage: zkb collection rm NAME\n");
+            return 2;
+        };
+        return collection_cmd.rm(gpa, init.io, init.environ_map, w, .{ .name = name });
     }
 
     if (std.mem.eql(u8, cmd, "status")) {

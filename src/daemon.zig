@@ -120,6 +120,9 @@ pub const State = struct {
     /// registered nothing while reporting success.
     register_mutex: std.Io.Mutex = .init,
     pending_registers: std.ArrayList(Registration) = .empty,
+    /// Collection names an `collection_rm` request asked to drop. Same handover as
+    /// registrations, and guarded by the same mutex.
+    pending_drops: std.ArrayList([]const u8) = .empty,
 
     /// How many times the anti-starvation deadline fired. Surfaced in `stats`
     /// because if this is nonzero and growing, the machine is under enough query
@@ -301,6 +304,7 @@ fn ingestThread(st: *State) void {
         // restart. The kb roots were previously scanned only by `zkb index`,
         // which meant a records csv an agent appended to was never picked up by
         // the running daemon.
+        applyDrops(st, &s);
         applyRegistrations(st, &s);
 
         // Housekeeping on zkb's own derived data (SPEC §14.0): a chunk whose
@@ -423,6 +427,20 @@ fn applyRegistrations(st: *State, s: *store.Store) void {
     }
 }
 
+/// Apply queued collection drops. Ingest thread only.
+fn applyDrops(st: *State, s: *store.Store) void {
+    st.register_mutex.lockUncancelable(st.io);
+    const taken = st.pending_drops.toOwnedSlice(st.gpa) catch &.{};
+    st.register_mutex.unlock(st.io);
+
+    defer st.gpa.free(taken);
+    for (taken) |name| {
+        defer st.gpa.free(name);
+        const id = s.findCollection(name) catch continue orelse continue;
+        _ = s.deleteCollection(st.gpa, id) catch {};
+    }
+}
+
 /// Embed and write pending documents one at a time, re-checking shutdown between
 /// documents so a stop request does not wait for the whole backlog.
 fn drainPending(st: *State, s: *store.Store, collection_id: i64, root: []const u8) !usize {
@@ -535,6 +553,7 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
         .query => try handleQuery(st, db, w, &req),
         .recall => try handleRecall(st, db, w, &req),
         .index => try handleIndex(st, w, req.id, &req),
+        .collection_rm => try handleCollectionRm(st, w, req.id, &req),
         .maintain => try handleMaintain(st, db, w, &req),
         .shutdown => {
             try proto.beginOk(w, req.id);
@@ -615,6 +634,9 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
         else => return proto.writeError(w, req.id, .internal, "search failed", null),
     };
     var results = hybrid.search(st.gpa, db, mode, query, vec, coll orelse null, .{
+        // Read off the request like every other parameter. A filter the daemon
+        // path silently dropped is the single most repeated bug in this codebase.
+        .path = req.str("path"),
         .top_k = cfg.candidates,
         .candidates = @max(50, cfg.candidates),
     }) catch return proto.writeError(w, req.id, .internal, "search failed", null);
@@ -718,6 +740,39 @@ fn handleIndex(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request
     st.rescan.store(true, .release);
     try proto.beginOk(w, id);
     try w.writeAll("{\"queued\":true,\"note\":\"ingest thread woken\"}");
+    try proto.finishOk(w);
+}
+
+fn handleCollectionRm(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request) !void {
+    const name = req.str("collection") orelse
+        return proto.writeError(w, id, .bad_request, "collection_rm requires a collection", null);
+
+    // Refused rather than silently recreated: these two are zkb's own write areas
+    // and the next ingest pass would put them straight back, so reporting success
+    // would be a lie about what happened.
+    if (std.mem.eql(u8, name, "memory") or std.mem.eql(u8, name, "kb")) {
+        return proto.writeError(w, id, .bad_request, "memory and kb are zkb's own collections", "they are recreated on the next scan");
+    }
+
+    {
+        var db = store.open(st.db_path_z, .read_only) catch
+            return proto.writeError(w, id, .internal, "cannot open index", null);
+        defer db.close();
+        var s = store.Store.init(&db);
+        const found = s.findCollection(name) catch null;
+        if (found == null) {
+            return proto.writeError(w, id, .not_found, "no such collection", "zkb status lists them");
+        }
+    }
+
+    const owned = try st.gpa.dupe(u8, name);
+    st.register_mutex.lockUncancelable(st.io);
+    st.pending_drops.append(st.gpa, owned) catch st.gpa.free(owned);
+    st.register_mutex.unlock(st.io);
+    st.rescan.store(true, .release);
+
+    try proto.beginOk(w, id);
+    try w.writeAll("{\"queued\":true}");
     try proto.finishOk(w);
 }
 
