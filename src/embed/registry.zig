@@ -165,3 +165,40 @@ fn hfHub(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
     return try std.fmt.allocPrint(gpa, "{s}/.cache/huggingface/hub", .{home});
 }
 
+
+/// What a daemon should do about the model it found, or did not.
+pub const Startup = union(enum) {
+    ready: Resolved,
+    /// Start anyway, saying this. Keyword search, scanning and maintenance all
+    /// work without a model; only embedding does not.
+    degraded: []const u8,
+};
+
+/// `resolve` for a daemon, which unlike a one-shot command has something useful
+/// to do without a model.
+///
+/// The rule lives here because two callers need the same answer: `daemon start`
+/// decides whether to spawn at all, and `daemon run` decides whether to come up.
+/// They used to hold it separately, and the first one still refused after the
+/// second learned to degrade — so the daemon that could now start was never
+/// launched, and the two disagreed about the same question in the same release.
+///
+/// A named `--model` that is not there stays an error either way. That is a
+/// typo, and answering a typo with a degraded daemon hides it.
+pub fn resolveForDaemon(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    layout: *const paths.Layout,
+    override: ?[]const u8,
+    q: Quant,
+) !Startup {
+    const found = resolve(gpa, io, env, layout, override, q) catch |err| switch (err) {
+        error.ModelNotFound => {
+            if (override != null) return err;
+            return .{ .degraded = "no embedding model; run: zkb model pull" };
+        },
+        else => return err,
+    };
+    return .{ .ready = found };
+}

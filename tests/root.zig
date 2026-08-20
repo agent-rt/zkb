@@ -27,6 +27,7 @@ test {
     _ = @import("roots_test.zig");
     _ = @import("gitignore_spec_test.zig");
     _ = @import("scan_test.zig");
+    _ = @import("daemon_test.zig");
 }
 
 // ---------------------------------------------------------------------------

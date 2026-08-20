@@ -67,7 +67,11 @@ pub const State = struct {
 
     db_path_z: [:0]const u8,
     root: []const u8,
-    model_path: []const u8,
+    /// Null when startup found no model. Optional rather than an empty string so
+    /// every use has to say what it does without one — an `""` sentinel got as
+    /// far as `accessAbsolute`, whose `isAbsolute` assertion killed the daemon a
+    /// second after it reported a successful start.
+    model_path: ?[]const u8,
     collection_id: i64 = 0,
 
     queue: equeue.Queue = .{},
@@ -149,7 +153,11 @@ pub const State = struct {
         if (self.embedder) |*e| return e;
         if (self.model_load_failed) return error.ModelUnavailable;
 
-        self.embedder = embed.Embedder.init(self.gpa, self.model_path, .{}) catch |err| {
+        const path = self.model_path orelse {
+            self.model_load_failed = true;
+            return error.ModelUnavailable;
+        };
+        self.embedder = embed.Embedder.init(self.gpa, path, .{}) catch |err| {
             self.model_load_failed = true;
             self.degraded_reason = "embedding model failed to load";
             return err;
@@ -497,14 +505,17 @@ fn drainPending(st: *State, s: *store.Store, collection_id: i64, root: []const u
 
 fn checkModelIdentity(st: *State, db: *sqlite.Db) !void {
     const hash = @import("util/hash.zig");
-    std.Io.Dir.accessAbsolute(st.io, st.model_path, .{}) catch {
+    // Nothing to compare against, and `degraded_reason` already says so in the
+    // words that name the fix.
+    const model_path = st.model_path orelse return;
+    std.Io.Dir.accessAbsolute(st.io, model_path, .{}) catch {
         st.setDegraded("embedding model file not found");
         return;
     };
-    const digest = try hash.fileSha256(st.io, st.model_path);
+    const digest = try hash.fileSha256(st.io, model_path);
     const task_digest = hash.bytesSha256(embed.default_query_task);
     const id = try std.fmt.allocPrint(st.gpa, "{s}@{s}+task:{s}", .{
-        std.fs.path.basename(st.model_path), digest[0..16], task_digest[0..8],
+        std.fs.path.basename(model_path), digest[0..16], task_digest[0..8],
     });
     defer st.gpa.free(id);
 
@@ -975,9 +986,29 @@ pub fn run(
     // Resolved once at startup: the daemon holds the path for its whole life,
     // and a Hugging Face cache hit should not be re-discovered per request.
     //
-    const found = try registry.resolve(gpa, io, env, &layout, opts.model_path, .q8_0);
-    const model_path = found.path;
-    defer if (opts.model_path == null) gpa.free(model_path);
+    // Not having one is a degraded start, not a refusal. The model is loaded
+    // lazily and every path that needs it already answers `model_unavailable`,
+    // so failing here traded a daemon that serves keyword search, scanning and
+    // maintenance for no daemon at all — on a fresh install, before the first
+    // `zkb model pull`, that is the whole tool. It also put the entire IPC
+    // surface out of reach of CI, which deliberately keeps no model: the socket,
+    // the framing and every handler could only ever be exercised by hand, and
+    // `--path` reaching the wrong handler is what that cost once already.
+    //
+    // A named `--model` that does not exist stays fatal. That is a typo, and
+    // silently degrading would answer it with the wrong kind of complaint.
+    const startup = try registry.resolveForDaemon(gpa, io, env, &layout, opts.model_path, .q8_0);
+    const startup_degraded: ?[]const u8 = switch (startup) {
+        .ready => null,
+        .degraded => |reason| reason,
+    };
+    const model_path: ?[]const u8 = switch (startup) {
+        .ready => |f| f.path,
+        .degraded => null,
+    };
+    defer if (model_path) |p| {
+        if (opts.model_path == null) gpa.free(p);
+    };
 
     const db_path_z = try gpa.dupeZ(u8, layout.db);
     defer gpa.free(db_path_z);
@@ -1005,6 +1036,10 @@ pub fn run(
         .model_path = model_path,
         .started_ms = nowMs(io),
         .trace = tracemod.Writer.init(io, env, layout.trace),
+        // Named here rather than left for `checkModelIdentity` to rediscover as
+        // "model file not found": the reason a caller sees should be the one that
+        // tells them what to do about it.
+        .degraded_reason = startup_degraded,
     };
 
     // Refuse rather than take over. `deleteFileAbsolute` below removes the socket
@@ -1069,7 +1104,9 @@ pub fn run(
     }
     var watcher = fsevents.Watcher.start(gpa, watch_roots.items, &st.rescan) catch
         fsevents.Watcher{ .flag = &st.rescan };
-    _ = &watcher;
+    // Before `st` goes out of scope: the watcher stores into `st.rescan`, and
+    // `st` is a local of this function.
+    defer watcher.stop(io, gpa);
 
     const embedder_thread = try std.Thread.spawn(.{}, embedderThread, .{&st});
     const ingest = try std.Thread.spawn(.{}, ingestThread, .{&st});

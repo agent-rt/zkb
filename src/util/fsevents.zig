@@ -60,6 +60,7 @@ extern "c" fn CFArrayCreate(CFAllocatorRef, [*]const ?*const anyopaque, CFIndex,
 extern "c" fn CFRelease(?*const anyopaque) void;
 extern "c" fn CFRunLoopGetCurrent() CFRunLoopRef;
 extern "c" fn CFRunLoopRun() void;
+extern "c" fn CFRunLoopStop(CFRunLoopRef) void;
 extern "c" fn FSEventStreamCreate(
     allocator: CFAllocatorRef,
     callback: Callback,
@@ -86,6 +87,41 @@ pub const latency_s: CFTimeInterval = 0.5;
 pub const Watcher = struct {
     flag: *std.atomic.Value(bool),
     thread: ?std.Thread = null,
+    ctx: ?*ThreadCtx = null,
+
+    /// Stop watching and join the thread.
+    ///
+    /// Not optional tidiness. `flag` points into the daemon's `State`, which is a
+    /// local of `daemon.run`; without this the run loop thread outlives that
+    /// frame and its next event stores into a dead stack slot. A process that
+    /// exits immediately after `run` never sees it, which is why this went
+    /// unnoticed — the first in-process caller segfaulted on the first save.
+    pub fn stop(self: *Watcher, io: std.Io, gpa: std.mem.Allocator) void {
+        const ctx = self.ctx orelse return;
+        const thread = self.thread orelse {
+            gpa.destroy(ctx);
+            self.ctx = null;
+            return;
+        };
+
+        // Bounded: if the run loop never came up, `live` goes false and this
+        // stops waiting. Neither branch may block shutdown indefinitely.
+        var waited_ms: usize = 0;
+        while (waited_ms < 2000) : (waited_ms += 5) {
+            if (ctx.runloop.load(.acquire) != 0) break;
+            if (!ctx.live.load(.acquire)) break;
+            std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch break;
+        }
+        const raw = ctx.runloop.load(.acquire);
+        if (raw != 0) CFRunLoopStop(@ptrFromInt(raw));
+        thread.join();
+
+        for (ctx.roots) |r| gpa.free(r);
+        gpa.free(ctx.roots);
+        gpa.destroy(ctx);
+        self.ctx = null;
+        self.thread = null;
+    }
 
     /// Start watching `roots`. Returns without an error if the platform has no
     /// FSEvents or the stream cannot start — the caller's polling loop is the
@@ -115,6 +151,7 @@ pub const Watcher = struct {
         const ctx = try gpa.create(ThreadCtx);
         errdefer gpa.destroy(ctx);
         ctx.* = .{ .gpa = gpa, .roots = owned, .flag = flag };
+        w.ctx = ctx;
 
         w.thread = std.Thread.spawn(.{}, threadMain, .{ctx}) catch {
             for (owned) |p| gpa.free(p);
@@ -130,13 +167,25 @@ const ThreadCtx = struct {
     gpa: std.mem.Allocator,
     roots: [][]u8,
     flag: *std.atomic.Value(bool),
+    /// Published by the watcher thread once its run loop exists, so `stop` has
+    /// something to stop. Null until then, and `stop` waits for it rather than
+    /// racing: a stop that arrives during startup would otherwise return while
+    /// the thread runs on.
+    runloop: std.atomic.Value(usize) = .init(0),
+    /// Set before the run loop starts and cleared when it will not start, so a
+    /// `stop` racing a failed setup does not wait out the full timeout.
+    live: std.atomic.Value(bool) = .init(true),
 };
 
 fn threadMain(ctx: *ThreadCtx) void {
-    // Never freed: the run loop below does not return, and the daemon exits by
-    // process teardown. Freeing on a path that cannot be reached would only be
-    // there to look tidy.
+    // On every exit path, including the several `orelse return`s below. A `stop`
+    // racing a setup that failed would otherwise wait out its whole timeout.
+    defer ctx.live.store(false, .release);
+    // These used to be left unfreed, on the reasoning that the run loop below
+    // never returns and the process would take everything with it. `stop` makes
+    // it return, so the unreachable path is now the ordinary one.
     var refs = ctx.gpa.alloc(?*const anyopaque, ctx.roots.len) catch return;
+    defer ctx.gpa.free(refs);
     var made: usize = 0;
     for (ctx.roots) |r| {
         const z = ctx.gpa.dupeZ(u8, r) catch break;
@@ -147,7 +196,13 @@ fn threadMain(ctx: *ThreadCtx) void {
     }
     if (made == 0) return;
 
-    const array = CFArrayCreate(null, refs.ptr, @intCast(made), &kCFTypeArrayCallBacks) orelse return;
+    const array = CFArrayCreate(null, refs.ptr, @intCast(made), &kCFTypeArrayCallBacks) orelse {
+        for (refs[0..made]) |r| CFRelease(r);
+        return;
+    };
+    // The array retains each of them; this drops the reference this frame holds.
+    for (refs[0..made]) |r| CFRelease(r);
+    defer CFRelease(array);
     var context: FSEventStreamContext = .{ .info = ctx.flag };
 
     const stream = FSEventStreamCreate(
@@ -160,10 +215,18 @@ fn threadMain(ctx: *ThreadCtx) void {
         kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot,
     ) orelse return;
 
-    FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    const loop = CFRunLoopGetCurrent();
+    FSEventStreamScheduleWithRunLoop(stream, loop, kCFRunLoopDefaultMode);
     if (!FSEventStreamStart(stream)) return;
 
+    // Published last: `stop` treats a non-zero run loop as "there is something
+    // running to stop", which is only true once the stream is started.
+    ctx.runloop.store(@intFromPtr(loop), .release);
     CFRunLoopRun();
+
+    FSEventStreamStop(stream);
+    FSEventStreamInvalidate(stream);
+    FSEventStreamRelease(stream);
 }
 
 /// Runs on the run-loop thread. One atomic store, nothing else: the ingest

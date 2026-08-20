@@ -44,21 +44,20 @@ pub fn start(
         return 0;
     }
 
-    // The daemon resolves the model path at startup and exits if there is none.
-    // Letting that happen unseen costs the caller a five second readiness
-    // timeout and a log file holding the single word `ModelNotFound`. Checking
-    // here turns the most likely first-run failure into the same shape every
-    // other missing prerequisite uses: what is absent, and the command that
-    // creates it.
-    if (zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0)) |found| {
-        var f = found;
-        f.deinit(gpa);
-    } else |err| switch (err) {
-        error.ModelNotFound => {
-            try w.writeAll("no embedding model\nrun: zkb model pull\n");
-            return 3;
+    // Resolved here as well as in the daemon, so the most likely first-run
+    // problem is reported by the command the caller ran rather than discovered
+    // as a five second readiness timeout and a log file holding one word. The
+    // decision itself is not duplicated — `resolveForDaemon` owns it, and this
+    // side only prints what it returns.
+    switch (try zkb.model_registry.resolveForDaemon(gpa, io, env, &layout, opts.model, .q8_0)) {
+        .ready => |found| {
+            var f = found;
+            f.deinit(gpa);
         },
-        else => return err,
+        // A warning, not a refusal: keyword search, scanning and maintenance need
+        // no model, and refusing here would withhold all of them over the one
+        // thing that is missing.
+        .degraded => |reason| try w.print("warning: {s}\n", .{reason}),
     }
 
     const exe = try zkb.paths.selfExe(gpa, io);
