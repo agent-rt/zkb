@@ -66,6 +66,10 @@ pub const PairKind = enum {
 pub const Pair = struct {
     kind: PairKind,
     cos: f64,
+    /// The collection both sides live in. One field rather than one per side
+    /// because a pair is never formed across collections (see `run`) — two fields
+    /// that must always agree are just two places for them to stop agreeing.
+    collection_id: i64,
     a_path: []const u8,
     a_heading: []const u8,
     a_excerpt: []const u8,
@@ -86,6 +90,7 @@ pub const Pair = struct {
 };
 
 pub const Island = struct {
+    collection_id: i64,
     path: []const u8,
     heading: []const u8,
     excerpt: []const u8,
@@ -416,7 +421,8 @@ fn describePair(
     cos: f64,
 ) !Pair {
     var st = try db.prepare(
-        \\SELECT d.rel_path, COALESCE(c.heading_path, ''), c.text, d.mtime_ms, d.content_sha
+        \\SELECT d.rel_path, COALESCE(c.heading_path, ''), c.text, d.mtime_ms, d.content_sha,
+        \\       d.collection_id
         \\FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE c.id = ?1
     );
     defer st.finalize();
@@ -430,6 +436,7 @@ fn describePair(
     const a_excerpt = try dupeExcerpt(gpa, st.columnText(2));
     errdefer gpa.free(a_excerpt);
     const a_mtime = st.columnI64(3);
+    const a_collection_id = st.columnI64(5);
     var sha_buf: [80]u8 = undefined;
     const a_sha_text = st.columnText(4);
     const a_sha = sha_buf[0..@min(a_sha_text.len, sha_buf.len)];
@@ -469,6 +476,7 @@ fn describePair(
     return .{
         .kind = kind,
         .cos = cos,
+        .collection_id = a_collection_id,
         .a_path = a_path,
         .a_heading = a_heading,
         .a_excerpt = a_excerpt,
@@ -488,13 +496,14 @@ fn describeIsland(
     cos: f64,
 ) !Island {
     var st = try db.prepare(
-        \\SELECT d.rel_path, COALESCE(c.heading_path, ''), c.text
+        \\SELECT d.rel_path, COALESCE(c.heading_path, ''), c.text, d.collection_id
         \\FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE c.id = ?1
     );
     defer st.finalize();
 
     try st.bindI64(1, chunk_id);
     if (!try st.step()) return error.SqliteStep;
+    const collection_id = st.columnI64(3);
     const path = try gpa.dupe(u8, st.columnText(0));
     errdefer gpa.free(path);
     const heading = try gpa.dupe(u8, st.columnText(1));
@@ -513,6 +522,7 @@ fn describeIsland(
     }
 
     return .{
+        .collection_id = collection_id,
         .path = path,
         .heading = heading,
         .excerpt = excerpt,
@@ -548,6 +558,7 @@ fn dupeExcerpt(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
 // ---------------------------------------------------------------------------
 
 pub const Stale = struct {
+    collection_id: i64,
     old_path: []const u8,
     old_mtime_ms: i64,
     newer_path: []const u8,
@@ -595,6 +606,7 @@ pub fn staleCandidates(
         if (already) continue;
 
         try out.append(gpa, .{
+            .collection_id = p.collection_id,
             .old_path = try gpa.dupe(u8, old_path),
             .old_mtime_ms = old_mtime,
             .newer_path = try gpa.dupe(u8, new_path),

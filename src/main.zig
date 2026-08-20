@@ -37,7 +37,8 @@ const usage =
     \\
     \\  status
     \\  collection rm NAME           drop a collection; the files are untouched
-    \\  maintain [--since last] [--check NAME] [--all] [--json]
+    \\  collection checks NAME [--off a,b]   checks this corpus declines
+    \\  maintain [--since last] [--check NAME] [--collection NAME] [--all] [--json]
     \\  mcp                          stdio MCP server (for Claude Code etc.)
     \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
     \\  doctor [--model PATH]
@@ -469,19 +470,36 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, cmd, "collection")) {
+        const coll_usage = "usage: zkb collection rm NAME\n" ++
+            "       zkb collection checks NAME --off a,b\n";
         const sub = args.next() orelse {
-            try w.writeAll("usage: zkb collection rm NAME\n");
+            try w.writeAll(coll_usage);
             return 2;
         };
-        if (!std.mem.eql(u8, sub, "rm")) {
+        const is_rm = std.mem.eql(u8, sub, "rm");
+        if (!is_rm and !std.mem.eql(u8, sub, "checks")) {
             try w.print("unknown collection subcommand: {s}\n", .{sub});
             return 2;
         }
         const name = args.next() orelse {
-            try w.writeAll("usage: zkb collection rm NAME\n");
+            try w.writeAll(coll_usage);
             return 2;
         };
-        return collection_cmd.rm(gpa, init.io, init.environ_map, w, .{ .name = name });
+        if (is_rm) return collection_cmd.rm(gpa, init.io, init.environ_map, w, .{ .name = name });
+
+        // No `--off` at all clears the list rather than erroring: "this corpus
+        // answers to everything its kind allows" has to be sayable, and it is the
+        // only way back from an opt-out entered by mistake.
+        var off: []const u8 = "";
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--off")) {
+                off = args.next() orelse "";
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        return collection_cmd.checks(gpa, init.io, init.environ_map, w, name, off);
     }
 
     if (std.mem.eql(u8, cmd, "status")) {
@@ -494,6 +512,7 @@ pub fn main(init: std.process.Init) !u8 {
         var selected: [8]zkb.maintain.Check = undefined;
         var n_selected: usize = 0;
         var use_all = false;
+        var only: []const u8 = "";
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--since")) {
                 const v = args.next() orelse "last";
@@ -502,6 +521,8 @@ pub fn main(init: std.process.Init) !u8 {
                 as_json = true;
             } else if (std.mem.eql(u8, a, "--all")) {
                 use_all = true;
+            } else if (std.mem.eql(u8, a, "--collection")) {
+                only = args.next() orelse "";
             } else if (std.mem.eql(u8, a, "--check")) {
                 const v = args.next() orelse "";
                 const c = zkb.maintain.Check.parse(v) orelse {
@@ -523,7 +544,7 @@ pub fn main(init: std.process.Init) !u8 {
             zkb.maintain.Check.all()
         else
             zkb.maintain.Check.default();
-        return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks);
+        return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks, only);
     }
 
     if (std.mem.eql(u8, cmd, "mcp")) {
@@ -706,6 +727,7 @@ fn maintainCmd(
     since_last: bool,
     as_json: bool,
     checks: []const zkb.maintain.Check,
+    only: []const u8,
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
@@ -725,8 +747,22 @@ fn maintainCmd(
     };
     defer db.close();
 
+    var only_id: i64 = 0;
+    if (only.len != 0) {
+        var s = zkb.store.Store.init(&db);
+        only_id = (try s.findCollection(only)) orelse {
+            try w.print("no such collection: {s}\n", .{only});
+            try w.writeAll("zkb status lists them\n");
+            return 3;
+        };
+    }
+
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    var report = try zkb.maintain.run(gpa, &db, .{ .checks = checks, .now_ms = now_ms });
+    var report = try zkb.maintain.run(gpa, &db, .{
+        .checks = checks,
+        .now_ms = now_ms,
+        .only_collection = only_id,
+    });
     defer report.deinit(gpa);
 
     if (as_json) {

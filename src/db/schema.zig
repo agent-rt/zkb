@@ -9,7 +9,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 
-pub const schema_version: i64 = 11;
+pub const schema_version: i64 = 12;
 
 /// Bumped when chunk boundaries change. Vectors are only valid for the chunk
 /// text that produced them, so a chunker change invalidates the index just as
@@ -222,6 +222,27 @@ const ddl_v11 =
     \\CREATE INDEX rec_memory_scope ON rec_memory(scope);
 ;
 
+/// v12 adds `collections.checks_off`, so a collection can decline the health
+/// checks whose conventions it does not follow.
+///
+/// The kind already gives a default (see `maintain.Check.defaultFor`), but a kind
+/// cannot express this: `synap` and `docs` are both `documents`, and `synap` keeps
+/// no index.md — so 16 of its 9 documents' findings were the check disagreeing
+/// with a convention that corpus never adopted. Which conventions a corpus follows
+/// is a property of the corpus, not of who writes it, so it is declared rather
+/// than inferred.
+///
+/// A subtraction list rather than an allowlist: a check added later applies
+/// everywhere immediately and is switched off where it turns out to be noise.
+/// An allowlist would make every new check silently dead until each collection
+/// opted in one by one.
+///
+/// NULL means "no opt-outs", which is not the same as `''` — both behave the same
+/// today, but only because an empty list parses to nothing.
+const ddl_v12 =
+    \\ALTER TABLE collections ADD COLUMN checks_off TEXT;
+;
+
 /// v10 renames the `kb` collection to `numbers`.
 ///
 /// `kb` read as "knowledge base", which is the whole product; the collection holds
@@ -281,6 +302,7 @@ pub fn migrate(db: *sqlite.Db) Error!void {
         try db.exec(ddl_v6);
         try db.exec(ddl_v7);
         try db.exec(ddl_v11);
+        try db.exec(ddl_v12);
         // v8 added `exclude` and v9 dropped it; a fresh database skips both.
         try db.exec(ddl_fts);
         try db.exec(ddl_vec);
@@ -301,6 +323,16 @@ pub fn migrate(db: *sqlite.Db) Error!void {
     if (have < 9) try migrateToV9(db);
     if (have < 10) try migrateToV10(db);
     if (have < 11) try migrateToV11(db);
+    if (have < 12) try migrateToV12(db);
+}
+
+/// v11 -> v12: per-collection check opt-outs.
+fn migrateToV12(db: *sqlite.Db) Error!void {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    try db.exec(ddl_v12);
+    try setMetaInt(db, "schema_version", 12);
+    try db.exec("COMMIT;");
 }
 
 /// v10 -> v11: a scope column on the memory projection.

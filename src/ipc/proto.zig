@@ -26,6 +26,9 @@ pub const Method = enum {
     /// Remove a collection and everything indexed under it. A write, so it is
     /// handed to the ingest thread rather than done here — same reason as `index`.
     collection_rm,
+    /// Set which health checks a collection declines. A write, handed to the
+    /// ingest thread for the same reason as `collection_rm`.
+    collection_checks,
     maintain,
     shutdown,
 

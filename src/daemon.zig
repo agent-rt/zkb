@@ -124,6 +124,9 @@ pub const State = struct {
     /// Collection names an `collection_rm` request asked to drop. Same handover as
     /// registrations, and guarded by the same mutex.
     pending_drops: std.ArrayList([]const u8) = .empty,
+    /// `collection_checks` requests: which checks a collection has switched off.
+    /// Same handover and same mutex — it is a write, so the ingest thread owns it.
+    pending_checks: std.ArrayList(ChecksUpdate) = .empty,
 
     /// How many times the anti-starvation deadline fired. Surfaced in `stats`
     /// because if this is nonzero and growing, the machine is under enough query
@@ -307,6 +310,7 @@ fn ingestThread(st: *State) void {
         // the running daemon.
         applyDrops(st, &s);
         applyRegistrations(st, &s);
+        applyChecks(st, &s);
 
         // Housekeeping on zkb's own derived data (SPEC §14.0): a chunk whose
         // document is gone is unconditionally garbage, and leaving it in costs
@@ -393,6 +397,19 @@ fn maybeRunDailyMaintenance(st: *State, db: *sqlite.Db) !void {
 /// ingest/roots.zig for why they stopped being a literal here.
 const IngestRoot = rootsmod.Root;
 
+/// One collection's opt-out list, handed from a connection thread to the writer.
+/// Same ownership rule as `Registration`.
+pub const ChecksUpdate = struct {
+    name: []const u8,
+    /// Comma-separated check names. Empty clears the list.
+    off: []const u8,
+
+    pub fn deinit(self: ChecksUpdate, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.off);
+    }
+};
+
 /// A collection to register, handed from a connection thread to the writer.
 /// All strings are gpa-owned and freed once applied.
 pub const Registration = struct {
@@ -425,6 +442,20 @@ fn applyRegistrations(st: *State, s: *store.Store) void {
     for (taken) |r| {
         defer r.deinit(st.gpa);
         _ = s.upsertCollection(r.name, r.root, .documents, r.extensions, r.include, nowMs(st.io)) catch {};
+    }
+}
+
+/// Apply queued check opt-outs. Ingest thread only.
+fn applyChecks(st: *State, s: *store.Store) void {
+    st.register_mutex.lockUncancelable(st.io);
+    const taken = st.pending_checks.toOwnedSlice(st.gpa) catch &.{};
+    st.register_mutex.unlock(st.io);
+
+    defer st.gpa.free(taken);
+    for (taken) |u| {
+        defer u.deinit(st.gpa);
+        const id = s.findCollection(u.name) catch continue orelse continue;
+        s.setChecksOff(id, u.off) catch {};
     }
 }
 
@@ -555,6 +586,7 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
         .recall => try handleRecall(st, db, w, &req),
         .index => try handleIndex(st, w, req.id, &req),
         .collection_rm => try handleCollectionRm(st, w, req.id, &req),
+        .collection_checks => try handleCollectionChecks(st, w, req.id, &req),
         .maintain => try handleMaintain(st, db, w, &req),
         .shutdown => {
             try proto.beginOk(w, req.id);
@@ -738,6 +770,34 @@ fn handleIndex(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request
     st.rescan.store(true, .release);
     try proto.beginOk(w, id);
     try w.writeAll("{\"queued\":true,\"note\":\"ingest thread woken\"}");
+    try proto.finishOk(w);
+}
+
+fn handleCollectionChecks(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request) !void {
+    const name = req.str("collection") orelse
+        return proto.writeError(w, id, .bad_request, "collection_checks requires a collection", null);
+    const off = req.str("off") orelse "";
+
+    {
+        var db = store.open(st.db_path_z, .read_only) catch
+            return proto.writeError(w, id, .internal, "cannot open index", null);
+        defer db.close();
+        var s = store.Store.init(&db);
+        _ = s.findCollection(name) catch null orelse
+            return proto.writeError(w, id, .not_found, "no such collection", "zkb status lists them");
+    }
+
+    const u: ChecksUpdate = .{
+        .name = try st.gpa.dupe(u8, name),
+        .off = try st.gpa.dupe(u8, off),
+    };
+    st.register_mutex.lockUncancelable(st.io);
+    st.pending_checks.append(st.gpa, u) catch u.deinit(st.gpa);
+    st.register_mutex.unlock(st.io);
+    st.rescan.store(true, .release);
+
+    try proto.beginOk(w, id);
+    try w.writeAll("{\"queued\":true}");
     try proto.finishOk(w);
 }
 

@@ -526,3 +526,133 @@ test "orphan is a documents-collection finding, not a memory one" {
     try testing.expectEqual(@as(usize, 1), report.count(.orphan));
     try testing.expectEqualStrings("lonely.md", report.findings[0].path);
 }
+
+/// A short chunk in a memory collection.
+///
+/// Deliberately not `addDoc`: that one writes 500 tokens, and the whole point
+/// here is the shape `remember` actually produces — one file, one fact, one
+/// small chunk.
+fn addTinyDoc(s: *store.Store, cid: i64, path: []const u8, text: []const u8) !i64 {
+    var sha_buf: [80]u8 = undefined;
+    const sha = try std.fmt.bufPrint(&sha_buf, "sha-{s}", .{path});
+    const did = try s.upsertDocContent(cid, path, sha, @intCast(text.len), 1000);
+    var v: [dim]f32 = @splat(0);
+    v[0] = 1;
+    _ = try s.insertChunk(cid, did, .{
+        .idx = 0,
+        .heading_path = "",
+        .byte_start = 0,
+        .byte_end = @intCast(text.len),
+        .n_tokens = 20,
+        .text = text,
+    }, &v);
+    try s.markIndexed(did, 1, 1000);
+    return did;
+}
+
+test "fragment is a documents-collection finding, not a memory one" {
+    // The bug this encodes: measured on the real index, `fragment` reported 28 of
+    // the 35 memories zkb had written itself. One memory is one fact, so a single
+    // short chunk is the correct shape — `maintain` was reporting `remember`'s
+    // normal output back as a defect.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
+    const mem = try s.ensureCollectionKind("memory", "/tmp/mem", .memory, 1000);
+
+    _ = try addTinyDoc(&s, docs, "stub.md", "barely anything");
+    _ = try addTinyDoc(&s, mem, "prefers-jj.md", "uses jj over git");
+
+    var report = try zkb.maintain.run(gpa, &db, .{ .checks = &.{.fragment} });
+    defer report.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), report.count(.fragment));
+    try testing.expectEqualStrings("stub.md", report.findings[0].path);
+}
+
+test "a collection declines a check its kind would otherwise allow" {
+    // Two `documents` collections, one of which keeps no index.md. The kind is
+    // identical, so nothing derived from the kind can tell them apart — which is
+    // the whole reason `checks_off` exists rather than a fourth kind.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
+    const loose = try s.ensureCollectionKind("synap", "/tmp/synap", .documents, 1000);
+
+    _ = try s.upsertDocContent(docs, "lonely.md", "sha1", 10, 1000);
+    _ = try s.upsertDocContent(loose, "quickstart.md", "sha2", 10, 1000);
+    try schema.setMeta(&db, "links_extracted", "1");
+
+    {
+        var before = try zkb.maintain.run(gpa, &db, .{ .checks = &.{.orphan} });
+        defer before.deinit(gpa);
+        try testing.expectEqual(@as(usize, 2), before.count(.orphan));
+    }
+
+    try s.setChecksOff(loose, "orphan");
+
+    var after = try zkb.maintain.run(gpa, &db, .{ .checks = &.{.orphan} });
+    defer after.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), after.count(.orphan));
+    try testing.expectEqualStrings("lonely.md", after.findings[0].path);
+
+    // And back: an opt-out entered by mistake has to be undoable without
+    // rebuilding anything.
+    try s.setChecksOff(loose, "");
+    var undone = try zkb.maintain.run(gpa, &db, .{ .checks = &.{.orphan} });
+    defer undone.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), undone.count(.orphan));
+}
+
+test "an opt-out names one check and leaves the collection's others alone" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
+    _ = try addTinyDoc(&s, docs, "stub.md", "barely anything");
+    try schema.setMeta(&db, "links_extracted", "1");
+
+    // A substring of another check's name, and a name with surrounding spaces:
+    // both are ways a sloppy match would switch off the wrong thing.
+    try s.setChecksOff(docs, " orphan , fragment ");
+
+    var report = try zkb.maintain.run(gpa, &db, .{ .checks = &.{ .orphan, .fragment, .oversized } });
+    defer report.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), report.count(.orphan));
+    try testing.expectEqual(@as(usize, 0), report.count(.fragment));
+
+    try s.setChecksOff(docs, "orphan_chunk");
+    var partial = try zkb.maintain.run(gpa, &db, .{ .checks = &.{ .orphan, .fragment } });
+    defer partial.deinit(gpa);
+    // `orphan_chunk` shares a prefix with `orphan`; switching one off must not
+    // take the other with it.
+    try testing.expectEqual(@as(usize, 1), partial.count(.orphan));
+    try testing.expectEqual(@as(usize, 1), partial.count(.fragment));
+}
+
+test "--collection narrows the report without narrowing the conventions" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const docs = try s.ensureCollectionKind("docs", "/tmp/docs", .documents, 1000);
+    const other = try s.ensureCollectionKind("synap", "/tmp/synap", .documents, 1000);
+    _ = try s.upsertDocContent(docs, "lonely.md", "sha1", 10, 1000);
+    _ = try s.upsertDocContent(other, "also-lonely.md", "sha2", 10, 1000);
+    try schema.setMeta(&db, "links_extracted", "1");
+    try s.setChecksOff(other, "orphan");
+
+    var report = try zkb.maintain.run(gpa, &db, .{
+        .checks = &.{.orphan},
+        .only_collection = other,
+    });
+    defer report.deinit(gpa);
+    // Asked for `synap` alone, and `synap` declines this check: the answer is
+    // nothing, not "the other collection's finding because you asked for one".
+    try testing.expectEqual(@as(usize, 0), report.count(.orphan));
+}

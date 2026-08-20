@@ -92,6 +92,48 @@ pub const Check = enum {
         };
     }
 
+    /// Whether this check means anything for a collection of this kind, before
+    /// the collection's own opt-outs.
+    ///
+    /// Exhaustive on both axes on purpose: a new check cannot be added, and a new
+    /// kind cannot be introduced, without deciding what the pair means. The
+    /// alternative is a check that quietly applies everywhere, which is how
+    /// `fragment` came to report 28 of the 35 memories zkb itself wrote — one
+    /// memory is one fact, so "one short chunk" is the shape of a correct memory,
+    /// not a defect. `maintain` was reporting `remember`'s normal output.
+    ///
+    /// This is only the default. It cannot express everything that matters:
+    /// `synap` and `docs` are both `documents` and only one of them keeps an
+    /// index.md. That is what `checks_off` on the collection is for.
+    pub fn defaultFor(self: Check, kind: store.Store.Kind) bool {
+        return switch (self) {
+            // Failures of zkb's own machinery. Corpus conventions do not enter
+            // into it, so these hold everywhere.
+            .index_failed, .orphan_chunk => true,
+
+            // Wiki conventions: something links here, an index lists it, links
+            // resolve, a topic has neighbours. A memory corpus follows none of
+            // them by construction — `remember` writes one file per memory and no
+            // index ever points at one — and the writing convention for memories
+            // makes a dangling `[[name]]` a deliberate marker for a memory not
+            // written yet, not an error. A csv has no links at all.
+            .orphan, .not_in_index, .broken_link, .island => kind == .documents,
+
+            // "Too short to be a document" describes a memory rather than
+            // faulting it.
+            .fragment => kind == .documents,
+
+            // Size and redundancy are properties of text, not of a convention.
+            // Rows in a csv are neither, and are not documents to begin with.
+            .oversized, .near_duplicate, .duplicate_content, .stale => kind != .records,
+
+            // Off by default everywhere (see `default()`), but when asked for
+            // explicitly it is meaningful for anything parsed as a document. A
+            // memory without frontmatter does not parse at all.
+            .no_frontmatter => kind != .records,
+        };
+    }
+
     /// True for the checks that need vectors, which are the expensive ones.
     /// Grouped so a run that wants none of them can skip the whole KNN pass.
     pub fn isVector(self: Check) bool {
@@ -108,6 +150,12 @@ pub const Check = enum {
 
 pub const Finding = struct {
     check: Check,
+    /// Which collection the finding is about, or 0 for one about the index as a
+    /// whole. Carried rather than looked up from `path` afterwards: `rel_path` is
+    /// collection-relative, so two collections can hold the same path, and a
+    /// lookup that guesses wrong would silently move a finding between corpora
+    /// with different conventions.
+    collection_id: i64,
     /// Stable identity across runs, so `--since last` can diff. Built from
     /// content rather than row ids: chunk and link ids change on every re-index,
     /// and a finding that changes identity every run makes every run "all new".
@@ -153,6 +201,11 @@ pub const Options = struct {
     fragment_max_tokens: i64 = 100,
     /// More chunks than this suggests the document should be split.
     oversized_chunks: i64 = 50,
+    /// Report only this collection. Zero means all of them.
+    ///
+    /// Narrowing the report, not the conventions: a collection's `checks_off`
+    /// still applies when it is the only one asked for.
+    only_collection: i64 = 0,
 };
 
 /// Filenames that are indexes or conventions rather than content, and so are not
@@ -194,26 +247,101 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, opts: Options) !Report {
     }
     if (wants_vector) try runVectorChecks(gpa, db, &findings, opts);
 
+    const policies = try loadPolicies(gpa, db);
+    defer {
+        for (policies) |p| gpa.free(p.off);
+        gpa.free(policies);
+    }
+    var kept: usize = 0;
+    for (findings.items) |f| {
+        if (keep(policies, f, opts.only_collection)) {
+            findings.items[kept] = f;
+            kept += 1;
+        } else {
+            f.deinit(gpa);
+        }
+    }
+    findings.shrinkRetainingCapacity(kept);
+
     return .{
         .findings = try findings.toOwnedSlice(gpa),
         .link_graph_empty = !graph_built,
     };
 }
 
+/// The one place a finding comes into existence, which is why `collection_id` is
+/// a required parameter here rather than something a check may forget to set:
+/// a check that does not know which corpus it is talking about cannot be filtered
+/// by that corpus's conventions, and the compiler is the only reviewer that never
+/// skips a call site.
 fn add(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(Finding),
     check: Check,
+    collection_id: i64,
     key: []const u8,
     path: []const u8,
     detail: []const u8,
 ) !void {
     try out.append(gpa, .{
         .check = check,
+        .collection_id = collection_id,
         .key = try gpa.dupe(u8, key),
         .path = try gpa.dupe(u8, path),
         .detail = try gpa.dupe(u8, detail),
     });
+}
+
+/// What a collection has decided about the checks, resolved once per run.
+const Policy = struct {
+    id: i64,
+    kind: store.Store.Kind,
+    /// Comma-separated check names this collection has switched off.
+    off: []const u8,
+
+    fn allows(self: Policy, check: Check) bool {
+        if (!check.defaultFor(self.kind)) return false;
+        var it = std.mem.splitScalar(u8, self.off, ',');
+        while (it.next()) |raw| {
+            const name = std.mem.trim(u8, raw, " \t");
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, @tagName(check))) return false;
+        }
+        return true;
+    }
+};
+
+fn loadPolicies(gpa: std.mem.Allocator, db: *sqlite.Db) ![]Policy {
+    var out: std.ArrayList(Policy) = .empty;
+    errdefer {
+        for (out.items) |p| gpa.free(p.off);
+        out.deinit(gpa);
+    }
+    var st = try db.prepare("SELECT id, kind, coalesce(checks_off, '') FROM collections");
+    defer st.finalize();
+    while (try st.step()) {
+        try out.append(gpa, .{
+            .id = st.columnI64(0),
+            .kind = std.meta.stringToEnum(store.Store.Kind, st.columnText(1)) orelse .documents,
+            .off = try gpa.dupe(u8, st.columnText(2)),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// A finding about a collection that has declined this check is dropped here, in
+/// one place, after every check has run.
+///
+/// Filtering inside each check's SQL instead would put the same decision in ten
+/// queries — and a query that forgot the clause would report noise silently,
+/// which is exactly the failure this whole change is repairing.
+fn keep(policies: []const Policy, f: Finding, only: i64) bool {
+    if (only != 0 and f.collection_id != 0 and f.collection_id != only) return false;
+    if (f.collection_id == 0) return true;
+    for (policies) |p| {
+        if (p.id == f.collection_id) return p.allows(f.check);
+    }
+    return true;
 }
 
 /// One KNN pass feeds all four vector checks, because they are all questions
@@ -262,7 +390,7 @@ fn runVectorChecks(
             if (p.b_heading.len != 0) " > " else "",
             p.b_heading,
         });
-        try add(gpa, out, check, key, p.a_path, detail);
+        try add(gpa, out, check, p.collection_id, key, p.a_path, detail);
     }
 
     if (wanted[2]) {
@@ -272,7 +400,7 @@ fn runVectorChecks(
                 if (i.nearest_path.len != 0) i.nearest_path else "(nothing)",
                 i.cos,
             });
-            try add(gpa, out, .island, key, i.path, detail);
+            try add(gpa, out, .island, i.collection_id, key, i.path, detail);
         }
     }
 
@@ -288,25 +416,28 @@ fn runVectorChecks(
             const detail = try std.fmt.bufPrint(&dbuf, "{d} days old; {s} says the same at cos {d:.3}", .{
                 days, s.newer_path, s.cos,
             });
-            try add(gpa, out, .stale, key, s.old_path, detail);
+            try add(gpa, out, .stale, s.collection_id, key, s.old_path, detail);
         }
     }
 }
 
 fn checkIndexFailed(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
-    var st = try db.prepare("SELECT rel_path, index_error FROM docs WHERE index_error IS NOT NULL ORDER BY rel_path");
+    var st = try db.prepare(
+        \\SELECT rel_path, index_error, collection_id FROM docs
+        \\WHERE index_error IS NOT NULL ORDER BY rel_path
+    );
     defer st.finalize();
     var kbuf: [512]u8 = undefined;
     while (try st.step()) {
         const path = st.columnText(0);
         const key = try std.fmt.bufPrint(&kbuf, "index_failed:{s}", .{path});
-        try add(gpa, out, .index_failed, key, path, st.columnText(1));
+        try add(gpa, out, .index_failed, st.columnI64(2), key, path, st.columnText(1));
     }
 }
 
 fn checkBrokenLinks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
-        \\SELECT d.rel_path, l.raw, l.kind FROM links l
+        \\SELECT d.rel_path, l.raw, l.kind, d.collection_id FROM links l
         \\JOIN docs d ON d.id = l.doc_id
         \\WHERE l.target_doc_id IS NULL AND l.kind NOT IN ('external', 'asset')
         \\ORDER BY d.rel_path, l.raw
@@ -319,27 +450,23 @@ fn checkBrokenLinks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(
         const raw = st.columnText(1);
         const key = try std.fmt.bufPrint(&kbuf, "broken_link:{s}:{s}", .{ path, raw });
         const detail = try std.fmt.bufPrint(&dbuf, "{s} -> {s}", .{ st.columnText(2), raw });
-        try add(gpa, out, .broken_link, key, path, detail);
+        try add(gpa, out, .broken_link, st.columnI64(3), key, path, detail);
     }
 }
 
-/// Only for `documents` collections.
-///
 /// "Nothing links here" is a finding about a corpus that is supposed to be
-/// interlinked. It is not a finding about a memory or a records row: `remember`
-/// writes one file per memory and no index ever points at them, so every memory
-/// zkb has ever written is an orphan by construction. Measured on this index, 35
-/// of 69 orphans were memories and 1 was `facts.csv` — more than half the check's
-/// output was it disagreeing with how the other half of zkb works.
+/// interlinked, which is why it is one of the checks `defaultFor` withholds from
+/// memory and records collections.
 ///
-/// The kind is the right discriminator rather than a path prefix: it is what
-/// already says who writes a collection and how it is parsed.
+/// The kind gate used to live here, as `WHERE c.kind = 'documents'` in this one
+/// query. That was right about orphans and invisible to every other check, so
+/// `fragment` and `broken_link` went on reporting the same corpora. The decision
+/// now has exactly one home; putting a copy back here would restore the split it
+/// came from.
 fn checkOrphans(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
-        \\SELECT d.rel_path FROM docs d
-        \\JOIN collections c ON c.id = d.collection_id
-        \\WHERE c.kind = 'documents'
-        \\  AND NOT EXISTS (SELECT 1 FROM links l WHERE l.target_doc_id = d.id)
+        \\SELECT d.rel_path, d.collection_id FROM docs d
+        \\WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.target_doc_id = d.id)
         \\ORDER BY d.rel_path
     );
     defer st.finalize();
@@ -348,7 +475,7 @@ fn checkOrphans(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Find
         const path = st.columnText(0);
         if (isConventionFile(path)) continue;
         const key = try std.fmt.bufPrint(&kbuf, "orphan:{s}", .{path});
-        try add(gpa, out, .orphan, key, path, "nothing links here");
+        try add(gpa, out, .orphan, st.columnI64(1), key, path, "nothing links here");
     }
 }
 
@@ -379,7 +506,7 @@ fn checkOrphanChunks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList
         "{d} chunks from {d} deleted document(s) are still searchable; run: zkb index",
         .{ chunks, docs },
     );
-    try add(gpa, out, .orphan_chunk, key, "(index)", detail);
+    try add(gpa, out, .orphan_chunk, 0, key, "(index)", detail);
 }
 
 /// A document sitting next to an index.md that does not mention it. This encodes
@@ -387,7 +514,7 @@ fn checkOrphanChunks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList
 /// universal rule — which is why it is a separate check that can be turned off.
 fn checkNotInIndex(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
-        \\SELECT d.rel_path, idx.rel_path FROM docs d
+        \\SELECT d.rel_path, idx.rel_path, d.collection_id FROM docs d
         \\JOIN docs idx
         \\  ON idx.collection_id = d.collection_id
         \\ AND idx.rel_path = CASE
@@ -408,7 +535,7 @@ fn checkNotInIndex(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(F
         if (isConventionFile(path)) continue;
         const key = try std.fmt.bufPrint(&kbuf, "not_in_index:{s}", .{path});
         const detail = try std.fmt.bufPrint(&dbuf, "not listed in {s}", .{st.columnText(1)});
-        try add(gpa, out, .not_in_index, key, path, detail);
+        try add(gpa, out, .not_in_index, st.columnI64(2), key, path, detail);
     }
 }
 
@@ -419,7 +546,7 @@ fn checkFragment(
     max_tokens: i64,
 ) !void {
     var st = try db.prepare(
-        \\SELECT d.rel_path, c.n_tokens FROM docs d
+        \\SELECT d.rel_path, c.n_tokens, d.collection_id FROM docs d
         \\JOIN chunks c ON c.doc_id = d.id
         \\WHERE d.chunk_count = 1 AND c.n_tokens < ?1
         \\ORDER BY d.rel_path
@@ -432,7 +559,7 @@ fn checkFragment(
         const path = st.columnText(0);
         const key = try std.fmt.bufPrint(&kbuf, "fragment:{s}", .{path});
         const detail = try std.fmt.bufPrint(&dbuf, "single chunk, {d} tokens", .{st.columnI64(1)});
-        try add(gpa, out, .fragment, key, path, detail);
+        try add(gpa, out, .fragment, st.columnI64(2), key, path, detail);
     }
 }
 
@@ -443,7 +570,7 @@ fn checkOversized(
     max_chunks: i64,
 ) !void {
     var st = try db.prepare(
-        "SELECT rel_path, chunk_count FROM docs WHERE chunk_count > ?1 ORDER BY chunk_count DESC",
+        "SELECT rel_path, chunk_count, collection_id FROM docs WHERE chunk_count > ?1 ORDER BY chunk_count DESC",
     );
     defer st.finalize();
     try st.bindI64(1, max_chunks);
@@ -453,13 +580,13 @@ fn checkOversized(
         const path = st.columnText(0);
         const key = try std.fmt.bufPrint(&kbuf, "oversized:{s}", .{path});
         const detail = try std.fmt.bufPrint(&dbuf, "{d} chunks", .{st.columnI64(1)});
-        try add(gpa, out, .oversized, key, path, detail);
+        try add(gpa, out, .oversized, st.columnI64(2), key, path, detail);
     }
 }
 
 fn checkNoFrontmatter(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
     var st = try db.prepare(
-        "SELECT rel_path FROM docs WHERE frontmatter IS NULL AND indexed_at IS NOT NULL ORDER BY rel_path",
+        "SELECT rel_path, collection_id FROM docs WHERE frontmatter IS NULL AND indexed_at IS NOT NULL ORDER BY rel_path",
     );
     defer st.finalize();
     var kbuf: [512]u8 = undefined;
@@ -468,7 +595,7 @@ fn checkNoFrontmatter(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayLis
         const key = try std.fmt.bufPrint(&kbuf, "no_frontmatter:{s}", .{path});
         // Only presence, never compliance: which fields belong in frontmatter is
         // a convention of specific namespaces, not something zkb gets to judge.
-        try add(gpa, out, .no_frontmatter, key, path, "no frontmatter block");
+        try add(gpa, out, .no_frontmatter, st.columnI64(1), key, path, "no frontmatter block");
     }
 }
 

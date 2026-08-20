@@ -191,6 +191,19 @@ pub const Store = struct {
         return std.meta.stringToEnum(Kind, st.columnText(0)) orelse .documents;
     }
 
+    /// Replace a collection's list of switched-off health checks.
+    ///
+    /// The whole list, not one flag at a time: the caller states the end state it
+    /// wants, so reading the current value and reasoning about the difference is
+    /// never part of setting it.
+    pub fn setChecksOff(self: *Store, id: i64, csv: []const u8) Error!void {
+        var st = try self.db.prepare("UPDATE collections SET checks_off = ?2 WHERE id = ?1");
+        defer st.finalize();
+        try st.bindI64(1, id);
+        if (csv.len == 0) try st.bindNull(2) else try st.bindText(2, csv);
+        _ = try st.step();
+    }
+
     pub fn findCollection(self: *Store, name: []const u8) Error!?i64 {
         var st = try self.db.prepare("SELECT id FROM collections WHERE name = ?1");
         defer st.finalize();
