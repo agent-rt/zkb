@@ -656,3 +656,39 @@ test "--collection narrows the report without narrowing the conventions" {
     // nothing, not "the other collection's finding because you asked for one".
     try testing.expectEqual(@as(usize, 0), report.count(.orphan));
 }
+
+test "a namespace convention file is content, and has to be linked like content" {
+    // `zkb.md` is the per-directory convention file — what depends on what, and
+    // in which order edits propagate. It looks like CLAUDE.md, but it is not: the
+    // corpus registers it in the namespace's index.md, the same as every other
+    // document, and it carries `part_of:` pointing back there. Exempting it from
+    // the orphan check would buy a convention file silence at the price of the
+    // one signal that says nobody wrote it down.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+
+    // A namespace that did it right: index.md lists its convention file.
+    _ = try addDoc(&s, cid, "projects/a/index.md",
+        \\# A
+        \\
+        \\| [zkb.md](zkb://projects/a/zkb.md) | 本命名空间约定 |
+        \\
+    );
+    _ = try addDoc(&s, cid, "projects/a/zkb.md", "# projects/a 命名空间约定\n");
+
+    // A namespace that forgot. Its index.md links nothing.
+    _ = try addDoc(&s, cid, "projects/b/index.md", "# B\n");
+    _ = try addDoc(&s, cid, "projects/b/zkb.md", "# projects/b 命名空间约定\n");
+
+    _ = try maintain.resolveLinks(gpa, &db);
+
+    var report = try maintain.run(gpa, &db, .{ .checks = &.{.orphan} });
+    defer report.deinit(gpa);
+
+    // Only the unregistered one. Both index.md files stay exempt — nothing links
+    // to an index by construction, which is the distinction zkb.md does not share.
+    try testing.expectEqual(@as(usize, 1), report.count(.orphan));
+    try testing.expectEqualStrings("projects/b/zkb.md", report.findings[0].path);
+}
