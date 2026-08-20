@@ -208,3 +208,110 @@ pub fn list(
     }
     return out.items;
 }
+
+/// One collection's registration: the root and filters a caller named, in the
+/// form they are stored in.
+///
+/// There used to be two of these — one in `cli/index_cmd.zig` for the direct
+/// path and one in `daemon.zig` for the IPC path — and a parameter reached the
+/// index only if it was threaded through five places by hand: both structs, the
+/// serialiser, the parser, and both `upsertCollection` calls. Missing one is
+/// silent in the worst possible way, because the command still succeeds: that is
+/// exactly how `zkb index --root X` came to register nothing whenever a daemon
+/// happened to be running.
+///
+/// So the wire format is not written out field by field anywhere. `writeJson`
+/// and `fromLookup` both walk `std.meta.fields(Registration)`, which makes them
+/// the same list by construction — an optional field added here crosses the
+/// socket with no other edit, and a non-optional one fails to compile at every
+/// literal until it is filled in.
+pub const Registration = struct {
+    collection: []const u8,
+    root: []const u8,
+    /// Newline-separated, or null for "the caller did not say" — which must stay
+    /// distinct from `""`, meaning "match nothing" (see `joinList`).
+    extensions: ?[]const u8 = null,
+    include: ?[]const u8 = null,
+
+    /// The wire name for `collection`, kept as it is because an older daemon on
+    /// the other end of the socket during an upgrade still reads that key.
+    const default_collection = "docs";
+
+    /// Pairs with `fromLookup` only. A registration built by the CLI holds arena
+    /// memory and must not be freed with a gpa.
+    ///
+    /// Walks the field list for the same reason the wire pair does. This one was
+    /// written out by hand at first, and adding a fifth field to try the claim
+    /// that a new field costs nothing leaked exactly one allocation — the same
+    /// shape as the bug this whole change is about, surviving in the last place
+    /// still enumerating fields by hand.
+    pub fn deinit(self: Registration, gpa: std.mem.Allocator) void {
+        inline for (std.meta.fields(Registration)) |f| {
+            const v: ?[]const u8 = @field(self, f.name);
+            if (v) |owned| gpa.free(owned);
+        }
+    }
+
+    pub fn writeJson(self: Registration, w: *std.Io.Writer) !void {
+        try w.writeAll("{");
+        var first = true;
+        inline for (std.meta.fields(Registration)) |f| {
+            const v: ?[]const u8 = @field(self, f.name);
+            if (v) |val| {
+                if (!first) try w.writeAll(",");
+                first = false;
+                try std.json.Stringify.value(f.name, .{}, w);
+                try w.writeAll(":");
+                try std.json.Stringify.value(val, .{}, w);
+            }
+        }
+        try w.writeAll("}");
+    }
+
+    /// Read from anything with `str(name) ?[]const u8` — a `proto.Request` in the
+    /// daemon, a parsed object in a test. Taken as `anytype` so this module never
+    /// imports the wire protocol: the field list is the contract, not the socket.
+    ///
+    /// Null when no root was named, which is the request asking for a rescan of
+    /// what is already registered rather than for a new registration.
+    pub fn fromLookup(gpa: std.mem.Allocator, src: anytype) !?Registration {
+        if (src.str("root") == null) return null;
+        var r: Registration = undefined;
+        inline for (std.meta.fields(Registration)) |f| {
+            const raw = src.str(f.name);
+            @field(r, f.name) = switch (@typeInfo(f.type)) {
+                .optional => if (raw) |v| try gpa.dupe(u8, v) else null,
+                else => try gpa.dupe(u8, raw orelse default_collection),
+            };
+        }
+        return r;
+    }
+
+    /// Write the collection row and return its id. The one place either path
+    /// turns a registration into stored state.
+    pub fn apply(
+        self: Registration,
+        s: *store.Store,
+        kind: store.Store.Kind,
+        now_ms: i64,
+    ) !i64 {
+        return s.upsertCollection(self.collection, self.root, kind, self.extensions, self.include, now_ms);
+    }
+
+    /// The scan filters this registration implies, on top of its kind's defaults.
+    pub fn filters(
+        self: Registration,
+        arena: std.mem.Allocator,
+        cid: i64,
+        kind: store.Store.Kind,
+    ) !scan.Filters {
+        return filtersFor(arena, .{
+            .id = cid,
+            .name = self.collection,
+            .root = self.root,
+            .kind = kind,
+            .extensions = self.extensions,
+            .include = self.include,
+        });
+    }
+};

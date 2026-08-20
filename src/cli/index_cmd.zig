@@ -23,13 +23,9 @@ pub const Options = struct {
     force: bool = false,
 };
 
-/// What to register, derived from the flags: exactly one root, and the two
-/// filter lists in the newline-separated form they are stored in.
-const Registration = struct {
-    root: []const u8,
-    extensions: ?[]const u8,
-    include: ?[]const u8,
-};
+/// What to register, derived from the flags. Shared with the daemon's side of
+/// the socket so a new filter cannot reach one path and not the other.
+const Registration = zkb.roots.Registration;
 
 /// Fold the flags into a single registration, or explain why they cannot be.
 ///
@@ -91,6 +87,7 @@ fn registrationFrom(
     }
 
     return .{
+        .collection = opts.collection,
         .root = folded.root,
         .extensions = try zkb.roots.joinList(arena, exts.items),
         .include = try zkb.roots.joinList(arena, include.items),
@@ -146,7 +143,7 @@ pub fn run(
     // around, and for no gain: the daemon has the model resident and this
     // process would have to load its own.
     if (!opts.force) {
-        if (try viaDaemon(gpa, io, &layout, w, opts.collection, reg)) |code| return code;
+        if (try viaDaemon(gpa, io, &layout, w, reg)) |code| return code;
     }
 
     const root = reg.root;
@@ -160,15 +157,8 @@ pub fn run(
     var s = zkb.store.Store.init(&db);
 
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    const cid = try s.upsertCollection(opts.collection, root, .documents, reg.extensions, reg.include, now_ms);
-    const filters = try zkb.roots.filtersFor(arena, .{
-        .id = cid,
-        .name = opts.collection,
-        .root = root,
-        .kind = .documents,
-        .extensions = reg.extensions,
-        .include = reg.include,
-    });
+    const cid = try reg.apply(&s, .documents, now_ms);
+    const filters = try reg.filters(arena, cid, .documents);
 
     if (opts.force) {
         // Force means "distrust the hashes": clear the stamps so every doc is
@@ -293,7 +283,6 @@ fn viaDaemon(
     io: std.Io,
     layout: *const zkb.paths.Layout,
     w: *Writer,
-    collection: []const u8,
     reg: Registration,
 ) !?u8 {
     var c = zkb.ipc_client.Client.connect(io, layout.sock) catch return null;
@@ -311,19 +300,7 @@ fn viaDaemon(
         defer bw.deinit();
         const pw = &bw.writer;
 
-        try pw.writeAll("{\"collection\":");
-        try std.json.Stringify.value(collection, .{}, pw);
-        try pw.writeAll(",\"root\":");
-        try std.json.Stringify.value(reg.root, .{}, pw);
-        if (reg.extensions) |v| {
-            try pw.writeAll(",\"extensions\":");
-            try std.json.Stringify.value(v, .{}, pw);
-        }
-        if (reg.include) |v| {
-            try pw.writeAll(",\"include\":");
-            try std.json.Stringify.value(v, .{}, pw);
-        }
-        try pw.writeAll("}");
+        try reg.writeJson(pw);
 
         var resp = c.call(gpa, .index, bw.written()) catch return null;
         defer resp.deinit(gpa);

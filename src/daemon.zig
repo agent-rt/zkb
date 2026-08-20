@@ -411,21 +411,9 @@ pub const ChecksUpdate = struct {
 };
 
 /// A collection to register, handed from a connection thread to the writer.
-/// All strings are gpa-owned and freed once applied.
-pub const Registration = struct {
-    name: []const u8,
-    root: []const u8,
-    /// Newline-separated, or null to keep whatever is stored.
-    extensions: ?[]const u8,
-    include: ?[]const u8,
-
-    fn deinit(self: Registration, gpa: std.mem.Allocator) void {
-        gpa.free(self.name);
-        gpa.free(self.root);
-        if (self.extensions) |v| gpa.free(v);
-        if (self.include) |v| gpa.free(v);
-    }
-};
+/// All strings are gpa-owned and freed once applied. Defined with the scan layer
+/// rather than here so the direct path and this one cannot drift apart.
+const Registration = rootsmod.Registration;
 
 /// Write any handed-over registrations. Called by the ingest thread only.
 ///
@@ -441,7 +429,7 @@ fn applyRegistrations(st: *State, s: *store.Store) void {
     defer st.gpa.free(taken);
     for (taken) |r| {
         defer r.deinit(st.gpa);
-        _ = s.upsertCollection(r.name, r.root, .documents, r.extensions, r.include, nowMs(st.io)) catch {};
+        _ = r.apply(s, .documents, nowMs(st.io)) catch {};
     }
 }
 
@@ -746,14 +734,7 @@ fn handleIndex(st: *State, w: *std.Io.Writer, id: i64, req: *const proto.Request
     // A request naming a root is asking for that root to be part of the index
     // from now on, not just scanned once. Queue it for the writer; the reply is
     // still immediate, because the client polls `stats` for completion.
-    if (req.str("root")) |root| {
-        const name = req.str("collection") orelse "docs";
-        const reg: Registration = .{
-            .name = try st.gpa.dupe(u8, name),
-            .root = try st.gpa.dupe(u8, root),
-            .extensions = if (req.str("extensions")) |v| try st.gpa.dupe(u8, v) else null,
-            .include = if (req.str("include")) |v| try st.gpa.dupe(u8, v) else null,
-        };
+    if (try Registration.fromLookup(st.gpa, req)) |reg| {
         st.register_mutex.lockUncancelable(st.io);
         defer st.register_mutex.unlock(st.io);
         st.pending_registers.append(st.gpa, reg) catch reg.deinit(st.gpa);
@@ -993,6 +974,7 @@ pub fn run(
 
     // Resolved once at startup: the daemon holds the path for its whole life,
     // and a Hugging Face cache hit should not be re-discovered per request.
+    //
     const found = try registry.resolve(gpa, io, env, &layout, opts.model_path, .q8_0);
     const model_path = found.path;
     defer if (opts.model_path == null) gpa.free(model_path);

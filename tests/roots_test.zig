@@ -153,3 +153,105 @@ test "an ignored directory is prunable, not just its files" {
     // A pattern that can only match deeper must not prune an ancestor.
     try testing.expect(!zkb.glob.match("**/draft.md", "agents/handoffs"));
 }
+
+// ---------------------------------------------------------------------------
+// the two paths a registration can take
+// ---------------------------------------------------------------------------
+
+/// Every field carries a value distinguishable from every other field's, so a
+/// serialiser that writes the right number of keys under the wrong names still
+/// fails. `include` deliberately holds a newline: it is the stored list
+/// separator, and a format that cannot carry one would corrupt any multi-pattern
+/// registration.
+fn sampleRegistration() roots.Registration {
+    return .{
+        .collection = "agent-memory",
+        .root = "/Users/x/.claude/projects",
+        .extensions = ".md\n.markdown",
+        .include = "*/memory/*.md\n*/notes/*.md",
+    };
+}
+
+fn requestFor(gpa: std.mem.Allocator, reg: roots.Registration) !zkb.proto.Request {
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try reg.writeJson(&body.writer);
+
+    var line: std.Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    try line.writer.print(
+        "{{\"id\":1,\"method\":\"index\",\"params\":{s}}}",
+        .{body.written()},
+    );
+    return zkb.proto.parseRequest(gpa, line.written());
+}
+
+test "a registration survives the socket with every field intact" {
+    // What this guards is not JSON. It is that `zkb index --root X` behaves the
+    // same whether or not a daemon happens to be running — the failure that
+    // motivated it registered nothing, silently, and only when one was.
+    //
+    // CI cannot start a daemon (`daemon run` resolves an embedding model and CI
+    // has none), so the socket itself is unreachable here. What is reachable is
+    // the pair that matters: the serialiser the CLI uses and the parser the
+    // daemon uses, driven by the same field list.
+    const gpa = testing.allocator;
+    const sent = sampleRegistration();
+
+    var req = try requestFor(gpa, sent);
+    defer req.deinit();
+
+    const got = (try roots.Registration.fromLookup(gpa, &req)) orelse
+        return error.TestUnexpectedResult;
+    defer got.deinit(gpa);
+
+    // Compared by reflection, not field by field: a field added to Registration
+    // is checked here without anyone remembering to add an assertion for it.
+    // That is the whole point — the last parameter to go missing did so because
+    // five hand-written places had to agree and one did not.
+    inline for (std.meta.fields(roots.Registration)) |f| {
+        const a: ?[]const u8 = @field(sent, f.name);
+        const b: ?[]const u8 = @field(got, f.name);
+        if (a) |want| {
+            try testing.expect(b != null);
+            try testing.expectEqualStrings(want, b.?);
+        } else {
+            try testing.expect(b == null);
+        }
+    }
+}
+
+test "an unset filter stays unset rather than becoming empty" {
+    // NULL and "" are different stored states: NULL means the kind's default,
+    // "" means match nothing. A round trip that turned one into the other would
+    // silently empty a collection.
+    const gpa = testing.allocator;
+    var req = try requestFor(gpa, .{ .collection = "docs", .root = "/Users/x/docs" });
+    defer req.deinit();
+
+    const got = (try roots.Registration.fromLookup(gpa, &req)).?;
+    defer got.deinit(gpa);
+    try testing.expect(got.extensions == null);
+    try testing.expect(got.include == null);
+    try testing.expectEqualStrings("docs", got.collection);
+}
+
+test "a request with no root is a rescan, not a registration" {
+    const gpa = testing.allocator;
+    var req = try zkb.proto.parseRequest(gpa, "{\"id\":1,\"method\":\"index\",\"params\":{}}");
+    defer req.deinit();
+    try testing.expect((try roots.Registration.fromLookup(gpa, &req)) == null);
+}
+
+test "a request that names only a root registers it under the default collection" {
+    const gpa = testing.allocator;
+    var req = try zkb.proto.parseRequest(
+        gpa,
+        "{\"id\":1,\"method\":\"index\",\"params\":{\"root\":\"/Users/x/docs\"}}",
+    );
+    defer req.deinit();
+    const got = (try roots.Registration.fromLookup(gpa, &req)).?;
+    defer got.deinit(gpa);
+    try testing.expectEqualStrings("docs", got.collection);
+    try testing.expectEqualStrings("/Users/x/docs", got.root);
+}
