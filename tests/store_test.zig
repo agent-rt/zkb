@@ -643,3 +643,62 @@ test "one exit code per error, whichever path produced it" {
         try testing.expect(n >= 1 and n <= 4);
     }
 }
+
+test "a wildcard-free --path names a place, and still names a file" {
+    // Measured against the forms the argument actually gets typed in:
+    // `projects/qlit/**`, `projects/qlit/*` and even a stray `/projects/qlit/**`
+    // all worked, while `projects/qlit` — the plainest one — returned nothing.
+    // Not an error, nothing: identical output to "that project has nothing about
+    // this", which is the answer a reader will believe.
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const inside = try s.upsertDocContent(cid, "projects/qlit/PLAN.md", "sha-p", 10, 1000);
+    const deeper = try s.upsertDocContent(cid, "projects/qlit/notes/a.md", "sha-a", 10, 1000);
+    const sibling = try s.upsertDocContent(cid, "projects/qlit-old/PLAN.md", "sha-o", 10, 1000);
+    const root_index = try s.upsertDocContent(cid, "index.md", "sha-i", 10, 1000);
+    for ([_]i64{ inside, deeper, sibling, root_index }) |d| try addChunks(&s, cid, d, 1);
+
+    var query_vec = dummyVector(0);
+    const Case = struct { pattern: []const u8, want: []const i64 };
+    for ([_]Case{
+        // Every spelling of "that directory" selects the subtree, including the
+        // shapes that arrive pasted out of a shell.
+        .{ .pattern = "projects/qlit/**", .want = &.{ inside, deeper } },
+        .{ .pattern = "projects/qlit", .want = &.{ inside, deeper } },
+        .{ .pattern = "projects/qlit/", .want = &.{ inside, deeper } },
+        .{ .pattern = "./projects/qlit", .want = &.{ inside, deeper } },
+        .{ .pattern = "/projects/qlit", .want = &.{ inside, deeper } },
+        // The subtree reading is an addition, not a rewrite into `<pat>/**`:
+        // a bare filename still means that file.
+        .{ .pattern = "index.md", .want = &.{root_index} },
+        // The prefix has to end on a component boundary, or `qlit` would drag in
+        // `qlit-old` and the filter would quietly be wrong rather than empty.
+        .{ .pattern = "projects/ql", .want = &.{} },
+        // A typo stays empty. Guessing at one would be the same failure as the
+        // silent no-match, only louder about the wrong answer.
+        .{ .pattern = "projcts/qlit", .want = &.{} },
+    }) |c| {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+            .top_k = 10,
+            .path = c.pattern,
+        });
+        defer res.deinit(testing.allocator);
+        testing.expectEqual(c.want.len, res.hits.len) catch |e| {
+            std.debug.print("pattern {s}: got {d} hit(s)\n", .{ c.pattern, res.hits.len });
+            return e;
+        };
+        for (res.hits) |h| {
+            var ok = false;
+            for (c.want) |d| if (d == h.doc_id) {
+                ok = true;
+            };
+            testing.expect(ok) catch |e| {
+                std.debug.print("pattern {s}: unexpected doc {d}\n", .{ c.pattern, h.doc_id });
+                return e;
+            };
+        }
+    }
+}

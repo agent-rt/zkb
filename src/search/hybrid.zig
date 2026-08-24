@@ -188,9 +188,46 @@ fn scopeDocIds(
     if (collection_id) |cid| try st.bindI64(1, cid);
 
     while (try st.step()) {
-        if (glob.match(pattern, st.columnText(1))) try out.append(gpa, st.columnI64(0));
+        if (inPathScope(pattern, st.columnText(1))) try out.append(gpa, st.columnI64(0));
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// Does `rel_path` fall inside what a `--path` argument names?
+///
+/// A pattern with no wildcard reads as a place, not a filename. `--path
+/// projects/qlit` is how the argument gets typed, and matching it only as an
+/// exact `rel_path` finds nothing — output that is indistinguishable from "that
+/// project has nothing about this". Measured across the forms someone actually
+/// reaches for, `projects/qlit/**`, `projects/qlit/*` and even the stray
+/// `/projects/qlit/**` all worked, while the plainest one silently did not.
+///
+/// The two readings do not compete: a document either *is* that path or lives
+/// under it, so both count. That keeps `--path index.md` meaning the file —
+/// rewriting a bare pattern into `<pat>/**` instead would have broken it.
+///
+/// Only wildcard-free patterns get the subtree reading. Once a pattern contains
+/// `*` or `?` the person is writing a glob and is entitled to have it obeyed.
+/// `glob` itself is left alone: it is also the scan's `--include` matcher, and
+/// widening a filter that decides which files get indexed is a different and much
+/// less reversible decision.
+fn inPathScope(pattern: []const u8, rel_path: []const u8) bool {
+    if (glob.match(pattern, rel_path)) return true;
+
+    for (pattern) |c| if (c == '*' or c == '?') return false;
+    // `./` and a leading `/` are how a path arrives when it was pasted out of a
+    // shell or a file listing. A rel_path carries neither, so stripping them can
+    // only turn a non-match into a match — and `glob` already tolerates the
+    // leading slash on wildcard patterns, so not doing it here would leave
+    // `/projects/qlit/**` working while `/projects/qlit` did not.
+    var dir = pattern;
+    if (std.mem.startsWith(u8, dir, "./")) dir = dir[2..];
+    dir = std.mem.trimStart(u8, dir, "/");
+    dir = std.mem.trimEnd(u8, dir, "/");
+    if (dir.len == 0) return false;
+    return rel_path.len > dir.len + 1 and
+        std.mem.startsWith(u8, rel_path, dir) and
+        rel_path[dir.len] == '/';
 }
 
 /// Exact nearest neighbours within a document subset.
