@@ -276,3 +276,82 @@ test "json output is parseable and carries the same documents" {
     try testing.expectEqual(@as(usize, 2), docs.items.len);
     try testing.expect(parsed.value.object.get("total_tokens").?.integer > 0);
 }
+
+test "an empty pack says whether the corpus was silent or the budget was" {
+    // These are different facts and the markdown gave them the same sentence.
+    // Measured on the real corpus: five qlit documents matched, every one was
+    // dropped whole for exceeding a 500-token budget, and the output read "No
+    // relevant documents found." The json had said `omitted: [all five]` the
+    // whole time. Paired with `--path`, that sentence reads as "this project has
+    // nothing about it" — a conclusion someone acts on.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    try seed(&db, 2, 2, 400);
+
+    var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
+    defer results.deinit(gpa);
+
+    // Small enough that the per-document ceiling admits nothing.
+    var p = try pack.assemble(gpa, &db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
+    defer p.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), p.groups.len);
+    try testing.expect(p.omitted.len != 0);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try pack.renderMarkdown(&w, &p);
+    const out = w.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "none fitted the 20-token budget") != null);
+    // `omitted` carries the rel_path alone, where a rendered document heading
+    // carries `collection/rel_path`. Asserted as it is rather than as it reads.
+    try testing.expect(std.mem.indexOf(u8, out, "doc0.md") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Raise --budget") != null);
+    // The other sentence must not appear: it is the claim being corrected.
+    try testing.expect(std.mem.indexOf(u8, out, "No relevant documents") == null);
+}
+
+test "renderEmpty is one wording, whichever renderer reached it" {
+    // `query` rebuilds this markdown from the daemon's json rather than sharing
+    // the renderer, so the two are separate code paths by design. What must not
+    // drift is the sentence, so the sentence is what they share — and this holds
+    // the json-shaped caller to the same bytes as the pack-shaped one.
+    const Omitted = pack.Omitted;
+    const packName = struct {
+        fn f(o: Omitted) []const u8 {
+            return o.rel_path;
+        }
+    }.f;
+    const jsonName = struct {
+        fn f(v: std.json.Value) []const u8 {
+            return v.object.get("path").?.string;
+        }
+    }.f;
+
+    var a_buf: [512]u8 = undefined;
+    var a = std.Io.Writer.fixed(&a_buf);
+    try pack.renderEmpty(&a, 500, &[_]Omitted{
+        .{ .rel_path = "projects/qlit/PLAN.md", .score = 1 },
+        .{ .rel_path = "projects/qlit/REQ.md", .score = 0.5 },
+    }, packName);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        \\[{"path":"projects/qlit/PLAN.md"},{"path":"projects/qlit/REQ.md"}]
+        ,
+        .{},
+    );
+    defer parsed.deinit();
+    var b_buf: [512]u8 = undefined;
+    var b = std.Io.Writer.fixed(&b_buf);
+    try pack.renderEmpty(&b, 500, parsed.value.array.items, jsonName);
+
+    try testing.expectEqualStrings(a.buffered(), b.buffered());
+
+    // And an actually-empty result keeps the original sentence.
+    var c_buf: [256]u8 = undefined;
+    var c = std.Io.Writer.fixed(&c_buf);
+    try pack.renderEmpty(&c, 500, &[_]Omitted{}, packName);
+    try testing.expect(std.mem.indexOf(u8, c.buffered(), "No relevant documents found") != null);
+}

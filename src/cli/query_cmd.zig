@@ -108,7 +108,13 @@ fn renderFromJson(w: *Writer, result: std.json.Value, query: []const u8) !void {
 
     const docs = if (obj.get("documents")) |d| (if (d == .array) d.array.items else &.{}) else &.{};
     if (docs.len == 0) {
-        try w.writeAll("\nNo relevant documents found.\n");
+        const om = if (obj.get("omitted")) |o| (if (o == .array) o.array.items else &.{}) else &.{};
+        const nameOf = struct {
+            fn f(v: std.json.Value) []const u8 {
+                return str(v.object, "path");
+            }
+        }.f;
+        try zkb.pack.renderEmpty(w, @intCast(@max(0, int(obj, "budget_tokens"))), om, nameOf);
         return;
     }
 

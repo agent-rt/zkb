@@ -406,7 +406,12 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
         try w.writeAll("\n");
     }
     if (pack.groups.len == 0) {
-        try w.writeAll("\nNo relevant documents found.\n");
+        const nameOf = struct {
+            fn f(o: Omitted) []const u8 {
+                return o.rel_path;
+            }
+        }.f;
+        try renderEmpty(w, pack.budget_tokens, pack.omitted, nameOf);
         return;
     }
 
@@ -433,6 +438,36 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
         "tokens: {d} / {d} (approx, counted with the embedding model's tokenizer)\n",
         .{ pack.total_tokens, pack.budget_tokens },
     );
+}
+
+/// What an empty result actually means, said once for both renderers.
+///
+/// "No relevant documents found." was printed whenever no document survived
+/// assembly — including when several matched and every one of them was dropped
+/// whole for exceeding the budget. The json said so all along (`omitted` listed
+/// them); the markdown, which is what a person and an agent read, claimed the
+/// corpus had nothing. With `--path` that reads as "this project has nothing
+/// about it", which is a conclusion someone will act on.
+///
+/// `nameOf` exists because the two renderers hold different element types — the
+/// pack's own `Omitted`, and the json the daemon sent back. The wording is what
+/// must not diverge, so the wording is the part that lives here.
+pub fn renderEmpty(
+    w: *std.Io.Writer,
+    budget: usize,
+    items: anytype,
+    comptime nameOf: fn (std.meta.Elem(@TypeOf(items))) []const u8,
+) !void {
+    if (items.len == 0) {
+        try w.writeAll("\nNo relevant documents found.\n");
+        return;
+    }
+    try w.print(
+        "\n{d} document(s) matched, and none fitted the {d}-token budget:\n",
+        .{ items.len, budget },
+    );
+    for (items) |it| try w.print("  {s}\n", .{nameOf(it)});
+    try w.writeAll("\nRaise --budget to see them.\n");
 }
 
 pub fn renderJson(w: *std.Io.Writer, pack: *const Pack) !void {
