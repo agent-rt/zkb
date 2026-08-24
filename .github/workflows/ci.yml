@@ -61,16 +61,6 @@ jobs:
           n=$(grep -c '^  FAIL' <<<"$doc")
           [ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 failed check, got $n"; echo "$doc"; exit 1; }
 
-          # The first thing a new install does. Without a model the daemon
-          # cannot serve, so start must say so and name the fix rather than
-          # spending five seconds waiting for a process that already exited.
-          # This also covers run/ being created: before that fix the failure
-          # here was a bare FileNotFound, which this assertion would not accept.
-          rc=0
-          out=$("$bin" daemon start 2>&1) || rc=$?
-          [ "$rc" -eq 3 ] || { echo "FAIL: daemon start without a model should exit 3, got $rc"; echo "$out"; exit 1; }
-          grep -q 'zkb model pull' <<<"$out" || { echo "FAIL: daemon start should name the fix"; echo "$out"; exit 1; }
-
           # Report a missing index as exit 3 with something to act on, rather
           # than failing or pretending to succeed.
           for cmd in records status; do
@@ -153,3 +143,26 @@ jobs:
           out=$(HOME="$fakehome" "$bin" daemon uninstall 2>&1) || { echo "FAIL: daemon uninstall"; echo "$out"; exit 1; }
           n=$(ls "$fakehome/Library/LaunchAgents" | wc -l | tr -d ' ')
           [ "$n" -eq 0 ] || { echo "FAIL: $n plist(s) left after uninstall"; exit 1; }
+
+          # The first thing a new install does. The model is loaded lazily, so a
+          # missing one is not fatal: the daemon comes up degraded and says so.
+          # (0.0.21 exited 3 here, which is what kept the whole IPC surface out
+          # of CI — nothing on a runner could reach the socket.)
+          #
+          # Last, and in its own ZKB_HOME, for two reasons: starting a daemon
+          # creates the index, which would turn the exit-3 assertions above into
+          # exit 0; and every `index` call above asserts the direct path, which
+          # a listening daemon would replace with the IPC one.
+          dhome=$(mktemp -d /tmp/zkbd.XXXXXX)   # short: sun_path caps at 104 bytes
+          rc=0
+          out=$(ZKB_HOME="$dhome" "$bin" daemon start 2>&1) || rc=$?
+          [ "$rc" -eq 0 ] || { echo "FAIL: daemon start without a model should come up degraded, got $rc"; echo "$out"; exit 1; }
+          grep -q 'zkb model pull' <<<"$out" || { echo "FAIL: start should name the missing model"; echo "$out"; exit 1; }
+
+          # Reaching status proves the socket is really being served, not just
+          # that a process survived long enough to print "started".
+          st=$(ZKB_HOME="$dhome" "$bin" daemon status 2>&1) || { echo "FAIL: daemon status"; echo "$st"; exit 1; }
+          grep -q 'running'  <<<"$st" || { echo "FAIL: the daemon should be listening"; echo "$st"; exit 1; }
+          grep -q 'DEGRADED' <<<"$st" || { echo "FAIL: status should own up to the missing model"; echo "$st"; exit 1; }
+
+          ZKB_HOME="$dhome" "$bin" daemon stop >/dev/null 2>&1 || { echo "FAIL: daemon stop"; exit 1; }
