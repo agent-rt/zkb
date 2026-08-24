@@ -362,3 +362,104 @@ test "recency ranking respects the scope" {
     defer gpa.free(work);
     try testing.expectEqual(@as(usize, 2), work.len);
 }
+
+test "a scoped row is freed like any other, whichever wrapper parsed it" {
+    // `scope` was added to `Fact` and three places had to grow a line: the two
+    // hand-written `deinit` field lists and `Current.deinit`. Only the last one
+    // did, so every `zkb facts` leaked one string per row — invisible, because a
+    // leak in a process about to exit costs nothing anyone would notice.
+    //
+    // `testing.allocator` is the whole assertion: it fails on a leak, and it
+    // panics on the double free that lived one layer up in `recall`.
+    {
+        var parsed = try zkb.facts.parse(gpa, scoped_csv);
+        defer parsed.deinit(gpa);
+        try testing.expectEqual(@as(usize, 3), parsed.facts.len);
+        try testing.expectEqualStrings("work", parsed.facts[0].scope);
+    }
+
+    // The dedup path replaces a winner's strings in place, `scope` among them,
+    // and that is a second owner of the same field.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = try TmpCsv.init(io, "facts-scope", scoped_csv);
+    defer tmp.deinit(io);
+
+    const rows = try zkb.facts.currentAll(gpa, io, tmp.path);
+    defer {
+        for (rows) |r| r.deinit(gpa);
+        gpa.free(rows);
+    }
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.key, "salary")) continue;
+        try testing.expectEqualStrings("480000", r.value);
+        try testing.expectEqualStrings("work", r.scope);
+    }
+}
+
+test "a labelled fact is injected only for its own scope" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = try TmpCsv.init(io, "facts-inscope",
+        \\key,value,at,recorded_at,src,note,scope
+        \\height,178,2026-01-01,2026-01-02,user,,
+        \\salary,450000,2026-01-01,2026-01-02,user,,work
+        \\
+    );
+    defer tmp.deinit(io);
+
+    const rows = try zkb.facts.currentAll(gpa, io, tmp.path);
+    defer {
+        for (rows) |r| r.deinit(gpa);
+        gpa.free(rows);
+    }
+
+    for (rows) |r| {
+        const universal = std.mem.eql(u8, r.key, "height");
+        // Unscoped: everywhere. Scoped: only where it was named — and `null`,
+        // which is what a caller that passed no scope looks like, is not a match.
+        try testing.expectEqual(universal, r.inScope(null));
+        try testing.expectEqual(universal, r.inScope("personal"));
+        try testing.expect(r.inScope("work"));
+    }
+}
+
+const scoped_csv =
+    \\key,value,at,recorded_at,src,note,scope
+    \\salary,450000,2026-01-01,2026-01-02,user,月額,work
+    \\height,178,2026-01-01,2026-01-02,user,,
+    \\salary,480000,2026-06-01,2026-06-02,user,昇給後,work
+    \\
+;
+
+/// A facts.csv under /tmp, because `currentAll` reads a path, not a string —
+/// which is the half where the ownership bug lived.
+const TmpCsv = struct {
+    dir: []u8,
+    path: []u8,
+
+    fn init(io: std.Io, name: []const u8, body: []const u8) !TmpCsv {
+        const dir = try std.fmt.allocPrint(gpa, "/tmp/zkb-{s}-{x}", .{ name, @intFromPtr(body.ptr) });
+        errdefer gpa.free(dir);
+        var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
+        defer d.close(io);
+        var f = try d.createFile(io, "facts.csv", .{});
+        defer f.close(io);
+        var buf: [1024]u8 = undefined;
+        var wr = f.writer(io, &buf);
+        try wr.interface.writeAll(body);
+        try wr.interface.flush();
+        return .{ .dir = dir, .path = try std.fmt.allocPrint(gpa, "{s}/facts.csv", .{dir}) };
+    }
+
+    fn deinit(self: *TmpCsv, io: std.Io) void {
+        std.Io.Dir.cwd().deleteTree(io, self.dir) catch {};
+        gpa.free(self.path);
+        gpa.free(self.dir);
+    }
+};

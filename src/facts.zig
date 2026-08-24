@@ -68,20 +68,35 @@ pub const Fact = struct {
     scope: []const u8,
 };
 
-/// Parse `facts.csv`. The six columns are built in — no `_schema.json` needed.
+/// Free every string a row owns, by walking the field table rather than a list
+/// someone has to remember to extend.
+///
+/// `scope` was added to both `Fact` and `Current`, and only `Current.deinit`
+/// grew the matching line — so every `zkb facts` leaked one string per row,
+/// silently, because a leak in a process about to exit costs nothing visible.
+/// The hand-written list is the defect; a string field added from here on is
+/// freed because it exists, not because someone noticed.
+///
+/// Non-string fields are skipped rather than rejected: `Fact.value_num` is an
+/// `?f64` that owns nothing, and a row type is entitled to hold one.
+fn freeStrings(a: std.mem.Allocator, v: anytype) void {
+    inline for (std.meta.fields(@TypeOf(v))) |f| {
+        if (f.type == []const u8) a.free(@field(v, f.name));
+    }
+}
+
+fn freeFact(a: std.mem.Allocator, f: Fact) void {
+    freeStrings(a, f);
+}
+
+/// Parse `facts.csv`. The columns in `columns` are built in — no `_schema.json`
+/// needed.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
     facts: []Fact,
     bad_rows: []usize,
 
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
-        for (self.facts) |f| {
-            a.free(f.key);
-            a.free(f.value_txt);
-            a.free(f.at);
-            a.free(f.recorded_at);
-            a.free(f.src);
-            a.free(f.note);
-        }
+        for (self.facts) |f| freeFact(a, f);
         a.free(self.facts);
         a.free(self.bad_rows);
     }
@@ -181,12 +196,7 @@ pub const Current = struct {
     scope: []const u8,
 
     pub fn deinit(self: Current, gpa: std.mem.Allocator) void {
-        gpa.free(self.key);
-        gpa.free(self.value);
-        gpa.free(self.at);
-        gpa.free(self.recorded_at);
-        gpa.free(self.note);
-        gpa.free(self.scope);
+        freeStrings(gpa, self);
     }
 
     /// Does this fact belong in a recall for `want`?
@@ -217,14 +227,7 @@ fn parseFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?struct {
     facts: []Fact,
 
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
-        for (self.facts) |f| {
-            a.free(f.key);
-            a.free(f.value_txt);
-            a.free(f.at);
-            a.free(f.recorded_at);
-            a.free(f.src);
-            a.free(f.note);
-        }
+        for (self.facts) |f| freeFact(a, f);
         a.free(self.facts);
         a.free(self.source);
     }
