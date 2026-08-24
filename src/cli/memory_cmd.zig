@@ -275,14 +275,18 @@ pub fn recall(
     // Filtered before rendering, not inside the renderer: `zkb facts` shows
     // everything on purpose (you asked for it), while recall is injected without
     // anyone asking — which is the whole reason a scope exists.
+    //
+    // `currentAll` hands over the elements as well as the slice, so a fact that
+    // does not survive the filter has to be freed here — it has no other owner.
+    // The slice itself is freed either way; only what it held moves on.
+    defer gpa.free(all_current);
     const current = blk: {
         var keep: std.ArrayList(zkb.facts.Current) = .empty;
         for (all_current) |c| {
-            if (c.inScope(opts.scope)) try keep.append(gpa, c);
+            if (c.inScope(opts.scope)) try keep.append(gpa, c) else c.deinit(gpa);
         }
         break :blk try keep.toOwnedSlice(gpa);
     };
-    defer gpa.free(current);
     defer {
         for (current) |f| f.deinit(gpa);
         gpa.free(current);
@@ -608,4 +612,74 @@ fn warnIfUnversioned(io: std.Io, w: *Writer, kb: []const u8) !void {
         if (std.Io.Dir.accessAbsolute(io, p, .{})) |_| return else |_| {}
     }
     try w.print("\nnote: {s} is not under version control (optional)\n", .{kb});
+}
+
+const testing = std.testing;
+
+test "recall hands the facts back once, and only the ones in scope" {
+    // This crashed. `zkb recall` with no daemon and at least one fact freed the
+    // filtered slice twice — a `defer gpa.free(current)` left behind when the
+    // scope filter arrived and brought its own freeing defer. Nobody saw it
+    // because the machine that would notice always has a daemon running, and the
+    // daemon path never reaches this code. A fresh install has no daemon, and
+    // `zkb recall` is the first command the skill tells an agent to run.
+    //
+    // `testing.allocator` panics on the double free and fails on the leak of the
+    // facts the filter dropped, so both halves of the fix are asserted by simply
+    // getting here.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [64]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/zkb-recall-test-{x}", .{@intFromPtr(&threaded)});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    {
+        const data = try std.fmt.allocPrint(testing.allocator, "{s}/data", .{root});
+        defer testing.allocator.free(data);
+        var d = try std.Io.Dir.cwd().createDirPathOpen(io, data, .{});
+        defer d.close(io);
+        var f = try d.createFile(io, "facts.csv", .{});
+        defer f.close(io);
+        var fbuf: [512]u8 = undefined;
+        var wr = f.writer(io, &fbuf);
+        try wr.interface.writeAll(
+            \\key,value,at,recorded_at,src,note,scope
+            \\height,178,2026-01-01,2026-01-02,user,,
+            \\salary,450000,2026-01-01,2026-01-02,user,,work
+            \\
+        );
+        try wr.interface.flush();
+
+        // An index has to exist or recall returns 3 before reaching any of this.
+        const index_dir = try std.fmt.allocPrint(testing.allocator, "{s}/index", .{root});
+        defer testing.allocator.free(index_dir);
+        var i = try std.Io.Dir.cwd().createDirPathOpen(io, index_dir, .{});
+        i.close(io);
+        const db_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/zkb.db", .{index_dir}, 0);
+        defer testing.allocator.free(db_path);
+        var db = try zkb.store.open(db_path, .read_write);
+        db.close();
+    }
+
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("ZKB_HOME", root);
+
+    var out: [8192]u8 = undefined;
+    {
+        var w = std.Io.Writer.fixed(&out);
+        const code = try recall(testing.allocator, io, &env, &w, .{ .budget = 500 });
+        try testing.expectEqual(@as(u8, 0), code);
+        // Unscoped caller: the universal fact, and not the labelled one.
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "height") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "salary") == null);
+    }
+    {
+        var w = std.Io.Writer.fixed(&out);
+        _ = try recall(testing.allocator, io, &env, &w, .{ .budget = 500, .scope = "work" });
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "height") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "salary") != null);
+    }
 }
