@@ -247,3 +247,116 @@ fn registeredRoot(db_path: [:0]const u8) !?[]u8 {
     if (!(st.step() catch return null)) return null;
     return try gpa.dupe(u8, st.columnText(0));
 }
+
+/// Seed an index at ZKB_HOME before the daemon opens it.
+///
+/// Without a model the ingest thread cannot embed, so a corpus on disk stays
+/// pending and never becomes a chunk — which is exactly the state that makes the
+/// socket testable, and also the state in which a retrieval test would have
+/// nothing to retrieve. Writing the chunks directly sidesteps the embedder while
+/// leaving the request path, the handler and the pack entirely real.
+fn seedIndex(io: std.Io, home: *const Home) !void {
+    const index_dir = try std.fmt.allocPrint(gpa, "{s}/index", .{home.root});
+    defer gpa.free(index_dir);
+    var d = try std.Io.Dir.cwd().createDirPathOpen(io, index_dir, .{});
+    d.close(io);
+
+    const db_path = try std.fmt.allocPrintSentinel(gpa, "{s}/zkb.db", .{index_dir}, 0);
+    defer gpa.free(db_path);
+    var db = try zkb.store.open(db_path, .read_write);
+    defer db.close();
+    var s = zkb.store.Store.init(&db);
+
+    const cid = try s.ensureCollection("corpus", "/tmp/corpus", 1000);
+    for ([_][]const u8{ "a/one.md", "b/two.md" }) |rel| {
+        const body = "RRF fusion merges the two rankers.";
+        const did = try s.upsertDocContent(cid, rel, rel, body.len, 1000);
+        var v: [@intCast(zkb.schema.embedding_dim)]f32 = @splat(0);
+        v[0] = 1;
+        _ = try s.insertChunk(cid, did, .{
+            .idx = 0,
+            .heading_path = "",
+            .byte_start = 0,
+            .byte_end = @intCast(body.len),
+            .n_tokens = 8,
+            .text = body,
+        }, &v);
+        try s.markIndexed(did, 1, 1000);
+    }
+}
+
+test "query's filters cross the socket, and are read on the other side" {
+    // `query` grew `--collection` and `--path` long after `search` had them, and
+    // a filter that exists only on the in-process path is the failure this
+    // codebase keeps repeating: the command reports success, returns results, and
+    // the filter silently did nothing. The two halves are wired once each now —
+    // `proto.writeFilters` writes, `searchConfig`/`requestedCollection` read — so
+    // this drives the request through the same serialiser the CLI uses, over the
+    // real socket, into the real handler.
+    try withIo(struct {
+        fn f(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var env = try envFor(&home);
+            defer env.deinit();
+            try seedIndex(io, &home);
+
+            const server = try Server.start(io, &env, &home);
+            var client = try Server.waitReady(io, home.sock);
+            defer {
+                client.close();
+                server.stop(io, home.sock);
+            }
+
+            // Unfiltered first, so the filtered result below is a narrowing and
+            // not an empty index dressed up as one.
+            {
+                var resp = try client.call(gpa, .query, "{\"query\":\"fusion\",\"budget\":2000}");
+                defer resp.deinit(gpa);
+                try testing.expect(resp.ok);
+                try testing.expectEqual(@as(usize, 2), resp.result.?.object.get("documents").?.array.items.len);
+            }
+
+            var pbuf: [512]u8 = undefined;
+            var pw = std.Io.Writer.fixed(&pbuf);
+            try pw.writeAll("{\"query\":\"fusion\",\"budget\":2000");
+            try zkb.proto.writeFilters(&pw, "corpus", "a/**");
+            try pw.writeAll("}");
+
+            var resp = try client.call(gpa, .query, pw.buffered());
+            defer resp.deinit(gpa);
+            try testing.expect(resp.ok);
+
+            const docs = resp.result.?.object.get("documents").?.array;
+            try testing.expectEqual(@as(usize, 1), docs.items.len);
+            try testing.expectEqualStrings("a/one.md", docs.items[0].object.get("path").?.string);
+        }
+    }.f);
+}
+
+test "query rejects a collection that does not exist, rather than ignoring it" {
+    // The quiet failure mode is worse than the loud one: an unknown name that is
+    // dropped returns the whole corpus, which reads as "no matches in this
+    // project" only after someone notices the results come from elsewhere.
+    try withIo(struct {
+        fn f(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var env = try envFor(&home);
+            defer env.deinit();
+            try seedIndex(io, &home);
+
+            const server = try Server.start(io, &env, &home);
+            var client = try Server.waitReady(io, home.sock);
+            defer {
+                client.close();
+                server.stop(io, home.sock);
+            }
+
+            var resp = try client.call(gpa, .query, "{\"query\":\"fusion\",\"collection\":\"nope\"}");
+            defer resp.deinit(gpa);
+            try testing.expect(!resp.ok);
+            try testing.expectEqualStrings("bad_request", resp.code);
+        }
+    }.f);
+}

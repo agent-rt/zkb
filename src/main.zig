@@ -24,6 +24,7 @@ const usage =
     \\  search <query> [-k N] [--mode hybrid|vector|keyword] [--collection NAME]
     \\                 [--path GLOB] [--json] [--full] [--model PATH]
     \\  query <question> [--budget N] [--neighbors N] [--format markdown|json]
+    \\                   [--collection NAME] [--path GLOB]
     \\
     \\  remember <text> [--type user|feedback|decision|project|reference]
     \\                  [--subjects a,b] [--refs a,b] [--scope NAME] [--force]
@@ -242,6 +243,13 @@ pub fn main(init: std.process.Init) !u8 {
                     try w.print("unknown format: {s} (markdown|json)\n", .{v});
                     return 2;
                 };
+            } else if (std.mem.eql(u8, a, "--collection")) {
+                opts.collection = args.next();
+            } else if (std.mem.eql(u8, a, "--path")) {
+                opts.path = args.next() orelse {
+                    try w.writeAll("--path needs a glob, e.g. --path 'projects/qlit/**'\n");
+                    return 2;
+                };
             } else if (std.mem.eql(u8, a, "--model")) {
                 opts.model = args.next();
             } else {
@@ -250,7 +258,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         opts.query = question orelse {
-            try w.writeAll("usage: zkb query <question> [--budget N] [--format markdown|json]\n");
+            try w.writeAll("usage: zkb query <question> [--budget N] [--collection NAME] [--path GLOB]\n");
             return 2;
         };
         return query_cmd.run(gpa, init.io, init.environ_map, w, opts);
