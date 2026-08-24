@@ -161,6 +161,31 @@ pub fn parseRequest(gpa: std.mem.Allocator, line: []const u8) ParseError!Request
     return .{ .id = id, .method = method, .params = params, .parsed = parsed };
 }
 
+/// The retrieval filters a request carries, written into request params.
+///
+/// This is the writing half of the daemon's `searchConfig` + `requestedCollection`.
+/// Those two collapsed the *reading* of these fields into one place, after `--path`
+/// shipped filtering nothing over IPC; the writing stayed split across `search` and
+/// `query`, which is the same hazard facing the other way. A filter added here now
+/// reaches every command that calls this, or none of them.
+///
+/// Emits nothing when both are null, and each field starts with a comma: callers
+/// have already written at least `{"query":...`.
+pub fn writeFilters(
+    w: *std.Io.Writer,
+    collection: ?[]const u8,
+    path: ?[]const u8,
+) !void {
+    if (collection) |name| {
+        try w.writeAll(",\"collection\":");
+        try std.json.Stringify.value(name, .{}, w);
+    }
+    if (path) |pat| {
+        try w.writeAll(",\"path\":");
+        try std.json.Stringify.value(pat, .{}, w);
+    }
+}
+
 /// `{"id":N,"ok":true,"result":` — the caller writes the result body and then
 /// calls `finishOk`.
 pub fn beginOk(w: *std.Io.Writer, id: i64) !void {

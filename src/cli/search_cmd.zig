@@ -202,6 +202,17 @@ fn printJson(w: *Writer, results: *const zkb.hybrid.Results, counts: zkb.store.S
 
 /// Returns null when the daemon is unavailable, so the caller falls through to
 /// the in-process path.
+/// The exact params `search` puts on the wire. See `query_cmd.requestParams`.
+pub fn requestParams(w: *Writer, opts: Options) !void {
+    try w.writeAll("{\"query\":");
+    try std.json.Stringify.value(opts.query, .{}, w);
+    try w.print(",\"k\":{d},\"mode\":\"{t}\"", .{ opts.top_k, opts.mode });
+    // 不带上这两个过滤器的话，`--collection x` 在有 daemon 时被静默忽略：命令照常
+    // 返回结果，只是过滤没生效——比报错更难发现，因为输出看起来完全正常。
+    try zkb.proto.writeFilters(w, opts.collection, opts.path);
+    try w.writeAll("}");
+}
+
 fn viaDaemon(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -216,20 +227,7 @@ fn viaDaemon(
     // simpler than growing an ArrayList and cannot fail mid-write.
     var pbuf: [8192]u8 = undefined;
     var pw = std.Io.Writer.fixed(&pbuf);
-    try pw.writeAll("{\"query\":");
-    try std.json.Stringify.value(opts.query, .{}, &pw);
-    try pw.print(",\"k\":{d},\"mode\":\"{t}\"", .{ opts.top_k, opts.mode });
-    // 不带上 collection 的话，`--collection x` 在有 daemon 时被静默忽略：命令照常
-    // 返回结果，只是过滤没生效——比报错更难发现，因为输出看起来完全正常。
-    if (opts.collection) |name| {
-        try pw.writeAll(",\"collection\":");
-        try std.json.Stringify.value(name, .{}, &pw);
-    }
-    if (opts.path) |pat| {
-        try pw.writeAll(",\"path\":");
-        try std.json.Stringify.value(pat, .{}, &pw);
-    }
-    try pw.writeAll("}");
+    try requestParams(&pw, opts);
 
     var resp = c.call(gpa, .search, pw.buffered()) catch return null;
     defer resp.deinit(gpa);
