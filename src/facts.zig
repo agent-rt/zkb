@@ -116,15 +116,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !struct {
 
     var out: std.ArrayList(Fact) = .empty;
     errdefer {
-        for (out.items) |f| {
-            gpa.free(f.key);
-            gpa.free(f.value_txt);
-            gpa.free(f.at);
-            gpa.free(f.recorded_at);
-            gpa.free(f.src);
-            gpa.free(f.note);
-            gpa.free(f.scope);
-        }
+        for (out.items) |f| freeFact(gpa, f);
         out.deinit(gpa);
     }
 
@@ -342,12 +334,103 @@ pub fn history(
     return out.toOwnedSlice(gpa);
 }
 
+pub const AppendError = error{StaleHeaderWithBadRows};
+
+/// Rewrite `facts.csv` under the current column set, if it was written under an
+/// older one.
+///
+/// Widening the header alone would invert the failure and lose every existing
+/// row instead of the new one, so the whole file is rewritten: columns are
+/// matched **by name**, a column the old file lacks becomes empty, and one it
+/// has that we do not know is dropped. Written beside the original and renamed
+/// over it — `data/` is the one directory zkb cannot rebuild, so a half-written
+/// file must never be the file.
+///
+/// A file that already contains bad rows is refused rather than migrated. Those
+/// rows are exactly the data at risk — a bad row is usually one a newer zkb
+/// already appended — and `Table` keeps only their line numbers, so rewriting
+/// from it would quietly finish the job the bug started.
+fn migrateHeader(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const source = (readAll(gpa, io, path) catch null) orelse return;
+    defer gpa.free(source);
+
+    var table = try csvmod.parse(gpa, source);
+    defer table.deinit(gpa);
+    if (table.header.len == 0) return;
+
+    if (table.header.len == columns.len) {
+        var same = true;
+        for (table.header, columns) |have, want| {
+            if (!std.mem.eql(u8, have, want)) same = false;
+        }
+        if (same) return;
+    }
+    if (table.bad_rows.len != 0) return error.StaleHeaderWithBadRows;
+
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.migrating", .{path});
+    defer gpa.free(tmp);
+    {
+        var out = try std.Io.Dir.createFileAbsolute(io, tmp, .{ .truncate = true });
+        defer out.close(io);
+        var buf: [4096]u8 = undefined;
+        var writer = out.writer(io, &buf);
+        const w = &writer.interface;
+
+        try csvmod.writeRow(w, &columns);
+        for (table.rows) |row| {
+            var fields: [columns.len][]const u8 = undefined;
+            for (&fields, columns) |*slot, name| {
+                slot.* = if (table.columnIndex(name)) |i| row[i] else "";
+            }
+            try csvmod.writeRow(w, &fields);
+        }
+        try w.flush();
+    }
+    try std.Io.Dir.renameAbsolute(tmp, path, io);
+}
+
+/// Line numbers of rows whose field count does not match the header.
+///
+/// Exists so the caller refusing to migrate can name them. `parseFile` drops
+/// this on purpose — one broken row must not stop the other facts from being
+/// answered — but "not written, and here is why" needs the numbers.
+pub fn badRowLines(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]usize {
+    const source = (readAll(gpa, io, path) catch null) orelse return &.{};
+    defer gpa.free(source);
+    var table = try csvmod.parse(gpa, source);
+    defer table.deinit(gpa);
+    return gpa.dupe(usize, table.bad_rows);
+}
+
+fn readAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    if (size == 0) return null;
+    const source = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(source);
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    try reader.interface.readSliceAll(source);
+    return source;
+}
+
 /// Append one fact to `facts.csv`, creating the file with a header if needed.
 ///
 /// Appending rather than updating is the whole design: a changed value is a new
 /// row with a new `at`, the old row stays, and "how do I undo this" is answered
 /// by version control instead of by an undo feature.
+///
+/// The header is brought up to date first, because the parser rejects any row
+/// whose field count differs from the header — in both directions, since a row
+/// that has drifted is corruption rather than a value to guess at. A writer that
+/// emits today's seven fields into a file whose header still says six therefore
+/// does not add a fact; it adds a bad row, and `remember-fact` prints "appended"
+/// over something nothing will ever read back. That was live for **every**
+/// `remember-fact` on a file created before `scope`, not only the ones that pass
+/// `--scope`.
 pub fn append(
+    gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     key: []const u8,
@@ -358,6 +441,8 @@ pub fn append(
     note: []const u8,
     scope: []const u8,
 ) !void {
+    try migrateHeader(gpa, io, path);
+
     const exists = blk: {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch break :blk false;
         break :blk true;

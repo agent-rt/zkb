@@ -510,7 +510,23 @@ pub fn rememberFact(
     var today_buf: [32]u8 = undefined;
     const recorded = try isoDate(&today_buf, io);
 
-    try zkb.facts.append(io, layout.facts, key, value, effective, recorded, "user", note, scope);
+    zkb.facts.append(gpa, io, layout.facts, key, value, effective, recorded, "user", note, scope) catch |err| switch (err) {
+        // The header predates a column *and* rows are already malformed. Those
+        // rows are the data at risk — most likely ones a newer zkb appended and
+        // nothing has been able to read since — so the file is left exactly as
+        // it is. A stack trace would be the wrong answer to a file the person
+        // can open and fix.
+        error.StaleHeaderWithBadRows => {
+            const lines = zkb.facts.badRowLines(gpa, io, layout.facts) catch &.{};
+            defer gpa.free(lines);
+            try w.print("{s}: {d} row(s) do not match the header", .{ layout.facts, lines.len });
+            for (lines, 0..) |n, i| try w.print("{s}{d}", .{ if (i == 0) " — line " else ", ", n });
+            try w.writeAll("\nnot written: the header is out of date, and widening it would drop those rows\n");
+            try w.writeAll("fix them (each row needs one field per header column), then retry\n");
+            return 2;
+        },
+        else => return err,
+    };
     try w.print("{s} = {s}  (effective {s}, recorded {s})\n", .{ key, value, effective, recorded });
     try w.print("appended to {s}\n", .{layout.facts});
     try warnIfUnversioned(io, w, layout.data);

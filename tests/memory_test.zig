@@ -463,3 +463,88 @@ const TmpCsv = struct {
         gpa.free(self.dir);
     }
 };
+
+test "appending to a file written before a column widens its header first" {
+    // The parser rejects a row whose field count differs from the header, in
+    // both directions. So a writer emitting today's seven fields into a file
+    // whose header still says six does not add a fact — it adds a bad row, and
+    // `remember-fact` prints "appended" over something nothing can read back.
+    // That was live for *every* `remember-fact` on a pre-`scope` file, not only
+    // the ones passing `--scope`.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = try TmpCsv.init(io, "facts-migrate",
+        \\key,value,at,recorded_at,src,note
+        \\height,178,2026-01-01,2026-01-02,user,原有的
+        \\salary,450000,2026-02-01,2026-02-02,user,"带,逗号的备注"
+        \\
+    );
+    defer tmp.deinit(io);
+
+    try zkb.facts.append(gpa, io, tmp.path, "weight", "70", "2026-08-24", "2026-08-24", "user", "新的", "");
+
+    const rows = try zkb.facts.currentAll(gpa, io, tmp.path);
+    defer {
+        for (rows) |r| r.deinit(gpa);
+        gpa.free(rows);
+    }
+    // Three: the new row is readable, and neither old row was lost to the
+    // widening — the failure mode of migrating the header on its own.
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.key, "salary")) continue;
+        // Quoting survives the rewrite; a comma inside a field is why the file
+        // is rewritten with the csv writer rather than by appending a column.
+        try testing.expectEqualStrings("带,逗号的备注", r.note);
+    }
+    const still_bad = try zkb.facts.badRowLines(gpa, io, tmp.path);
+    defer gpa.free(still_bad);
+    try testing.expectEqual(@as(usize, 0), still_bad.len);
+}
+
+test "a file that already has bad rows is refused, not rewritten" {
+    // Those rows are the data at risk — most likely ones a newer zkb appended
+    // and nothing has read since. `Table` keeps only their line numbers, so
+    // rewriting from it would quietly finish the job the bug started.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const before =
+        \\key,value,at,recorded_at,src,note
+        \\height,178,2026-01-01,2026-01-02,user,好行
+        \\lost,1,2026-02-01,2026-02-02,user,已经丢过的行,work
+        \\
+    ;
+    var tmp = try TmpCsv.init(io, "facts-badrows", before);
+    defer tmp.deinit(io);
+
+    try testing.expectError(
+        error.StaleHeaderWithBadRows,
+        zkb.facts.append(gpa, io, tmp.path, "weight", "70", "2026-08-24", "2026-08-24", "user", "", ""),
+    );
+
+    // Byte-for-byte untouched: refusing has to mean refusing, not "refused
+    // after writing most of it".
+    const after = try readWholeFile(io, tmp.path);
+    defer gpa.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    const lines = try zkb.facts.badRowLines(gpa, io, tmp.path);
+    defer gpa.free(lines);
+    try testing.expectEqualSlices(usize, &.{3}, lines);
+}
+
+fn readWholeFile(io: std.Io, path: []const u8) ![]u8 {
+    var f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(buf);
+    var rbuf: [4096]u8 = undefined;
+    var r = f.reader(io, &rbuf);
+    try r.interface.readSliceAll(buf);
+    return buf;
+}
