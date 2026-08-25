@@ -158,6 +158,19 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run.step);
 
     // ---------------------------------------------------------------- tests
+    //
+    // **`failed command: .../test --listen=-` is not a failure.** It is printed
+    // on green runs too: when the build runner's protocol connection to a test
+    // binary drops it says that, re-runs the binary plainly, and reports the
+    // real result. Read the exit code, or the `N pass (N total)` lines from
+    // `--summary all`. Two separate hours have gone into that line.
+    //
+    // A related thing that is not understood: the exit code of `zig build test`
+    // was observed non-zero on 4 of 12 runs one afternoon while the suite
+    // itself reported 249/249 every time, and has been green 21 runs in a row
+    // since — under load, after forced rebuilds, on a clean tree. No mechanism
+    // was found and nothing was changed for it. If it comes back, keep the
+    // stderr of the failing run; that is the piece nobody has yet.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/root.zig"),
