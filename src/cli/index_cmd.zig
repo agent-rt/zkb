@@ -38,6 +38,8 @@ fn registrationFrom(
     io: std.Io,
     env: *const std.process.Environ.Map,
     opts: Options,
+    /// What this collection already says about itself, when it exists.
+    existing: ?zkb.store.Store.CollectionRow,
     w: *Writer,
 ) !?Registration {
     if (opts.roots.len > 1 and opts.include.len > 0) {
@@ -50,12 +52,33 @@ fn registrationFrom(
         return error.ConflictingOptions;
     }
 
+    // With no `--root`, an existing collection keeps the one it has.
+    //
+    // The fallback used to be unconditional, so `zkb index --collection memory`
+    // — the most natural way to say "I edited a file in there, re-index it" —
+    // rebound the collection to `$HOME/docs` and returned 0. `recall` then
+    // answered from a completely different corpus, plausibly, with nothing
+    // anywhere saying so. See agent-rt/zkb#1.
+    //
+    // `$HOME/docs` stays the default for a collection that does not exist yet,
+    // which is the case it was written for.
     const default_root = if (opts.roots.len == 0) blk: {
+        if (existing) |row| break :blk row.root;
         const home = env.get("HOME") orelse return error.NoHomeDirectory;
         break :blk try std.fmt.allocPrint(arena, "{s}/docs", .{home});
     } else null;
 
     const given: []const []const u8 = if (default_root) |d| &.{d} else opts.roots;
+
+    // A root that is being changed is said out loud. Passing `--root` is
+    // explicit, so it is allowed — but a collection quietly pointing somewhere
+    // else afterwards is the failure this whole change is about, and one line
+    // is the difference between an explicit change and an unnoticed one.
+    if (existing) |row| {
+        if (opts.roots.len > 0 and !std.mem.eql(u8, row.root, try absolutize(arena, io, opts.roots[0]))) {
+            try w.print("collection \"{s}\": root {s} -> {s}\n", .{ row.name, row.root, opts.roots[0] });
+        }
+    }
 
     // Absolute, because the root is stored and later read by the daemon, whose
     // working directory has nothing to do with the one this command ran in.
@@ -74,11 +97,30 @@ fn registrationFrom(
         else => return e,
     };
 
+    // Filters the caller did not name come from the collection, for the same
+    // reason the root does — and not only so the stored row survives, which
+    // `coalesce` in `upsertCollection` already handles. **This run scans with
+    // them too.** Leaving them empty here kept the row intact while the scan
+    // itself walked past the filters and queued the files the collection
+    // exists to exclude: the record was right and the index was wrong, which
+    // is the harder half to notice.
+    const inherit: ?zkb.store.Store.CollectionRow =
+        if (opts.roots.len == 0 and opts.include.len == 0 and opts.extensions.len == 0)
+            existing
+        else
+            null;
+
     var include: std.ArrayList([]const u8) = .empty;
     for (folded.include) |p| try include.append(arena, p);
     for (opts.include) |p| try include.append(arena, p);
+    if (inherit) |row| {
+        if (row.include) |raw| for (try zkb.roots.splitList(arena, raw)) |p| try include.append(arena, p);
+    }
 
     var exts: std.ArrayList([]const u8) = .empty;
+    if (inherit) |row| {
+        if (row.extensions) |raw| for (try zkb.roots.splitList(arena, raw)) |e| try exts.append(arena, e);
+    }
     for (opts.extensions) |e| {
         // `--ext md` and `--ext .md` mean the same thing; the stored form has the
         // dot because that is what the matcher compares against.
@@ -130,9 +172,23 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // What the collection already is, read before anything is decided.
+    //
+    // A read-only connection, opened and closed before the daemon is contacted.
+    // The rule further down — that the ingest thread owns the only *write*
+    // connection — is about writers; one `SELECT` does not touch it, and the
+    // alternative is asking the daemon over the socket for something already
+    // sitting in a file this process can open.
+    const existing: ?zkb.store.Store.CollectionRow = blk: {
+        var db = zkb.store.open(try arena.dupeZ(u8, layout.db), .read_only) catch break :blk null;
+        defer db.close();
+        var s0 = zkb.store.Store.init(&db);
+        break :blk s0.collectionByName(arena, opts.collection) catch null;
+    };
+
     // Resolved before the daemon is contacted, so a bad flag combination is
     // rejected here rather than half-applied by whichever path runs.
-    const reg = (registrationFrom(arena, io, env, opts, w) catch |e| switch (e) {
+    const reg = (registrationFrom(arena, io, env, opts, existing, w) catch |e| switch (e) {
         error.ConflictingOptions => return 2,
         else => return e,
     }) orelse return 2;

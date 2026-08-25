@@ -350,6 +350,68 @@ test "a null filter keeps what is stored, so a root can be moved alone" {
     try testing.expectEqualStrings("*/memory/*.md", rows[0].include.?);
 }
 
+test "re-registering keeps the kind, which is what supplies the built-in filters" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    // A memory collection skips `archive/` because of its kind, not because of
+    // anything stored on the row. `zkb index` always says `.documents`, so this
+    // update used to turn a memory collection into a documents one — after
+    // which `recall` answered from memories that had been deliberately retired,
+    // and nothing said so. agent-rt/zkb#1.
+    _ = try s.upsertCollection("mem", "/a", .memory, null, null, 1);
+    _ = try s.upsertCollection("mem", "/b", .documents, null, null, 2);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const row = (try s.collectionByName(arena.allocator(), "mem")).?;
+    try testing.expectEqual(store.Store.Kind.memory, row.kind);
+    // The root it *was* asked to change still changes.
+    try testing.expectEqualStrings("/b", row.root);
+}
+
+test "collectionByName answers about one collection, or about none" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    _ = try s.upsertCollection("one", "/a", .documents, ".md", "keep/**", 1);
+    _ = try s.upsertCollection("two", "/b", .records, null, null, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = (try s.collectionByName(arena.allocator(), "one")).?;
+    try testing.expectEqualStrings("/a", a.root);
+    try testing.expectEqualStrings("keep/**", a.include.?);
+    try testing.expectEqual(store.Store.Kind.records, (try s.collectionByName(arena.allocator(), "two")).?.kind);
+    try testing.expect(try s.collectionByName(arena.allocator(), "nope") == null);
+}
+
+test "ensureCollectionKind corrects a kind that is already wrong" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    // The state agent-rt/zkb#1 left behind: a memory collection recorded as a
+    // documents one, so its built-in `archive/` exclusion is gone. Nothing
+    // repaired it — every path that knew the right kind stopped at "the row
+    // exists", which made the function's name a claim it did not keep.
+    _ = try s.upsertCollection("memory", "/m", .documents, null, null, 1);
+    const id = try s.ensureCollectionKind("memory", "/m", .memory, 2);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const row = (try s.collectionByName(arena.allocator(), "memory")).?;
+    try testing.expectEqual(id, row.id);
+    try testing.expectEqual(store.Store.Kind.memory, row.kind);
+    // It repairs the kind and nothing else: the root is not its business.
+    try testing.expectEqualStrings("/m", row.root);
+}
+
 test "collections created before v7 have no filters, not empty ones" {
     var db = try openMem();
     defer db.close();

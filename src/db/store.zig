@@ -62,6 +62,20 @@ pub const Store = struct {
         return self.ensureCollectionKind(name, root, .documents, now_ms);
     }
 
+    /// The collection by this name, with this kind — creating it if it is not
+    /// there and **correcting it if it is there with the wrong one**.
+    ///
+    /// It used to return the existing row untouched, which made the name a lie
+    /// and left no way back from agent-rt/zkb#1: `zkb index` had turned the
+    /// `memory` collection into a `documents` one, and since the kind is what
+    /// supplies the built-in filters, `recall` began answering from the 25
+    /// retired memories under `archive/`. Nothing repaired it — not `zkb
+    /// memory`, not a re-index — because every path that knew the right kind
+    /// stopped at "the row exists".
+    ///
+    /// The callers are the ones that own their kind: `memory`, `records`, and
+    /// the known roots in `index_cmd`. A caller that does not know had no
+    /// business calling this.
     pub fn ensureCollectionKind(
         self: *Store,
         name: []const u8,
@@ -69,11 +83,29 @@ pub const Store = struct {
         kind: Kind,
         now_ms: i64,
     ) Error!i64 {
-        {
-            var st = try self.db.prepare("SELECT id FROM collections WHERE name = ?1");
+        // The lookup gets a scope of its own so its `defer` runs before the
+        // repair statement is prepared: `finalize` does not clear the handle,
+        // so finalizing the same statement twice hands SQLite a pointer it has
+        // already freed.
+        const found: ?struct { id: i64, kind: Kind } = blk: {
+            var st = try self.db.prepare("SELECT id, kind FROM collections WHERE name = ?1");
             defer st.finalize();
             try st.bindText(1, name);
-            if (try st.step()) return st.columnI64(0);
+            if (!try st.step()) break :blk null;
+            break :blk .{
+                .id = st.columnI64(0),
+                .kind = std.meta.stringToEnum(Kind, st.columnText(1)) orelse .documents,
+            };
+        };
+        if (found) |row| {
+            if (row.kind != kind) {
+                var fix = try self.db.prepare("UPDATE collections SET kind = ?2 WHERE id = ?1");
+                defer fix.finalize();
+                try fix.bindI64(1, row.id);
+                try fix.bindText(2, @tagName(kind));
+                _ = try fix.step();
+            }
+            return row.id;
         }
         var st = try self.db.prepare(
             "INSERT INTO collections(name, root, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -112,9 +144,19 @@ pub const Store = struct {
         now_ms: i64,
     ) Error!i64 {
         if (try self.findCollection(name)) |id| {
+            // `kind` is deliberately not in the SET list. It is what the row is,
+            // not what a caller is asking for: the CLI always passes
+            // `.documents`, so re-indexing a `memory` or `records` collection
+            // used to turn it into a documents collection — and the kind is
+            // what supplies the built-in filters, so a `memory` collection
+            // silently stopped skipping `archive/` and `recall` began answering
+            // from memories that had been retired. See agent-rt/zkb#1.
+            //
+            // `extensions` and `include` coalesce for the same reason: a value
+            // the caller never mentioned is not a value they asked to clear.
             var st = try self.db.prepare(
                 \\UPDATE collections
-                \\   SET root = ?2, kind = ?3,
+                \\   SET root = ?2,
                 \\       extensions = coalesce(?4, extensions),
                 \\       include    = coalesce(?5, include)
                 \\ WHERE id = ?1
@@ -122,7 +164,6 @@ pub const Store = struct {
             defer st.finalize();
             try st.bindI64(1, id);
             try st.bindText(2, root);
-            try st.bindText(3, @tagName(kind));
             if (extensions) |v| try st.bindText(4, v) else try st.bindNull(4);
             if (include) |v| try st.bindText(5, v) else try st.bindNull(5);
             _ = try st.step();
@@ -181,6 +222,31 @@ pub const Store = struct {
             });
         }
         return out.items;
+    }
+
+    /// One collection by name, as it is stored.
+    ///
+    /// Exists so a command can reuse what a collection already says about
+    /// itself instead of inventing a default for anything the caller left out.
+    pub fn collectionByName(
+        self: *Store,
+        arena: std.mem.Allocator,
+        name: []const u8,
+    ) Error!?CollectionRow {
+        var st = try self.db.prepare(
+            "SELECT id, name, root, kind, extensions, include FROM collections WHERE name = ?1",
+        );
+        defer st.finalize();
+        try st.bindText(1, name);
+        if (!try st.step()) return null;
+        return .{
+            .id = st.columnI64(0),
+            .name = try arena.dupe(u8, st.columnText(1)),
+            .root = try arena.dupe(u8, st.columnText(2)),
+            .kind = std.meta.stringToEnum(Kind, st.columnText(3)) orelse .documents,
+            .extensions = if (st.columnIsNull(4)) null else try arena.dupe(u8, st.columnText(4)),
+            .include = if (st.columnIsNull(5)) null else try arena.dupe(u8, st.columnText(5)),
+        };
     }
 
     pub fn collectionKind(self: *Store, id: i64) Error!Kind {
