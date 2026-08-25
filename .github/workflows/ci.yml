@@ -91,6 +91,21 @@ jobs:
           grep -q 'sel' <<<"$out" || { echo "FAIL: the registered collection is missing"; echo "$out"; exit 1; }
           grep -q "matching \*/memory/\*.md" <<<"$out" || { echo "FAIL: status should show why the count is 1"; echo "$out"; exit 1; }
 
+          # Re-indexing a collection by name must refresh it, not redefine it.
+          #
+          # `zkb index --collection sel` with no --root used to fall back to
+          # $HOME/docs and rewrite the collection to point there, exit 0, and
+          # say nothing — so `recall` began answering from a different corpus.
+          # The assertion is the scanned path, because that is what changed;
+          # `status` afterwards proves the filters came along with it.
+          rc=0
+          out=$("$bin" index --collection sel 2>&1) || rc=$?
+          [ "$rc" -eq 4 ] || { echo "FAIL: re-index expected exit 4, got $rc"; echo "$out"; exit 1; }
+          grep -q "scanning $tree" <<<"$out" || { echo "FAIL: re-index should reuse the stored root, not \$HOME/docs"; echo "$out"; exit 1; }
+          grep -q 'seen 1,' <<<"$out" || { echo "FAIL: re-index should keep the stored filters"; echo "$out"; exit 1; }
+          out=$("$bin" status 2>&1)
+          grep -q "matching \*/memory/\*.md" <<<"$out" || { echo "FAIL: the filters are gone after a re-index"; echo "$out"; exit 1; }
+
           # Disjoint roots would make the collection root '/'. Refusing beats
           # walking the filesystem and looking like a hang.
           rc=0
