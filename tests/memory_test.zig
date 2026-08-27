@@ -429,6 +429,42 @@ test "a labelled fact is injected only for its own scope" {
     }
 }
 
+test "currentInScope applies that rule, so both recall transports get one answer" {
+    // `inScope` was right all along; what was missing was a caller that applied
+    // it on both paths. The CLI filtered; `handleRecall` read `currentAll` and
+    // rendered everything it found — so a scoped recall hid another label's
+    // memories while printing that label's facts, on the transport that normally
+    // serves. One function now, so there is one behaviour to be wrong about.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = try TmpCsv.init(io, "facts-currentinscope",
+        \\key,value,at,recorded_at,src,note,scope
+        \\height,178,2026-01-01,2026-01-02,user,,
+        \\salary,450000,2026-01-01,2026-01-02,user,,work
+        \\
+    );
+    defer tmp.deinit(io);
+
+    for ([_]struct { scope: ?[]const u8, want: usize }{
+        // No scope named: universal only. This is what an unset `--scope` means,
+        // and what an absent field on the wire has to keep meaning.
+        .{ .scope = null, .want = 1 },
+        .{ .scope = "work", .want = 2 },
+        // The leak, stated as a test: another label must not see it.
+        .{ .scope = "personal", .want = 1 },
+    }) |c| {
+        const rows = try zkb.facts.currentInScope(gpa, io, tmp.path, c.scope);
+        defer {
+            for (rows) |r| r.deinit(gpa);
+            gpa.free(rows);
+        }
+        try testing.expectEqual(c.want, rows.len);
+        for (rows) |r| try testing.expect(r.inScope(c.scope));
+    }
+}
+
 const scoped_csv =
     \\key,value,at,recorded_at,src,note,scope
     \\salary,450000,2026-01-01,2026-01-02,user,月額,work

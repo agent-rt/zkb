@@ -245,6 +245,44 @@ fn parseFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?struct {
 /// This is what `recall` injects. Numeric facts must not be reached by search —
 /// a stale narrative mentioning last year's salary would be retrieved just as
 /// happily as the fact itself (SPEC §15.5).
+/// `currentAll`, narrowed to what `scope` is allowed to see.
+///
+/// Here rather than at each call site, because leaving it at the call sites is
+/// how the two recall transports came apart: the CLI filtered, and the daemon
+/// read `currentAll` and rendered every fact it found. So `zkb recall --scope
+/// work` hid another label's *memories* while showing that label's *facts* — the
+/// leak a scope exists to prevent, on the transport that normally serves.
+///
+/// `zkb facts` keeps calling `currentAll`: showing everything is right when
+/// someone asked for it, and wrong when recall injects it unasked.
+pub fn currentInScope(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    scope: ?[]const u8,
+) ![]Current {
+    var all = try currentAll(gpa, io, path);
+    // `currentAll` hands over the elements as well as the slice, so a fact that
+    // does not survive has to be freed here — it has no other owner. The
+    // survivors are compacted down, which leaves no moment where a `Current`
+    // belongs to neither slice.
+    var kept: usize = 0;
+    for (all) |c| {
+        if (c.inScope(scope)) {
+            all[kept] = c;
+            kept += 1;
+        } else c.deinit(gpa);
+    }
+    errdefer {
+        for (all[0..kept]) |c| c.deinit(gpa);
+        gpa.free(all);
+    }
+    // Shrunk rather than returned as a subslice: the caller frees what it is
+    // handed, and a subslice is not the allocation the allocator gave out.
+    if (kept != all.len) all = try gpa.realloc(all, kept);
+    return all;
+}
+
 pub fn currentAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]Current {
     var parsed = (try parseFile(gpa, io, path)) orelse return &.{};
     defer parsed.deinit(gpa);

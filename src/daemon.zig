@@ -686,9 +686,7 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
 /// would break the single-writer invariant this daemon is built on.
 fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.Request) !void {
     const query = req.str("query") orelse "";
-    var cfg: recallmod.Config = .{};
-    if (req.int("budget")) |b| cfg.budget_tokens = @intCast(@max(0, b));
-    if (req.int("candidates")) |c| cfg.candidates = @intCast(@max(1, c));
+    const cfg = recallConfig(req);
 
     var vec: ?[]f32 = null;
     defer if (vec) |v| st.gpa.free(v);
@@ -700,8 +698,10 @@ fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
     }
 
     // Facts come from `facts.csv`, not from the index: the index can be stale or
-    // mid-rebuild, and a stale salary reads exactly like a current one.
-    const current = factsmod.currentAll(st.gpa, st.io, st.layout.facts) catch &.{};
+    // mid-rebuild, and a stale salary reads exactly like a current one. Scoped by
+    // the same function the CLI uses — this handler called `currentAll` and
+    // rendered every fact, which made `--scope` leak here and only here.
+    const current = factsmod.currentInScope(st.gpa, st.io, st.layout.facts, cfg.scope) catch &.{};
     defer {
         for (current) |f| f.deinit(st.gpa);
         st.gpa.free(current);
@@ -906,6 +906,26 @@ fn searchConfig(req: *const proto.Request, top_k: usize, max_per_doc: ?usize) hy
         .path = req.str("path"),
         .max_per_doc = max_per_doc,
     };
+}
+
+/// Every `recall` knob a request can carry, in one place — `searchConfig` for the
+/// other half of retrieval, and it exists for the same reason.
+///
+/// `handleRecall` used to read three of them inline and never look for `scope`,
+/// so a scoped recall was honoured without a daemon and ignored with one. The
+/// pairing that matters is with `memory_cmd.requestParams`: one function writes
+/// the knobs, one reads them, and a knob added to `recall.Config` has two obvious
+/// places to be wired rather than a hand-rolled json literal to be missed.
+fn recallConfig(req: *const proto.Request) recallmod.Config {
+    var cfg: recallmod.Config = .{};
+    if (req.int("budget")) |b| cfg.budget_tokens = @intCast(@max(0, b));
+    if (req.int("candidates")) |c| cfg.candidates = @intCast(@max(1, c));
+    if (req.int("recency_depth")) |d| cfg.recency_depth = @intCast(@max(0, d));
+    // Absent means null means universal-only, which is what the CLI means by an
+    // unset `--scope`. No `orelse ""`: an empty scope is a *stored* value, not
+    // the absence of one.
+    cfg.scope = req.str("scope");
+    return cfg;
 }
 
 fn searchAndWrite(

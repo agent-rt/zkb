@@ -221,12 +221,27 @@ test "every retrieval command puts its filters on the wire" {
     // Each command builds its params here, so a new one that forgets
     // `proto.writeFilters` fails on the row someone adds for it, and a new filter
     // added to `writeFilters` reaches all of them at once.
+    //
+    // `recall` was outside this for its whole life, and adding a row would not
+    // have brought it in: it hand-wrote its json inline, so there was no function
+    // for the table to call, and `--scope` was dropped on the wire exactly the way
+    // `--path` had been. What each row must carry is per-command, because what
+    // `recall` filters by is a scope and not a collection.
     const search_cmd = @import("search_cmd.zig");
+    const memory_cmd = @import("memory_cmd.zig");
+    const Pair = struct { key: []const u8, want: []const u8 };
+    const corpus_filters = &[_]Pair{
+        .{ .key = "collection", .want = "docs" },
+        .{ .key = "path", .want = "projects/qlit/**" },
+    };
 
     var buf: [1024]u8 = undefined;
     inline for (.{
-        .{ "query", requestParams, Options{ .query = "q", .collection = "docs", .path = "projects/qlit/**" } },
-        .{ "search", search_cmd.requestParams, search_cmd.Options{ .query = "q", .collection = "docs", .path = "projects/qlit/**" } },
+        .{ "query", requestParams, Options{ .query = "q", .collection = "docs", .path = "projects/qlit/**" }, corpus_filters },
+        .{ "search", search_cmd.requestParams, search_cmd.Options{ .query = "q", .collection = "docs", .path = "projects/qlit/**" }, corpus_filters },
+        .{ "recall", memory_cmd.requestParams, memory_cmd.RecallOptions{ .query = "q", .scope = "work" }, &[_]Pair{
+            .{ .key = "scope", .want = "work" },
+        } },
     }) |row| {
         var w = std.Io.Writer.fixed(&buf);
         const build = row[1];
@@ -241,11 +256,54 @@ test "every retrieval command puts its filters on the wire" {
         var req = try zkb.proto.parseRequest(testing.allocator, line);
         defer req.deinit();
 
-        try testing.expectEqualStrings("docs", req.str("collection") orelse
-            return testing.expect(false) catch @panic(row[0] ++ ": collection never reached the wire"));
-        try testing.expectEqualStrings("projects/qlit/**", req.str("path") orelse
-            return testing.expect(false) catch @panic(row[0] ++ ": path never reached the wire"));
+        for (row[3]) |pair| {
+            const got = req.str(pair.key) orelse {
+                std.debug.print("{s}: {s} never reached the wire\n", .{ row[0], pair.key });
+                return error.FilterDroppedOnTheWire;
+            };
+            try testing.expectEqualStrings(pair.want, got);
+        }
     }
+}
+
+test "recall's numeric knobs reach the wire, not only its filter" {
+    // `recency_depth` is the other field the hand-written params dropped. It has
+    // no CLI flag today, so nothing would have noticed — which is the reason to
+    // pin it here rather than leave it for a future flag to discover.
+    const memory_cmd = @import("memory_cmd.zig");
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try memory_cmd.requestParams(&w, .{
+        .query = "q",
+        .budget = 700,
+        .candidates = 9,
+        .recency_depth = 4,
+    });
+
+    const line = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"id\":1,\"method\":\"recall\",\"params\":{s}}}",
+        .{w.buffered()},
+    );
+    defer testing.allocator.free(line);
+    var req = try zkb.proto.parseRequest(testing.allocator, line);
+    defer req.deinit();
+
+    try testing.expectEqual(@as(?i64, 700), req.int("budget"));
+    try testing.expectEqual(@as(?i64, 9), req.int("candidates"));
+    try testing.expectEqual(@as(?i64, 4), req.int("recency_depth"));
+}
+
+test "an unset scope stays absent, rather than becoming an empty string" {
+    // The same inversion as the empty glob, and worse here: `""` is not "no
+    // scope", it is how a *universal* memory records its scope. Written
+    // unconditionally, "the caller named none" would arrive as "the caller asked
+    // for the one whose name is empty".
+    const memory_cmd = @import("memory_cmd.zig");
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try memory_cmd.requestParams(&w, .{ .query = "q" });
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "scope") == null);
 }
 
 test "an unset filter stays absent, rather than becoming an empty string" {

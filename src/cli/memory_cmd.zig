@@ -271,22 +271,12 @@ pub fn recall(
     // The most important line in the memory system: numeric facts are
     // *injected*, never retrieved (SPEC §15.5, §16.5). Read from the csv, so it
     // works with no model loaded and no index built.
-    const all_current = zkb.facts.currentAll(gpa, io, layout.facts) catch &.{};
+    //
     // Filtered before rendering, not inside the renderer: `zkb facts` shows
     // everything on purpose (you asked for it), while recall is injected without
-    // anyone asking — which is the whole reason a scope exists.
-    //
-    // `currentAll` hands over the elements as well as the slice, so a fact that
-    // does not survive the filter has to be freed here — it has no other owner.
-    // The slice itself is freed either way; only what it held moves on.
-    defer gpa.free(all_current);
-    const current = blk: {
-        var keep: std.ArrayList(zkb.facts.Current) = .empty;
-        for (all_current) |c| {
-            if (c.inScope(opts.scope)) try keep.append(gpa, c) else c.deinit(gpa);
-        }
-        break :blk try keep.toOwnedSlice(gpa);
-    };
+    // anyone asking — which is the whole reason a scope exists. The filter lives
+    // in `facts` so the daemon applies the same one.
+    const current = zkb.facts.currentInScope(gpa, io, layout.facts, opts.scope) catch &.{};
     defer {
         for (current) |f| f.deinit(gpa);
         gpa.free(current);
@@ -341,6 +331,35 @@ pub fn recall(
 /// Returns null when no daemon is listening, so the caller falls back to doing
 /// it in-process. Worth trying first: the daemon has the model resident, which
 /// is the whole difference between 60ms and two seconds.
+/// Every `RecallOptions` field that changes the answer, written in one place.
+///
+/// This used to be three lines inside `recallViaDaemon`, carrying three of the
+/// five fields. The two it left out were `scope` and `recency_depth`, and nothing
+/// failed: with a daemon running, `zkb recall --scope work` answered with the
+/// universal memories and silently dropped the scoped one — measured, six
+/// documents without a daemon and five with.
+///
+/// That is precisely the bug `query_cmd`'s "every retrieval command puts its
+/// filters on the wire" was written to catch, and its guard could not reach here,
+/// because `recall` had never adopted this shape: there was no function for the
+/// table to call. Adding a row would not have helped; the missing thing was this.
+pub fn requestParams(w: *Writer, opts: RecallOptions) !void {
+    try w.writeAll("{\"query\":");
+    try std.json.Stringify.value(opts.query, .{}, w);
+    try w.print(",\"budget\":{d},\"candidates\":{d},\"recency_depth\":{d}", .{
+        opts.budget, opts.candidates, opts.recency_depth,
+    });
+    // Absent when unset, never `""`. An empty scope is not "no scope" — it is how
+    // a *universal* memory is stored (`memory.Meta.scope`) — so a field written
+    // unconditionally would turn "the caller named no scope" into "the caller
+    // asked for the scope whose name is empty" on the other side.
+    if (opts.scope) |s| {
+        try w.writeAll(",\"scope\":");
+        try std.json.Stringify.value(s, .{}, w);
+    }
+    try w.writeAll("}");
+}
+
 fn recallViaDaemon(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -353,9 +372,7 @@ fn recallViaDaemon(
 
     var pbuf: [8192]u8 = undefined;
     var pw = std.Io.Writer.fixed(&pbuf);
-    try pw.writeAll("{\"query\":");
-    try std.json.Stringify.value(opts.query, .{}, &pw);
-    try pw.print(",\"budget\":{d},\"candidates\":{d}}}", .{ opts.budget, opts.candidates });
+    try requestParams(&pw, opts);
 
     var resp = c.call(gpa, .recall, pw.buffered()) catch return null;
     defer resp.deinit(gpa);
