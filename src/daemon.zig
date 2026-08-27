@@ -140,6 +140,11 @@ pub const State = struct {
     running: std.atomic.Value(bool) = .init(true),
     started_ms: i64 = 0,
     conns: std.atomic.Value(usize) = .init(0),
+    /// Identity of the binary this process is running, reported in `health` so a
+    /// caller can tell whether the daemon is its own build. Read once at startup:
+    /// the file on disk gets replaced by upgrades, and what matters is the image
+    /// that is actually executing.
+    build_id: u64 = 0,
 
     pub fn shuttingDown(self: *State) bool {
         return !self.running.load(.acquire);
@@ -599,13 +604,18 @@ fn handleLine(st: *State, db: *sqlite.Db, w: *std.Io.Writer, line: []const u8) !
 fn handleHealth(st: *State, w: *std.Io.Writer, id: i64) !void {
     const d = st.queue.depth(st.io);
     try proto.beginOk(w, id);
+    // `build` is what a caller compares against its own binary. `version` cannot
+    // do it — every build between two releases carries the same string — and
+    // `protocol` has never been bumped and would rely on someone remembering to.
+    // A daemon that does not report this field is, by that fact, not this build.
     try w.print(
-        "{{\"version\":\"{s}\",\"protocol\":{d},\"uptime_ms\":{d},\"model_loaded\":{}," ++
+        "{{\"version\":\"{s}\",\"protocol\":{d},\"build\":{d},\"uptime_ms\":{d},\"model_loaded\":{}," ++
             "\"queue\":{{\"interactive\":{d},\"ingest\":{d}}},\"degraded\":",
         .{
             @import("root.zig").version,  proto.protocol_version,
-            nowMs(st.io) - st.started_ms, st.modelLoaded(),
-            d.interactive,                d.ingest,
+            st.build_id,                  nowMs(st.io) - st.started_ms,
+            st.modelLoaded(),             d.interactive,
+            d.ingest,
         },
     );
     if (st.degraded()) |reason| try std.json.Stringify.value(reason, .{}, w) else try w.writeAll("null");
@@ -1065,6 +1075,10 @@ pub fn run(
         .root = root,
         .model_path = model_path,
         .started_ms = nowMs(io),
+        // Zero when the executable cannot be stat'ed, which no caller will match:
+        // "cannot prove it is your build" and "is not your build" deserve the same
+        // answer.
+        .build_id = paths.selfBuildId(gpa, io) catch 0,
         .trace = tracemod.Writer.init(io, env, layout.trace),
         // Named here rather than left for `checkModelIdentity` to rediscover as
         // "model file not found": the reason a caller sees should be the one that

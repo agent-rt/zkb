@@ -137,6 +137,31 @@ extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 /// Zig 0.16 dropped `std.fs.selfExePathAlloc`, and argv[0] is not a substitute:
 /// it can be a bare name resolved through PATH, or a symlink. The daemon has to
 /// re-spawn *itself*, so exactness matters more than portability here.
+/// Identity of the binary that is running, as size and mtime of its file.
+///
+/// Not the version string, which cannot do this job: `build.zig.zon` reads
+/// `0.0.25` for every build between two releases, so a version comparison cannot
+/// tell a freshly built binary from the release it branched off — and that is
+/// exactly the pair that has to be distinguishable while a fix is being verified.
+/// Measured: the installed daemon and the build under test both reported 0.0.25
+/// while behaving differently.
+///
+/// Not a content hash either: hashing tens of megabytes on the way to a 20ms
+/// query is a cost with no matching gain. Two different builds landing on the
+/// same size *and* the same mtime is not a case worth paying for, and the penalty
+/// for guessing wrong is one unnecessary daemon restart.
+pub fn selfBuildId(gpa: std.mem.Allocator, io: std.Io) !u64 {
+    const exe = try selfExe(gpa, io);
+    defer gpa.free(exe);
+
+    const f = try std.Io.Dir.openFileAbsolute(io, exe, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+
+    const mtime_ms: u64 = @bitCast(@as(i64, @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms))));
+    return st.size *% 31 +% mtime_ms;
+}
+
 pub fn selfExe(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     switch (@import("builtin").os.tag) {
         .macos, .ios => {

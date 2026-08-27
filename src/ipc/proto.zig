@@ -35,6 +35,30 @@ pub const Method = enum {
     pub fn parse(s: []const u8) ?Method {
         return std.meta.stringToEnum(Method, s);
     }
+
+    /// Whether serving this from a daemon built from a different binary would be
+    /// wrong rather than merely old.
+    ///
+    /// A stale daemon does not announce itself: it answers every request in the
+    /// code it was started with. Measured — a daemon left running across an
+    /// upgrade leaked one scope's facts into another's recall while the caller,
+    /// being new, formatted the answer in the new layout. It looked upgraded and
+    /// behaved old, which is the worst of the two.
+    ///
+    /// The control methods must stay reachable no matter how stale the daemon is:
+    /// `shutdown` is how a stale one gets replaced, and refusing it would make the
+    /// condition unrecoverable without hunting a pid. `health` and `stats` are how
+    /// it gets diagnosed, and they report what the daemon is rather than answering
+    /// out of the index.
+    ///
+    /// Exhaustive on purpose: a method added later cannot avoid deciding which of
+    /// the two it is.
+    pub fn needsCurrentBuild(self: Method) bool {
+        return switch (self) {
+            .health, .stats, .shutdown => false,
+            .search, .query, .recall, .index, .collection_rm, .collection_checks, .maintain => true,
+        };
+    }
 };
 
 pub const ErrorCode = enum {

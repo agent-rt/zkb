@@ -167,6 +167,57 @@ test "the daemon comes up without a model and says so" {
     }.f);
 }
 
+test "health carries the daemon's build, and it is the build that is running" {
+    // What a caller compares against its own binary to decide whether the daemon
+    // is its own. `version` cannot serve: every build between two releases
+    // reports the same string, so a daemon left running across a rebuild claims
+    // to be the binary that replaced it — measured, and it answered a scoped
+    // recall with another scope's facts while the caller formatted the reply in
+    // the new layout.
+    try withIo(struct {
+        fn f(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var env = try envFor(&home);
+            defer env.deinit();
+
+            const server = try Server.start(io, &env, &home);
+            var client = try Server.waitReady(io, home.sock);
+            defer {
+                client.close();
+                server.stop(io, home.sock);
+            }
+
+            var resp = try client.call(gpa, .health, "{}");
+            defer resp.deinit(gpa);
+            try testing.expect(resp.ok);
+
+            const build = resp.result.?.object.get("build") orelse
+                return error.HealthCarriesNoBuild;
+            try testing.expect(build == .integer);
+            // The daemon under test is spawned from this same executable, so the
+            // two must agree. If they ever do not, every command would silently
+            // take the in-process path and nothing else would say why.
+            const mine = try zkb.paths.selfBuildId(gpa, io);
+            try testing.expectEqual(mine, @as(u64, @bitCast(build.integer)));
+        }
+    }.f);
+}
+
+test "only the methods that read the index require a current daemon" {
+    // The classification that keeps a stale daemon recoverable. `shutdown` is how
+    // one gets replaced and `health`/`stats` are how it gets diagnosed, so
+    // refusing those would turn a slow path into a state nobody can get out of
+    // without hunting a pid.
+    const M = zkb.proto.Method;
+    for ([_]M{ .health, .stats, .shutdown }) |m| {
+        try testing.expect(!m.needsCurrentBuild());
+    }
+    for ([_]M{ .search, .query, .recall, .index, .collection_rm, .collection_checks, .maintain }) |m| {
+        try testing.expect(m.needsCurrentBuild());
+    }
+}
+
 test "a registration crossing the real socket lands with every field intact" {
     // The daemon half of what `roots_test.zig` checks in process. That one drives
     // the serialiser and the parser directly; this one puts them at opposite ends

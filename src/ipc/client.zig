@@ -6,12 +6,15 @@
 
 const std = @import("std");
 const proto = @import("proto.zig");
+const paths = @import("../util/paths.zig");
 
 pub const Error = error{
     DaemonNotRunning,
     ConnectFailed,
     ResponseTooLong,
     ConnectionClosed,
+    /// The daemon is running a different binary than this process.
+    DaemonStale,
 };
 
 pub const Response = struct {
@@ -37,6 +40,61 @@ pub const Client = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
     next_id: i64 = 1,
+    /// Whether the daemon has been shown to be this build. Null until asked.
+    build_checked: ?bool = null,
+
+    /// Refuse to be answered by a daemon running a different binary.
+    ///
+    /// The check has to live on this side. A stale daemon executes only the code
+    /// it was started with, so it cannot notice that it is stale, and no field
+    /// added to the request will ever be read by it. What the caller can do is
+    /// ask what the daemon is, and treat anything but its own build as a daemon
+    /// that is not there.
+    ///
+    /// Silence counts as a mismatch. A daemon predating the `build` field answers
+    /// `health` without it, and that absence is the only evidence such a daemon
+    /// can give — which is exactly the case that has to be caught, since it is the
+    /// state every upgrade leaves behind.
+    ///
+    /// One round trip per process, on the first request that needs it. `health`
+    /// touches no model and no index.
+    /// The error set is written out rather than inferred: this calls `call`, and
+    /// `call` calls this, so leaving both to inference is a dependency loop.
+    fn requireCurrentBuild(self: *Client, gpa: std.mem.Allocator) error{DaemonStale}!void {
+        if (self.build_checked) |ok| return if (ok) {} else error.DaemonStale;
+
+        // Marked before the call so the `health` request below cannot recurse:
+        // `health` does not need a current build, but the flag also keeps a
+        // failure from being retried once per call.
+        self.build_checked = false;
+
+        var resp = self.call(gpa, .health, "{}") catch return error.DaemonStale;
+        defer resp.deinit(gpa);
+
+        const mine = paths.selfBuildId(gpa, self.io) catch return error.DaemonStale;
+        const theirs: ?u64 = blk: {
+            const r = resp.result orelse break :blk null;
+            if (r != .object) break :blk null;
+            const v = r.object.get("build") orelse break :blk null;
+            break :blk switch (v) {
+                .integer => |i| @bitCast(i),
+                else => null,
+            };
+        };
+
+        if (theirs == null or theirs.? != mine) {
+            // stderr, not the command's writer: the fallback that follows owns
+            // stdout, and `--json` callers parse it. A note printed there would
+            // corrupt the very output it was trying to explain.
+            std.debug.print(
+                "note: the running zkb daemon is a different build; using the slower in-process path\n" ++
+                    "      to fix: zkb daemon stop && zkb daemon start\n",
+                .{},
+            );
+            return error.DaemonStale;
+        }
+        self.build_checked = true;
+    }
 
     pub fn connect(io: std.Io, sock_path: []const u8) Error!Client {
         const addr = std.Io.net.UnixAddress.init(sock_path) catch return error.ConnectFailed;
@@ -62,6 +120,8 @@ pub const Client = struct {
         method: proto.Method,
         params_json: []const u8,
     ) !Response {
+        if (method.needsCurrentBuild()) try self.requireCurrentBuild(gpa);
+
         const id = self.next_id;
         self.next_id += 1;
 
