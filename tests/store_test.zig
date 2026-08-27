@@ -412,6 +412,42 @@ test "ensureCollectionKind corrects a kind that is already wrong" {
     try testing.expectEqualStrings("/m", row.root);
 }
 
+test "correcting a kind requeues the documents the wrong kind mis-indexed" {
+    var db = try openMem();
+    defer db.close();
+    try schema.migrate(&db);
+    var s = store.Store.init(&db);
+
+    // Repairing the row is not repairing the damage. `indexer.indexOne` writes
+    // the per-chunk projections only when the collection's kind says to, so every
+    // document indexed under a wrong kind lost its `rec_memory` row and would
+    // never get it back on its own: the files did not change, so `scan` calls
+    // them unchanged forever. Measured once for real — all 40 memories invisible
+    // to `recall` for two days while `status` kept counting all 40.
+    const cid = try s.upsertCollection("memory", "/m", .documents, null, null, 1);
+    const did = try s.upsertDocContent(cid, "one.md", "sha", 10, 1);
+    try s.markIndexed(did, 1, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const before = try s.listPending(arena.allocator(), cid, 10);
+    try testing.expectEqual(@as(usize, 0), before.items.len);
+
+    _ = try s.ensureCollectionKind("memory", "/m", .memory, 2);
+
+    const after = try s.listPending(arena.allocator(), cid, 10);
+    try testing.expectEqual(@as(usize, 1), after.items.len);
+    try testing.expectEqualStrings("one.md", after.items[0].rel_path);
+
+    // And only when something was actually wrong. This runs on every `remember`
+    // and every index pass, so a kind that already agrees must cost nothing —
+    // otherwise the repair becomes a full re-embed on a normal command.
+    try s.markIndexed(did, 1, 3);
+    _ = try s.ensureCollectionKind("memory", "/m", .memory, 4);
+    const idempotent = try s.listPending(arena.allocator(), cid, 10);
+    try testing.expectEqual(@as(usize, 0), idempotent.items.len);
+}
+
 test "collections created before v7 have no filters, not empty ones" {
     var db = try openMem();
     defer db.close();

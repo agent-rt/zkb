@@ -692,3 +692,51 @@ test "a namespace convention file is content, and has to be linked like content"
     try testing.expectEqual(@as(usize, 1), report.count(.orphan));
     try testing.expectEqualStrings("projects/b/zkb.md", report.findings[0].path);
 }
+
+test "an indexed memory with no projection row is reported" {
+    // The failure this exists for: `recall` ranks memories out of `rec_memory`
+    // alone, so a missing row makes a memory unrankable while `status` still
+    // counts the document and `search` still finds its chunks. Every surface that
+    // could have contradicted the empty recall was reading a different table, and
+    // 40 of 40 memories stayed missing for two days behind "No memories yet".
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.upsertCollection("memory", "/tmp/memory", .memory, null, null, 1000);
+    _ = try addDoc(&s, cid, "one.md", "# One\n\nbody\n");
+
+    var report = try maintain.run(gpa, &db, .{ .checks = &.{.unprojected_memory} });
+    defer report.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), report.count(.unprojected_memory));
+    try testing.expectEqualStrings("memory", report.findings[0].path);
+    try testing.expect(std.mem.indexOf(u8, report.findings[0].detail, "1 indexed memories") != null);
+}
+
+test "a projected memory, and any document collection, are left alone" {
+    // The other half: a check that fires on a healthy corpus is worse than none,
+    // and this one would otherwise report every document in the knowledge base —
+    // no `documents` collection has a `rec_memory` row, and none should.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const mem_cid = try s.upsertCollection("memory", "/tmp/memory", .memory, null, null, 1000);
+    const did = try addDoc(&s, mem_cid, "one.md", "# One\n\nbody\n");
+    const chunk_id = (try db.queryI64("SELECT id FROM chunks WHERE doc_id = 1")).?;
+    try zkb.memory.replaceMeta(&db, did, chunk_id, .{
+        .type = .feedback,
+        .status = .active,
+        .created = "2026-08-27",
+        .source = "t",
+        .subjects = "",
+        .refs = "",
+        .scope = "",
+    });
+
+    const doc_cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    _ = try addDoc(&s, doc_cid, "a.md", "# A\n\nbody\n");
+
+    var report = try maintain.run(gpa, &db, .{ .checks = &.{.unprojected_memory} });
+    defer report.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), report.count(.unprojected_memory));
+}

@@ -67,6 +67,23 @@ pub const Check = enum {
     /// whose document is gone carries no information and cannot be re-derived.
     /// It is always garbage, which is why this one has a repair.
     orphan_chunk,
+    /// An indexed memory with no `rec_memory` row.
+    ///
+    /// The mirror image of `orphan_chunk`, and it went undetected the same way.
+    /// `recall` ranks memories by recency out of that projection alone
+    /// (`memory.recencyRanked`), so a missing row makes the memory invisible to
+    /// recall while `status` still counts the document and `search` still finds
+    /// its chunks. Every surface that could have contradicted the empty result
+    /// was reading a different table.
+    ///
+    /// Measured: all 40 rows vanished when a collection was re-indexed under the
+    /// wrong `kind`, and nothing noticed for two days — `status` said 40
+    /// documents, `doctor` passed 10 of 10, and the only symptom was `recall`
+    /// saying the store was empty.
+    ///
+    /// No judgment in this one either: the projection is derived from frontmatter
+    /// and either covers the indexed documents or does not.
+    unprojected_memory,
 
     /// Checks that run by default.
     ///
@@ -78,9 +95,9 @@ pub const Check = enum {
     /// Still available via `--check no_frontmatter`.
     pub fn default() []const Check {
         return &.{
-            .index_failed,      .broken_link, .orphan,         .not_in_index,
-            .fragment,          .oversized,   .near_duplicate, .duplicate_content,
-            .orphan_chunk,
+            .index_failed,      .broken_link,  .orphan,         .not_in_index,
+            .fragment,          .oversized,    .near_duplicate, .duplicate_content,
+            .orphan_chunk,      .unprojected_memory,
         };
     }
 
@@ -89,6 +106,7 @@ pub const Check = enum {
             .index_failed,      .broken_link, .orphan,          .not_in_index,
             .fragment,          .oversized,   .island,          .near_duplicate,
             .duplicate_content, .stale,       .no_frontmatter,  .orphan_chunk,
+            .unprojected_memory,
         };
     }
 
@@ -110,6 +128,12 @@ pub const Check = enum {
             // Failures of zkb's own machinery. Corpus conventions do not enter
             // into it, so these hold everywhere.
             .index_failed, .orphan_chunk => true,
+
+            // Also zkb's own machinery, but only one kind has the projection to
+            // be missing. Scoped by kind rather than answered `true` so a
+            // documents collection cannot be told to re-index over a row it was
+            // never supposed to have.
+            .unprojected_memory => kind == .memory,
 
             // Wiki conventions: something links here, an index lists it, links
             // resolve, a topic has neighbours. A memory corpus follows none of
@@ -237,6 +261,7 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, opts: Options) !Report {
         .oversized => try checkOversized(gpa, db, &findings, opts.oversized_chunks),
         .no_frontmatter => try checkNoFrontmatter(gpa, db, &findings),
         .orphan_chunk => try checkOrphanChunks(gpa, db, &findings),
+        .unprojected_memory => try checkUnprojectedMemories(gpa, db, &findings),
         // Handled together below: all four read the same KNN pass.
         .near_duplicate, .duplicate_content, .island, .stale => {},
     };
@@ -507,6 +532,44 @@ fn checkOrphanChunks(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList
         .{ chunks, docs },
     );
     try add(gpa, out, .orphan_chunk, 0, key, "(index)", detail);
+}
+
+/// Indexed memories with no row in `rec_memory`, per collection.
+///
+/// One finding per collection rather than per document: they always break as a
+/// set — the projection is written in the same transaction as the chunks, so
+/// whatever skipped it skipped it for every document that pass touched — and
+/// forty identical findings would say the same thing forty times while burying
+/// everything else in the report.
+///
+/// The finding carries the real collection id, so `defaultFor` can scope it to
+/// memory collections and `--collection` can select it.
+fn checkUnprojectedMemories(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
+    var st = try db.prepare(
+        \\SELECT d.collection_id, c.name, count(*)
+        \\FROM docs d
+        \\JOIN collections c ON c.id = d.collection_id
+        \\LEFT JOIN rec_memory m ON m.doc_id = d.id
+        \\WHERE c.kind = 'memory' AND d.indexed_at IS NOT NULL AND m.doc_id IS NULL
+        \\GROUP BY d.collection_id, c.name
+    );
+    defer st.finalize();
+
+    while (try st.step()) {
+        const cid = st.columnI64(0);
+        const name = st.columnText(1);
+        const missing = st.columnI64(2);
+
+        var kbuf: [128]u8 = undefined;
+        var dbuf: [256]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kbuf, "unprojected_memory:{d}:{d}", .{ cid, missing });
+        const detail = try std.fmt.bufPrint(
+            &dbuf,
+            "{d} indexed memories have no metadata row; recall cannot rank them; run: zkb index --force",
+            .{missing},
+        );
+        try add(gpa, out, .unprojected_memory, cid, key, name, detail);
+    }
 }
 
 /// A document sitting next to an index.md that does not mention it. This encodes

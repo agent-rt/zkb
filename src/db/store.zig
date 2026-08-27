@@ -99,11 +99,33 @@ pub const Store = struct {
         };
         if (found) |row| {
             if (row.kind != kind) {
-                var fix = try self.db.prepare("UPDATE collections SET kind = ?2 WHERE id = ?1");
-                defer fix.finalize();
-                try fix.bindI64(1, row.id);
-                try fix.bindText(2, @tagName(kind));
-                _ = try fix.step();
+                {
+                    var fix = try self.db.prepare("UPDATE collections SET kind = ?2 WHERE id = ?1");
+                    defer fix.finalize();
+                    try fix.bindI64(1, row.id);
+                    try fix.bindText(2, @tagName(kind));
+                    _ = try fix.step();
+                }
+                // The kind is not a label on the row, it decides whether the
+                // per-chunk projections get written at all (`indexer.indexOne`).
+                // So a wrong kind does not merely misname a collection — every
+                // document re-indexed under it had its `rec_memory` row deleted
+                // and not rewritten, and correcting the row here cannot bring one
+                // of them back. Only re-indexing can, and nothing else would ever
+                // mark them dirty: the files did not change, so `scan` sees them
+                // as unchanged forever.
+                //
+                // Measured: a memory collection re-indexed under the wrong kind
+                // lost all 40 projection rows. `zkb status` kept reporting 40
+                // documents, `doctor` passed every check, and `recall` returned
+                // nothing for two days. Clearing the stamps is what makes the fix
+                // reach the data the wrong kind destroyed.
+                var requeue = try self.db.prepare(
+                    "UPDATE docs SET indexed_at = NULL, index_error = NULL WHERE collection_id = ?1",
+                );
+                defer requeue.finalize();
+                try requeue.bindI64(1, row.id);
+                _ = try requeue.step();
             }
             return row.id;
         }
