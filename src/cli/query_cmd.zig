@@ -90,59 +90,32 @@ fn viaDaemon(
         try w.print("{s}\n", .{resp.line});
         return 0;
     }
-    try renderFromJson(w, resp.result.?, opts.query);
+    try renderFromJson(gpa, w, resp.result.?, opts.query);
     return 0;
 }
 
-/// Same output as the daemon path, rebuilt from its JSON. The markdown lives here
-/// rather than in the daemon so the wire format stays one thing.
-fn renderFromJson(w: *Writer, result: std.json.Value, query: []const u8) !void {
-    const obj = result.object;
-    try w.print("# Context for: {s}\n", .{query});
+/// Same output as the in-process path, rebuilt from the daemon's JSON. The
+/// markdown lives in `pack` rather than in the daemon so the wire format stays
+/// one thing and the rendering stays one function.
+///
+/// This used to render the markdown itself, and the copy had drifted: its
+/// `omitted` line listed the paths without the scores that decided which of them
+/// were dropped.
+fn renderFromJson(
+    gpa: std.mem.Allocator,
+    w: *Writer,
+    result: std.json.Value,
+    query: []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
 
-    if (obj.get("dropped_terms")) |dt| if (dt == .array and dt.array.items.len != 0) {
-        try w.writeAll("\n> not searched (unmatchable by the tokenizer):");
-        for (dt.array.items) |t| if (t == .string) try w.print(" {s}", .{t.string});
-        try w.writeAll("\n");
-    };
-
-    const docs = if (obj.get("documents")) |d| (if (d == .array) d.array.items else &.{}) else &.{};
-    if (docs.len == 0) {
-        const om = if (obj.get("omitted")) |o| (if (o == .array) o.array.items else &.{}) else &.{};
-        const nameOf = struct {
-            fn f(v: std.json.Value) []const u8 {
-                return str(v.object, "path");
-            }
-        }.f;
-        try zkb.pack.renderEmpty(w, @intCast(@max(0, int(obj, "budget_tokens"))), om, nameOf);
-        return;
-    }
-
-    for (docs) |d| {
-        const o = d.object;
-        try w.print("\n## {s}/{s}\n", .{ str(o, "collection"), str(o, "path") });
-        const spans = if (o.get("spans")) |sp| (if (sp == .array) sp.array.items else &.{}) else &.{};
-        for (spans) |sv| {
-            const so = sv.object;
-            const heading = str(so, "heading_path");
-            if (heading.len != 0) try w.print("> {s}\n", .{heading});
-            try w.print("\n{s}\n", .{str(so, "text")});
-        }
-    }
-
-    try w.writeAll("\n---\n");
-    if (obj.get("omitted")) |om| if (om == .array and om.array.items.len != 0) {
-        try w.writeAll("omitted (over budget):");
-        for (om.array.items, 0..) |ov, i| {
-            if (i != 0) try w.writeAll(",");
-            try w.print(" {s}", .{str(ov.object, "path")});
-        }
-        try w.writeAll("\n");
-    };
-    try w.print(
-        "tokens: {d} / {d} (approx, counted with the embedding model's tokenizer)\n",
-        .{ int(obj, "total_tokens"), int(obj, "budget_tokens") },
-    );
+    var pack = try zkb.pack.fromJson(arena_state.allocator(), result);
+    // The query as this process knows it, not the daemon's echo of it: `query` is
+    // never empty here, and an empty one makes `renderMarkdown` print recall's
+    // heading instead of this command's.
+    pack.query = query;
+    try zkb.pack.renderMarkdown(w, &pack);
 }
 
 /// Without a daemon the model has to be loaded here, which costs 1-2s. Reported
@@ -230,23 +203,6 @@ fn inProcess(
         },
     }
     return 0;
-}
-
-fn str(o: std.json.ObjectMap, key: []const u8) []const u8 {
-    const v = o.get(key) orelse return "";
-    return switch (v) {
-        .string => |s| s,
-        else => "",
-    };
-}
-
-fn int(o: std.json.ObjectMap, key: []const u8) i64 {
-    const v = o.get(key) orelse return 0;
-    return switch (v) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        else => 0,
-    };
 }
 
 const testing = std.testing;

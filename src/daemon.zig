@@ -524,7 +524,7 @@ fn checkModelIdentity(st: *State, db: *sqlite.Db) !void {
         if (!std.mem.eql(u8, stored, id)) {
             // Not repaired automatically: rebuilding every vector costs minutes
             // and burns battery, so it stays the user's explicit decision.
-            st.setDegraded("embedding model changed; semantic search disabled, run: zkb reindex");
+            st.setDegraded("embedding model changed; semantic search disabled, run: zkb index --force");
             return;
         }
     } else {
@@ -714,7 +714,10 @@ fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
     try proto.beginOk(w, req.id);
     try w.writeAll("{\"facts\":");
     try recallmod.renderFactsJson(w, current);
-    try w.writeAll(",\"memories\":");
+    // Without this the daemon path cannot tell an empty store from a broken
+    // projection, which is the difference `renderMemoriesMarkdown` exists to
+    // report. Same field, same name, as the in-process json.
+    try w.print(",\"memory_docs\":{d},\"memories\":", .{r.memory_docs});
     try packmod.renderJson(w, &r.pack);
     try w.writeAll("}");
     try proto.finishOk(w);

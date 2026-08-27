@@ -322,16 +322,15 @@ pub fn recall(
     switch (opts.format) {
         .markdown => {
             try zkb.recall.renderFactsMarkdown(w, current);
-            if (r.ranked.hits.len == 0) {
-                try w.writeAll("No memories yet. Record one with: zkb remember \"...\"\n");
-            } else {
-                try zkb.pack.renderMarkdown(w, &r.pack);
-            }
+            try zkb.recall.renderMemoriesMarkdown(w, &r.pack, r.memory_docs);
         },
         .json => {
             try w.writeAll("{\"facts\":");
             try zkb.recall.renderFactsJson(w, current);
-            try w.writeAll(",\"memories\":");
+            // On the wire for the same reason it is in the markdown, and in both
+            // json shapes because a field that exists on one transport only is
+            // how the two drifted in the first place.
+            try w.print(",\"memory_docs\":{d},\"memories\":", .{r.memory_docs});
             try zkb.pack.renderJson(w, &r.pack);
             try w.writeAll("}\n");
         },
@@ -369,45 +368,50 @@ fn recallViaDaemon(
         try w.print("{s}\n", .{resp.line});
         return 0;
     }
-    try renderRecallJson(w, resp.result.?);
+    try renderRecallJson(gpa, w, resp.result.?);
     return 0;
 }
 
-/// The same markdown as the in-process path, rebuilt from the daemon's JSON.
-/// Kept here rather than in the daemon so the wire format stays one thing.
-fn renderRecallJson(w: *Writer, result: std.json.Value) !void {
+/// The daemon's json, handed to the same two functions the in-process path uses.
+/// Rebuilt here rather than rendered in the daemon so the wire format stays one
+/// thing — but rebuilt into the *types* those functions take, not into a second
+/// renderer. This function used to be that second renderer, and it had drifted:
+/// `### x.md` for `## memory/x.md`, and no `omitted`/`tokens` footer at all.
+fn renderRecallJson(gpa: std.mem.Allocator, w: *Writer, result: std.json.Value) !void {
     const obj = result.object;
 
-    if (obj.get("facts")) |fv| if (fv == .array and fv.array.items.len != 0) {
-        try w.writeAll("## Facts (current values)\n\n");
-        for (fv.array.items) |item| {
-            const o = item.object;
-            try w.print("- {s}: {s}  (as of {s})", .{
-                jsonStr(o, "key"), jsonStr(o, "value"), jsonStr(o, "at"),
-            });
-            const note = jsonStr(o, "note");
-            if (note.len != 0) try w.print(" — {s}", .{note});
-            try w.writeAll("\n");
-        }
-        try w.writeAll("\n");
-    };
+    // Everything below borrows from `result`, which outlives this call.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const mem = obj.get("memories") orelse return;
-    const docs = if (mem.object.get("documents")) |d|
-        (if (d == .array) d.array.items else &.{})
+    const fact_items = if (obj.get("facts")) |fv|
+        (if (fv == .array) fv.array.items else &.{})
     else
         &.{};
-    if (docs.len == 0) {
-        try w.writeAll("No memories yet. Record one with: zkb remember \"...\"\n");
-        return;
+    const lines = try arena.alloc(zkb.recall.FactLine, fact_items.len);
+    for (fact_items, 0..) |item, i| {
+        const o = item.object;
+        lines[i] = .{
+            .key = jsonStr(o, "key"),
+            .value = jsonStr(o, "value"),
+            .at = jsonStr(o, "at"),
+            .note = jsonStr(o, "note"),
+        };
     }
-    try w.writeAll("## Memories\n");
-    for (docs) |d| {
-        const o = d.object;
-        try w.print("\n### {s}\n", .{jsonStr(o, "path")});
-        const spans = if (o.get("spans")) |sp| (if (sp == .array) sp.array.items else &.{}) else &.{};
-        for (spans) |sv| try w.print("\n{s}\n", .{jsonStr(sv.object, "text")});
-    }
+    try zkb.recall.renderFactsMarkdown(w, lines);
+
+    const mem = obj.get("memories") orelse return;
+    var pack = try zkb.pack.fromJson(arena, mem);
+    try zkb.recall.renderMemoriesMarkdown(w, &pack, jsonUsize(obj, "memory_docs"));
+}
+
+fn jsonUsize(o: std.json.ObjectMap, key: []const u8) usize {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| @intCast(@max(0, i)),
+        else => 0,
+    };
 }
 
 fn jsonStr(o: std.json.ObjectMap, key: []const u8) []const u8 {

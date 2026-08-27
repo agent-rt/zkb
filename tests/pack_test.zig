@@ -311,47 +311,69 @@ test "an empty pack says whether the corpus was silent or the budget was" {
     try testing.expect(std.mem.indexOf(u8, out, "No relevant documents") == null);
 }
 
-test "renderEmpty is one wording, whichever renderer reached it" {
-    // `query` rebuilds this markdown from the daemon's json rather than sharing
-    // the renderer, so the two are separate code paths by design. What must not
-    // drift is the sentence, so the sentence is what they share — and this holds
-    // the json-shaped caller to the same bytes as the pack-shaped one.
-    const Omitted = pack.Omitted;
-    const packName = struct {
-        fn f(o: Omitted) []const u8 {
-            return o.rel_path;
-        }
-    }.f;
-    const jsonName = struct {
-        fn f(v: std.json.Value) []const u8 {
-            return v.object.get("path").?.string;
-        }
-    }.f;
+/// A pack rendered directly, and the same pack rendered after a round trip
+/// through the json the daemon sends. Byte-identical or the transports have
+/// drifted.
+fn assertRoundTripRenders(p: *const pack.Pack) !void {
+    var direct_buf: [16384]u8 = undefined;
+    var direct = std.Io.Writer.fixed(&direct_buf);
+    try pack.renderMarkdown(&direct, p);
 
-    var a_buf: [512]u8 = undefined;
-    var a = std.Io.Writer.fixed(&a_buf);
-    try pack.renderEmpty(&a, 500, &[_]Omitted{
-        .{ .rel_path = "projects/qlit/PLAN.md", .score = 1 },
-        .{ .rel_path = "projects/qlit/REQ.md", .score = 0.5 },
-    }, packName);
+    var wire_buf: [16384]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_buf);
+    try pack.renderJson(&wire, p);
 
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        gpa,
-        \\[{"path":"projects/qlit/PLAN.md"},{"path":"projects/qlit/REQ.md"}]
-        ,
-        .{},
-    );
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, wire.buffered(), .{});
     defer parsed.deinit();
-    var b_buf: [512]u8 = undefined;
-    var b = std.Io.Writer.fixed(&b_buf);
-    try pack.renderEmpty(&b, 500, parsed.value.array.items, jsonName);
 
-    try testing.expectEqualStrings(a.buffered(), b.buffered());
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var rebuilt = try pack.fromJson(arena_state.allocator(), parsed.value);
 
-    // And an actually-empty result keeps the original sentence.
-    var c_buf: [256]u8 = undefined;
-    var c = std.Io.Writer.fixed(&c_buf);
-    try pack.renderEmpty(&c, 500, &[_]Omitted{}, packName);
-    try testing.expect(std.mem.indexOf(u8, c.buffered(), "No relevant documents found") != null);
+    var round_buf: [16384]u8 = undefined;
+    var round = std.Io.Writer.fixed(&round_buf);
+    try pack.renderMarkdown(&round, &rebuilt);
+
+    try testing.expectEqualStrings(direct.buffered(), round.buffered());
+}
+
+test "the daemon's json renders to the same markdown as the pack it came from" {
+    // The regression this exists for: `recall` and `query` each hand-wrote a
+    // markdown renderer for the daemon's json, and all three copies drifted from
+    // `renderMarkdown` — `### x.md` for `## memory/x.md`, a missing
+    // `omitted`/`tokens` footer, an `omitted` line without its scores. Every one
+    // of them was on the daemon side, which is the side that normally runs, so
+    // the drift was invisible from the path anyone tested.
+    //
+    // Asserting the bytes rather than the fields is the point: a renderer added
+    // later can only diverge by making this fail.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    try seed(&db, 2, 2, 50);
+
+    var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
+    defer results.deinit(gpa);
+    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 0 });
+    defer p.deinit(gpa);
+
+    try testing.expect(p.groups.len != 0);
+    try assertRoundTripRenders(&p);
+}
+
+test "a pack emptied by the budget survives the round trip with its omitted list" {
+    // The footer was the half the daemon path dropped, so the empty-but-omitted
+    // shape is the one worth pinning: it renders entirely out of the fields that
+    // used not to be read back.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    try seed(&db, 2, 2, 400);
+
+    var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
+    defer results.deinit(gpa);
+    var p = try pack.assemble(gpa, &db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
+    defer p.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 0), p.groups.len);
+    try testing.expect(p.omitted.len != 0);
+    try assertRoundTripRenders(&p);
 }

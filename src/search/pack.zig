@@ -406,12 +406,7 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
         try w.writeAll("\n");
     }
     if (pack.groups.len == 0) {
-        const nameOf = struct {
-            fn f(o: Omitted) []const u8 {
-                return o.rel_path;
-            }
-        }.f;
-        try renderEmpty(w, pack.budget_tokens, pack.omitted, nameOf);
+        try renderEmpty(w, pack.budget_tokens, pack.omitted);
         return;
     }
 
@@ -440,7 +435,7 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
     );
 }
 
-/// What an empty result actually means, said once for both renderers.
+/// What an empty result actually means.
 ///
 /// "No relevant documents found." was printed whenever no document survived
 /// assembly — including when several matched and every one of them was dropped
@@ -449,15 +444,12 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
 /// corpus had nothing. With `--path` that reads as "this project has nothing
 /// about it", which is a conclusion someone will act on.
 ///
-/// `nameOf` exists because the two renderers hold different element types — the
-/// pack's own `Omitted`, and the json the daemon sent back. The wording is what
-/// must not diverge, so the wording is the part that lives here.
-pub fn renderEmpty(
-    w: *std.Io.Writer,
-    budget: usize,
-    items: anytype,
-    comptime nameOf: fn (std.meta.Elem(@TypeOf(items))) []const u8,
-) !void {
+/// This took an `anytype` and a `comptime nameOf` for as long as a second,
+/// json-shaped renderer existed to call it: sharing the wording was as much as
+/// two renderers could share. `fromJson` retired that renderer, so the generality
+/// has no second caller left to reach and the parameter is the pack's own list
+/// again.
+fn renderEmpty(w: *std.Io.Writer, budget: usize, items: []const Omitted) !void {
     if (items.len == 0) {
         try w.writeAll("\nNo relevant documents found.\n");
         return;
@@ -466,7 +458,7 @@ pub fn renderEmpty(
         "\n{d} document(s) matched, and none fitted the {d}-token budget:\n",
         .{ items.len, budget },
     );
-    for (items) |it| try w.print("  {s}\n", .{nameOf(it)});
+    for (items) |it| try w.print("  {s}\n", .{it.rel_path});
     try w.writeAll("\nRaise --budget to see them.\n");
 }
 
@@ -511,4 +503,132 @@ pub fn renderJson(w: *std.Io.Writer, pack: *const Pack) !void {
         try w.print(",\"score\":{d:.6}}}", .{o.score});
     }
     try w.writeAll("]}");
+}
+
+/// A `Pack` rebuilt from the json a daemon sent back, so both transports render
+/// through `renderMarkdown` instead of each keeping a copy of it.
+///
+/// Every copy drifted. By the time this was written there were three, all of them
+/// on the daemon side — which is the side that normally runs, so the copy nobody
+/// compared was the copy everybody read. `recall` printed `### x.md` where the
+/// pack prints `## memory/x.md`; `recall` dropped the `omitted` and `tokens`
+/// footer entirely; `query` printed `omitted` without the scores. The footer is
+/// the one that cost something: listing what did not fit is what the pack is for
+/// (SPEC §5.4), and on the daemon path it had never happened.
+///
+/// Every string borrows from `v` and every slice comes from `arena`, so the
+/// parsed json must outlive the pack and `deinit` must never be called on it.
+/// That is why this takes an arena and not a gpa: the ownership here is *none*,
+/// and an allocator that frees per-allocation would invite a `deinit` that hands
+/// back memory belonging to the json.
+pub fn fromJson(arena: std.mem.Allocator, v: std.json.Value) !Pack {
+    if (v != .object) return error.InvalidPackJson;
+    const obj = v.object;
+
+    const doc_items = jsonArray(obj, "documents");
+    const groups = try arena.alloc(DocGroup, doc_items.len);
+    for (doc_items, 0..) |dv, i| {
+        if (dv != .object) return error.InvalidPackJson;
+        const d = dv.object;
+
+        const span_items = jsonArray(d, "spans");
+        const spans = try arena.alloc(Span, span_items.len);
+        for (span_items, 0..) |sv, j| {
+            if (sv != .object) return error.InvalidPackJson;
+            const s = sv.object;
+            spans[j] = .{
+                .first_idx = jsonInt(s, "first_idx"),
+                .last_idx = jsonInt(s, "last_idx"),
+                .heading_path = jsonStr(s, "heading_path"),
+                .text = jsonStr(s, "text"),
+                .n_tokens = jsonUsize(s, "n_tokens"),
+            };
+        }
+
+        groups[i] = .{
+            // Not on the wire, and deliberately not invented here: no renderer
+            // prints a doc_id, and a fabricated row id is the kind of value that
+            // later gets joined on.
+            .doc_id = 0,
+            .collection = jsonStr(d, "collection"),
+            .rel_path = jsonStr(d, "path"),
+            .title = jsonStr(d, "title"),
+            .score = jsonFloat(d, "score"),
+            .spans = spans,
+            .n_tokens = jsonUsize(d, "n_tokens"),
+        };
+    }
+
+    const omitted_items = jsonArray(obj, "omitted");
+    const omitted = try arena.alloc(Omitted, omitted_items.len);
+    for (omitted_items, 0..) |ov, i| {
+        if (ov != .object) return error.InvalidPackJson;
+        omitted[i] = .{
+            .rel_path = jsonStr(ov.object, "path"),
+            .score = jsonFloat(ov.object, "score"),
+        };
+    }
+
+    const term_items = jsonArray(obj, "dropped_terms");
+    const dropped_terms = try arena.alloc([]const u8, term_items.len);
+    for (term_items, 0..) |tv, i| dropped_terms[i] = if (tv == .string) tv.string else "";
+
+    return .{
+        .query = jsonStr(obj, "query"),
+        // An unrecognised mode is not worth failing a render over: it reaches no
+        // markdown, and refusing to print the pack because of it would trade a
+        // cosmetic field for the whole answer.
+        .mode = std.meta.stringToEnum(hybrid.Mode, jsonStr(obj, "mode")) orelse .hybrid,
+        .groups = groups,
+        .omitted = omitted,
+        .total_tokens = jsonUsize(obj, "total_tokens"),
+        .budget_tokens = jsonUsize(obj, "budget_tokens"),
+        .dropped_terms = dropped_terms,
+        .fts_skipped = jsonBool(obj, "fts_skipped"),
+    };
+}
+
+// A missing or wrongly-typed field reads as its zero value rather than failing.
+// The daemon and the CLI ship together, so a shape mismatch means an old daemon
+// is still running — and a recall that prints without one score beats a recall
+// that refuses to print.
+
+fn jsonStr(o: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = o.get(key) orelse return "";
+    return switch (v) {
+        .string => |s| s,
+        else => "",
+    };
+}
+
+fn jsonInt(o: std.json.ObjectMap, key: []const u8) i64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => 0,
+    };
+}
+
+fn jsonUsize(o: std.json.ObjectMap, key: []const u8) usize {
+    return @intCast(@max(0, jsonInt(o, key)));
+}
+
+fn jsonFloat(o: std.json.ObjectMap, key: []const u8) f64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => 0,
+    };
+}
+
+fn jsonBool(o: std.json.ObjectMap, key: []const u8) bool {
+    const v = o.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+fn jsonArray(o: std.json.ObjectMap, key: []const u8) []const std.json.Value {
+    const v = o.get(key) orelse return &.{};
+    return if (v == .array) v.array.items else &.{};
 }

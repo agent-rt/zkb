@@ -45,6 +45,17 @@ pub const Result = struct {
     /// Owns the hits the pack points at, so it must outlive the pack.
     ranked: hybrid.Results,
     pack: packmod.Pack,
+    /// How many memories the index holds, counted from `docs` and not from
+    /// `rec_memory`.
+    ///
+    /// Which table it comes from is the entire point. Ranking reads `rec_memory`
+    /// (see `memory.recencyRanked`), so when that projection is the thing that
+    /// broke, counting it reports zero and corroborates the empty result instead
+    /// of contradicting it. `docs` is written by a different path — `scan` fills
+    /// it, `indexer` only stamps it — so it can still say "there are forty of
+    /// them", which is the only way an empty recall ever becomes reportable as a
+    /// fault rather than as an answer.
+    memory_docs: usize,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         self.pack.deinit(gpa);
@@ -65,6 +76,7 @@ pub fn assemble(
 ) !Result {
     var s = store.Store.init(db);
     const memory_cid = try s.findCollection("memory");
+    const memory_docs: usize = if (memory_cid) |cid| try indexedDocs(db, cid) else 0;
 
     var hits: []hybrid.Hit = &.{};
     var filled: usize = 0;
@@ -135,7 +147,21 @@ pub fn assemble(
         .candidates = cfg.candidates,
     });
 
-    return .{ .ranked = ranked, .pack = p };
+    return .{ .ranked = ranked, .pack = p, .memory_docs = memory_docs };
+}
+
+/// Indexed documents in a collection. `indexed_at IS NOT NULL` rather than a bare
+/// count: a document queued but not yet embedded is not something recall could
+/// have returned, so counting it would turn a mid-index moment into a fault
+/// report.
+fn indexedDocs(db: *sqlite.Db, collection_id: i64) !usize {
+    var st = try db.prepare(
+        "SELECT count(*) FROM docs WHERE collection_id = ?1 AND indexed_at IS NOT NULL",
+    );
+    defer st.finalize();
+    try st.bindI64(1, collection_id);
+    if (!try st.step()) return 0;
+    return @intCast(@max(0, st.columnI64(0)));
 }
 
 fn freeHit(gpa: std.mem.Allocator, h: hybrid.Hit) void {
@@ -147,10 +173,66 @@ fn freeHit(gpa: std.mem.Allocator, h: hybrid.Hit) void {
 }
 
 // ---------------------------------------------------------------------------
+// rendering
+// ---------------------------------------------------------------------------
+
+/// The memories half of `recall`'s markdown, for both transports.
+///
+/// `memory_docs` is what separates "you have not recorded anything yet" from
+/// "you have, and not one of them came back". Those had a single message between
+/// them, and it asserted the first: when `rec_memory` silently emptied, every
+/// session for two days opened with `No memories yet. Record one with: zkb
+/// remember`, while `zkb status` counted forty of them one command away. A
+/// message that names the wrong cause is worse than no message, because it ends
+/// the investigation instead of starting one.
+///
+/// This is `pack.renderEmpty`'s distinction — matched but dropped, against
+/// nothing matched — drawn once more for the store itself.
+pub fn renderMemoriesMarkdown(
+    w: *std.Io.Writer,
+    pack: *const packmod.Pack,
+    memory_docs: usize,
+) !void {
+    // `omitted` non-empty means memories were found and the budget dropped them,
+    // which `renderMarkdown` already explains better than this can.
+    if (pack.groups.len == 0 and pack.omitted.len == 0) {
+        if (memory_docs == 0) {
+            try w.writeAll("No memories yet. Record one with: zkb remember \"...\"\n");
+        } else {
+            try w.print(
+                "{d} memories are indexed, but none of them ranked into this recall.\n" ++
+                    "That is not an ordinary empty result — check the index: zkb maintain\n",
+                .{memory_docs},
+            );
+        }
+        return;
+    }
+    try packmod.renderMarkdown(w, pack);
+}
+
+// ---------------------------------------------------------------------------
 // facts snapshot
 // ---------------------------------------------------------------------------
 
-pub fn renderFactsMarkdown(w: *std.Io.Writer, current: []const facts.Current) !void {
+/// A fact narrowed to the fields that reach the markdown.
+///
+/// The daemon sends these four and not `recorded_at` or `scope`, so the path that
+/// rebuilds facts from json has nothing to put in a `facts.Current`. Filling two
+/// fields with empty strings to satisfy the type would move the lie from the
+/// renderer into the struct, where the next reader cannot see it.
+pub const FactLine = struct {
+    key: []const u8,
+    value: []const u8,
+    at: []const u8,
+    note: []const u8,
+};
+
+/// Called by both transports: one holds `facts.Current`, the other holds
+/// `FactLine`, and they share exactly the four fields printed here. `anytype`
+/// rather than converting one into the other, because the conversion would have
+/// to invent the two fields the wire does not carry — and what must not diverge
+/// is the wording, which this way exists once.
+pub fn renderFactsMarkdown(w: *std.Io.Writer, current: anytype) !void {
     if (current.len == 0) return;
     try w.writeAll("## Facts (current values)\n\n");
     for (current) |f| {
