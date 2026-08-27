@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
 
     const opts = b.addOptions();
     opts.addOption(bool, "llama", want_llama);
+    // Read from the manifest rather than kept in step with a second copy in
+    // `root.zig`. The release workflow takes the tarball name and the formula's
+    // `version` from the tag, and the binary used to answer `zkb version` from a
+    // literal — two facts with nothing making them agree, and one of them is only
+    // visible by running the binary that was just installed.
+    opts.addOption([]const u8, "version", @import("build.zig.zon").version);
 
     // ---------------------------------------------------------------- SQLite
     // Two of these flags are load-bearing:

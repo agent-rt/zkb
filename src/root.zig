@@ -42,7 +42,14 @@ pub const build_options = @import("build_options");
 pub const model_registry = @import("embed/registry.zig");
 pub const embed = if (build_options.llama) @import("embed/llama.zig") else struct {};
 
-pub const version = "0.0.26";
+/// From `build.zig.zon`, which is also what the homebrew formula is generated
+/// from. Written here as a literal until 0.0.26, where releasing meant editing
+/// two files and remembering both: the version that ships in the tarball name and
+/// the version the binary reports had no mechanism holding them together, and a
+/// release with `zkb version` disagreeing with `brew info` came within one step of
+/// going out. Nothing downstream would have caught it — the formula, the release
+/// assets and the tag would all have been right.
+pub const version = build_options.version;
 
 test {
     @import("std").testing.refAllDecls(@This());
