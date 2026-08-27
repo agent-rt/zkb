@@ -10,7 +10,6 @@ const memory_cmd = @import("cli/memory_cmd.zig");
 const records_cmd = @import("cli/records_cmd.zig");
 const skill_cmd = @import("cli/skill_cmd.zig");
 const collection_cmd = @import("cli/collection_cmd.zig");
-const mcp = @import("mcp/server.zig");
 
 const usage =
     \\zkb — Agent memory + personal knowledge base
@@ -40,7 +39,6 @@ const usage =
     \\  collection rm NAME           drop a collection; the files are untouched
     \\  collection checks NAME [--off a,b]   checks this corpus declines
     \\  maintain [--since last] [--check NAME] [--collection NAME] [--all] [--json]
-    \\  mcp                          stdio MCP server (for Claude Code etc.)
     \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
     \\  doctor [--model PATH]
     \\  model pull [--quant q8_0|f16]
@@ -555,13 +553,6 @@ pub fn main(init: std.process.Init) !u8 {
         return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks, only);
     }
 
-    if (std.mem.eql(u8, cmd, "mcp")) {
-        // stdout is the protocol channel from here on; nothing else may write to
-        // it. Flush what the CLI已 buffered before handing it over.
-        try w.flush();
-        return mcp.run(gpa, init.io, init.environ_map);
-    }
-
     if (std.mem.eql(u8, cmd, "doctor")) {
         var model_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -839,7 +830,6 @@ fn maintainCmd(
 // block. Without it a `test` in any file here compiles to nothing and passes by
 // not existing.
 test {
-    _ = @import("mcp/server.zig");
     _ = @import("cli/doctor.zig");
     _ = @import("cli/model.zig");
     _ = @import("cli/index_cmd.zig");

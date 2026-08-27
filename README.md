@@ -164,9 +164,6 @@ wired up.
 
 ## For agents
 
-`zkb mcp` is an MCP stdio server exposing `zkb_search`, `zkb_query`,
-`zkb_recall` and `zkb_records`.
-
 `zkb skill` prints a SKILL.md describing how to use zkb, including which record
 types and fact keys exist *on this machine* — the part an agent cannot guess.
 Pipe it wherever your agent reads skills from.

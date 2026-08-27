@@ -192,11 +192,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // The suite above is rooted at tests/root.zig, which can only reach what the
-    // `zkb` module exports. Everything on the cli side — main.zig, cli/*, mcp/* —
-    // imports `zkb` rather than being part of it, so no test there was ever
-    // compiled, let alone run. A `test` block in src/mcp/server.zig passed by
-    // never executing, which is how a malformed tools/list payload shipped in
-    // 0.0.1.
+    // `zkb` module exports. Everything on the cli side — main.zig, cli/* — imports
+    // `zkb` rather than being part of it, so no test there was ever compiled, let
+    // alone run. A `test` block passed by never executing, which is how a
+    // malformed payload shipped in 0.0.1.
     //
     // Rooting a second artifact at main.zig covers the cli side, since every
     // file there is reachable from it.

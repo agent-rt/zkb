@@ -32,7 +32,7 @@ pub fn run(
     try writeDecisionTable(w);
     try writeLocalState(gpa, io, w, &layout);
     try writeGotchas(w);
-    try writeMcp(w);
+    try writeEscapeHatch(w);
     return 0;
 }
 
@@ -243,17 +243,8 @@ fn writeGotchas(w: *Writer) !void {
     );
 }
 
-fn writeMcp(w: *Writer) !void {
+fn writeEscapeHatch(w: *Writer) !void {
     try w.writeAll(
-        \\## Over MCP
-        \\
-        \\`zkb mcp` exposes `zkb_search`, `zkb_query`, `zkb_recall` and
-        \\`zkb_records`, plus `zkb://stats` and `zkb://health` as resources.
-        \\
-        \\`zkb_records` with no arguments lists the types; with `schema: true` it
-        \\lists a type's columns. There is no write tool — `zkb remember` is a shell
-        \\command, and the daemon keeps a single writer on purpose.
-        \\
         \\## Escape hatch
         \\
         \\`zkb sql "select ..."` runs read-only SQL over the index when the
