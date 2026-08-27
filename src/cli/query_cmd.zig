@@ -179,6 +179,10 @@ fn inProcess(
         .top_k = opts.candidates,
         .candidates = @max(50, opts.candidates),
         .path = opts.path,
+        // `top_k` here is a candidate pool for `pack`, not an answer. Capping it
+        // per document would cut the contiguous runs `pack` merges into spans,
+        // and `pack` enforces breadth itself (`max_doc_divisor`).
+        .max_per_doc = null,
     });
     defer results.deinit(gpa);
     {

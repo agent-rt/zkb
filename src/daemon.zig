@@ -665,7 +665,7 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
             w, req.id, .bad_request, "unknown collection", "zkb status lists them"),
         else => return proto.writeError(w, req.id, .internal, "search failed", null),
     };
-    var scfg = searchConfig(req, cfg.candidates);
+    var scfg = searchConfig(req, cfg.candidates, null);
     scfg.candidates = @max(50, cfg.candidates);
     var results = hybrid.search(st.gpa, db, mode, query, vec, coll orelse null, scfg) catch
         return proto.writeError(w, req.id, .internal, "search failed", null);
@@ -875,12 +875,12 @@ fn handleSearch(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
                     return proto.writeError(w, req.id, .model_unavailable, "embedding failed", null);
                 }
                 // Hybrid keeps working without the vector path.
-                return searchAndWrite(st, db, w, req.id, .keyword, query, null, coll, searchConfig(req, k));
+                return searchAndWrite(st, db, w, req.id, .keyword, query, null, coll, searchConfig(req, k, hybrid.search_max_per_doc));
             };
             vec = buf;
         }
     }
-    return searchAndWrite(st, db, w, req.id, mode, query, vec, coll, searchConfig(req, k));
+    return searchAndWrite(st, db, w, req.id, mode, query, vec, coll, searchConfig(req, k, hybrid.search_max_per_doc));
 }
 
 /// Every retrieval filter a request can carry, in one place.
@@ -894,10 +894,17 @@ fn handleSearch(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
 ///
 /// So the guard is structural rather than a test: both handlers build their config
 /// from this function, so a new filter is read once or not at all, never once.
-fn searchConfig(req: *const proto.Request, top_k: usize) hybrid.Config {
+///
+/// `max_per_doc` is a parameter rather than a value chosen in here because the two
+/// handlers genuinely want different ones — `search` answers in documents, `query`
+/// hands its hits to `pack` — and this function serves both. Picking one here
+/// would give the other the wrong answer by default, which is the failure the
+/// whole function exists to prevent.
+fn searchConfig(req: *const proto.Request, top_k: usize, max_per_doc: ?usize) hybrid.Config {
     return .{
         .top_k = top_k,
         .path = req.str("path"),
+        .max_per_doc = max_per_doc,
     };
 }
 

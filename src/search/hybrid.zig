@@ -27,7 +27,25 @@ pub const Config = struct {
     /// directions. Filtering is a property of one query; a collection is a
     /// property of the corpus.
     path: ?[]const u8 = null,
+    /// At most this many chunks from any one document, or null for no ceiling.
+    ///
+    /// Deliberately without a default. What a result *is* differs between the
+    /// callers — `search` answers in documents a person will open, `query` and
+    /// `recall` hand `top_k` to `pack` as a candidate pool and let it do the
+    /// grouping — and a default would silently pick one of those meanings for
+    /// whoever adds the next caller. Without one, a new call site does not
+    /// compile until it says which it wants.
+    max_per_doc: ?usize,
 };
+
+/// The ceiling `search` applies. `query` and `recall` pass null: capping their
+/// candidate pool here would cut the contiguous spans `pack` exists to merge.
+///
+/// 3 is the same number, for the same reason, as `pack.Config.max_doc_divisor`:
+/// not a tuned constant, but the guarantee that a `-k 10` still has room for at
+/// least four documents. Nothing was measured to produce it and nothing should
+/// be claimed for it beyond that.
+pub const search_max_per_doc: usize = 3;
 
 pub const Hit = struct {
     chunk_id: i64,
@@ -56,13 +74,7 @@ pub const Results = struct {
     fts_candidates: usize,
 
     pub fn deinit(self: *Results, gpa: std.mem.Allocator) void {
-        for (self.hits) |h| {
-            gpa.free(h.collection);
-            gpa.free(h.rel_path);
-            gpa.free(h.title);
-            gpa.free(h.heading_path);
-            gpa.free(h.text);
-        }
+        for (self.hits) |h| freeHit(gpa, h);
         gpa.free(self.hits);
         for (self.dropped_terms) |d| gpa.free(d);
         gpa.free(self.dropped_terms);
@@ -133,27 +145,11 @@ pub fn search(
     };
     defer gpa.free(fused);
 
-    const take = @min(cfg.top_k, fused.len);
-    var hits = try gpa.alloc(Hit, take);
-    var filled: usize = 0;
+    const hits = try selectHits(gpa, db, fused, cfg);
     errdefer {
-        for (hits[0..filled]) |h| {
-            gpa.free(h.collection);
-            gpa.free(h.rel_path);
-            gpa.free(h.title);
-            gpa.free(h.heading_path);
-            gpa.free(h.text);
-        }
+        for (hits) |h| freeHit(gpa, h);
         gpa.free(hits);
     }
-    for (fused[0..take]) |f| {
-        hits[filled] = try hydrate(gpa, db, f) orelse continue;
-        filled += 1;
-    }
-    // Shrunk rather than returned as a subslice: `Results.deinit` frees
-    // `self.hits`, and freeing a subslice of a larger allocation is not the same
-    // allocation the allocator handed out.
-    if (filled != hits.len) hits = try gpa.realloc(hits, filled);
 
     return .{
         .mode = mode,
@@ -163,6 +159,90 @@ pub fn search(
         .vec_candidates = vec_ids.items.len,
         .fts_candidates = fts_ids.items.len,
     };
+}
+
+/// Hydrate up to `cfg.top_k` hits, giving breadth across documents first.
+///
+/// The truncation used to be `fused[0..top_k]`, which is a ceiling on *chunks*.
+/// One long document whose chunks rank well on both paths takes every slot:
+/// measured on ~/docs, `zkb search "emqx" -k 10` came back with two files, nine
+/// of the ten hits from a single 20-chunk guide, and `-k 30` with eight files and
+/// nineteen hits from that same one. `-k N` reads as "N results" and was
+/// answering "N chunks", which is a different request.
+///
+/// Not a new principle: `pack.Config.max_doc_divisor` already writes down that
+/// breadth across documents beats depth in one, and `query` has enforced it per
+/// document all along. `search` never got the same treatment, so the two
+/// disagreed about what a result is.
+///
+/// Two passes, because a ceiling must not cost results. The first takes a hit
+/// while its document is still under the cap; the second refills from the ones
+/// the cap turned away. Without it, `-k 10` on a corpus of four documents would
+/// return four hits — trading one complaint for a worse one.
+///
+/// `doc_id` is only known after `hydrate`, so the counting happens here rather
+/// than over `fused`. Hydration still stops as soon as `top_k` is reached, so on
+/// the common path — no document over the cap — this issues exactly the queries
+/// the old code did.
+fn selectHits(
+    gpa: std.mem.Allocator,
+    db: *sqlite.Db,
+    fused: []const rrf.Fused,
+    cfg: Config,
+) ![]Hit {
+    var kept: std.ArrayList(Hit) = .empty;
+    errdefer {
+        for (kept.items) |h| freeHit(gpa, h);
+        kept.deinit(gpa);
+    }
+
+    // Hits whose document was already full, in fused order, held only until it is
+    // known whether `top_k` needs them back.
+    var capped: std.ArrayList(Hit) = .empty;
+    var reclaimed: usize = 0;
+    errdefer {
+        for (capped.items[reclaimed..]) |h| freeHit(gpa, h);
+        capped.deinit(gpa);
+    }
+
+    for (fused) |f| {
+        if (kept.items.len == cfg.top_k) break;
+        const h = try hydrate(gpa, db, f) orelse continue;
+        if (cfg.max_per_doc == null or countOf(kept.items, h.doc_id) < cfg.max_per_doc.?) {
+            try kept.append(gpa, h);
+            continue;
+        }
+        // More than `top_k` of these can never be needed, and holding them is
+        // memory for an outcome that cannot happen.
+        if (capped.items.len < cfg.top_k) try capped.append(gpa, h) else freeHit(gpa, h);
+    }
+
+    while (kept.items.len < cfg.top_k and reclaimed < capped.items.len) : (reclaimed += 1) {
+        try kept.append(gpa, capped.items[reclaimed]);
+    }
+    for (capped.items[reclaimed..]) |h| freeHit(gpa, h);
+    capped.deinit(gpa);
+
+    return kept.toOwnedSlice(gpa);
+}
+
+/// Linear rather than a map: `top_k` is a single-digit number in every caller,
+/// and a hash map here would add an allocation and a failure mode to a count that
+/// never exceeds a few dozen comparisons.
+fn countOf(hits: []const Hit, doc_id: i64) usize {
+    var n: usize = 0;
+    for (hits) |h| {
+        if (h.doc_id == doc_id) n += 1;
+    }
+    return n;
+}
+
+pub fn freeHit(gpa: std.mem.Allocator, h: Hit) void {
+    gpa.free(h.collection);
+    gpa.free(h.rel_path);
+    gpa.free(h.title);
+    gpa.free(h.heading_path);
+    gpa.free(h.text);
 }
 
 /// Documents in scope, by glob over `rel_path`.

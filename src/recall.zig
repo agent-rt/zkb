@@ -81,7 +81,7 @@ pub fn assemble(
     var hits: []hybrid.Hit = &.{};
     var filled: usize = 0;
     errdefer {
-        for (hits[0..filled]) |h| freeHit(gpa, h);
+        for (hits[0..filled]) |h| hybrid.freeHit(gpa, h);
         gpa.free(hits);
     }
 
@@ -94,6 +94,10 @@ pub fn assemble(
             var results = try hybrid.search(gpa, db, mode, query, query_vec, cid, .{
                 .top_k = cfg.candidates,
                 .candidates = @max(50, cfg.candidates),
+                // A candidate pool for `pack`, as in `query` — and one memory is
+                // one document, so a per-document ceiling would cap nothing here
+                // anyway.
+                .max_per_doc = null,
             });
             defer results.deinit(gpa);
             // Filtered here rather than inside `hybrid.search`: a scope is a
@@ -162,14 +166,6 @@ fn indexedDocs(db: *sqlite.Db, collection_id: i64) !usize {
     try st.bindI64(1, collection_id);
     if (!try st.step()) return 0;
     return @intCast(@max(0, st.columnI64(0)));
-}
-
-fn freeHit(gpa: std.mem.Allocator, h: hybrid.Hit) void {
-    gpa.free(h.collection);
-    gpa.free(h.rel_path);
-    gpa.free(h.title);
-    gpa.free(h.heading_path);
-    gpa.free(h.text);
 }
 
 // ---------------------------------------------------------------------------

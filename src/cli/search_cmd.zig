@@ -99,6 +99,7 @@ pub fn run(
     var results = try zkb.hybrid.search(gpa, &db, mode, opts.query, query_vec, collection_id, .{
         .path = opts.path,
         .top_k = opts.top_k,
+        .max_per_doc = zkb.hybrid.search_max_per_doc,
     });
     defer results.deinit(gpa);
     {

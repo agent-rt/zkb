@@ -593,7 +593,9 @@ test "a stale index entry costs its own result, not the whole search" {
         "fusion",
         &query_vec,
         cid,
-        .{ .top_k = 10 },
+        // No ceiling: these assert exactly what the index holds, and a breadth
+        // cap would put a second reason between the rows and the count.
+        .{ .top_k = 10, .max_per_doc = null },
     );
     defer res.deinit(testing.allocator);
 
@@ -628,7 +630,9 @@ test "a search over an index with nothing but stale entries returns empty, not a
         "fusion",
         &query_vec,
         cid,
-        .{ .top_k = 10 },
+        // No ceiling: these assert exactly what the index holds, and a breadth
+        // cap would put a second reason between the rows and the count.
+        .{ .top_k = 10, .max_per_doc = null },
     );
     defer res.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), res.hits.len);
@@ -684,7 +688,7 @@ test "a path filter scopes retrieval without splitting the corpus" {
 
     // Unscoped: both documents are reachable.
     {
-        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{ .top_k = 10 });
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{ .top_k = 10, .max_per_doc = null });
         defer res.deinit(testing.allocator);
         try testing.expectEqual(@as(usize, 4), res.hits.len);
     }
@@ -695,6 +699,7 @@ test "a path filter scopes retrieval without splitting the corpus" {
         var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
             .top_k = 10,
             .path = "agents/handoffs/**",
+            .max_per_doc = null,
         });
         defer res.deinit(testing.allocator);
         try testing.expectEqual(@as(usize, 2), res.hits.len);
@@ -707,10 +712,135 @@ test "a path filter scopes retrieval without splitting the corpus" {
         var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
             .top_k = 10,
             .path = "nowhere/**",
+            .max_per_doc = null,
         });
         defer res.deinit(testing.allocator);
         try testing.expectEqual(@as(usize, 0), res.hits.len);
     }
+}
+
+/// Every chunk gets the *same* vector, so a whole document can be made to rank
+/// ahead of everything else.
+///
+/// `addChunks` varies the vector by chunk index, which makes chunk 0 of every
+/// document the best match and spreads the top-k across documents by
+/// construction — the opposite of the shape under test here, and a test written
+/// on it would pass without the ceiling ever running.
+fn addChunksSharingVector(
+    s: *store.Store,
+    collection_id: i64,
+    doc_id: i64,
+    n: usize,
+    seed: u8,
+) !void {
+    for (0..n) |i| {
+        var vec = dummyVector(seed);
+        _ = try s.insertChunk(collection_id, doc_id, .{
+            .idx = @intCast(i),
+            .heading_path = "doc > section",
+            .byte_start = @intCast(i * 100),
+            .byte_end = @intCast((i + 1) * 100),
+            .n_tokens = 42,
+            .text = "reciprocal rank fusion keeps the weights out of it",
+        }, &vec);
+    }
+}
+
+test "one long document cannot take every slot in the top-k" {
+    // Measured on ~/docs before the ceiling existed: `zkb search "emqx" -k 10`
+    // returned two files, nine of the ten hits from one 20-chunk guide. `-k N`
+    // reads as "N results" and was answering "N chunks".
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const long = try s.upsertDocContent(cid, "long.md", "sha-long", 10, 1000);
+    try addChunksSharingVector(&s, cid, long, 20, 0);
+    for (0..6) |i| {
+        var path_buf: [32]u8 = undefined;
+        var sha_buf: [32]u8 = undefined;
+        const did = try s.upsertDocContent(
+            cid,
+            try std.fmt.bufPrint(&path_buf, "short{d}.md", .{i}),
+            try std.fmt.bufPrint(&sha_buf, "sha-short{d}", .{i}),
+            10,
+            1000,
+        );
+        try addChunksSharingVector(&s, cid, did, 1, 5);
+    }
+
+    var query_vec = dummyVector(0);
+
+    // The control, and the reason this test is not vacuous: with no ceiling the
+    // long document really does take the whole top-k.
+    {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+            .top_k = 10,
+            .max_per_doc = null,
+        });
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 10), res.hits.len);
+        try testing.expectEqual(@as(usize, 1), distinctDocs(res.hits));
+    }
+
+    {
+        var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+            .top_k = 10,
+            .max_per_doc = zkb.hybrid.search_max_per_doc,
+        });
+        defer res.deinit(testing.allocator);
+        // Still ten results — the ceiling decides which, never how many.
+        try testing.expectEqual(@as(usize, 10), res.hits.len);
+        // Six short documents plus the long one: every document that matched.
+        try testing.expectEqual(@as(usize, 7), distinctDocs(res.hits));
+    }
+}
+
+test "the ceiling never costs a result when the corpus is smaller than -k" {
+    // The failure the second pass exists to prevent. Two documents, five chunks
+    // each, a ceiling of three: refusing the surplus would answer `-k 10` with
+    // six hits and call the other four unavailable.
+    var db = try openMem();
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    for (0..2) |i| {
+        var path_buf: [32]u8 = undefined;
+        var sha_buf: [32]u8 = undefined;
+        const did = try s.upsertDocContent(
+            cid,
+            try std.fmt.bufPrint(&path_buf, "doc{d}.md", .{i}),
+            try std.fmt.bufPrint(&sha_buf, "sha-doc{d}", .{i}),
+            10,
+            1000,
+        );
+        try addChunksSharingVector(&s, cid, did, 5, 0);
+    }
+
+    var query_vec = dummyVector(0);
+    var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
+        .top_k = 10,
+        .max_per_doc = zkb.hybrid.search_max_per_doc,
+    });
+    defer res.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 10), res.hits.len);
+    try testing.expectEqual(@as(usize, 2), distinctDocs(res.hits));
+}
+
+fn distinctDocs(hits: []const zkb.hybrid.Hit) usize {
+    var seen: [64]i64 = undefined;
+    var n: usize = 0;
+    outer: for (hits) |h| {
+        for (seen[0..n]) |d| {
+            if (d == h.doc_id) continue :outer;
+        }
+        seen[n] = h.doc_id;
+        n += 1;
+    }
+    return n;
 }
 
 test "one exit code per error, whichever path produced it" {
@@ -782,6 +912,7 @@ test "a wildcard-free --path names a place, and still names a file" {
         var res = try zkb.hybrid.search(testing.allocator, &db, .hybrid, "fusion", &query_vec, cid, .{
             .top_k = 10,
             .path = c.pattern,
+            .max_per_doc = null,
         });
         defer res.deinit(testing.allocator);
         testing.expectEqual(c.want.len, res.hits.len) catch |e| {
