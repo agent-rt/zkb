@@ -867,6 +867,29 @@ pub fn record(
 /// that has not been indexed yet; resolving inline would mark those as broken and
 /// the result would depend on filesystem iteration order — a bug that only shows
 /// up when documents are added, and looks random when it does.
+/// Forget every resolution and work them all out again.
+///
+/// `resolveLinks` only looks at links with no target yet, which is right for the
+/// steady state — a resolved link does not change when a new document arrives.
+/// It is wrong exactly once: when the rule for reading a reference changes.
+/// Then every stored `target_doc_id` is an answer to a question nobody asks any
+/// more, and nothing re-asks it, because re-extraction happens only when a
+/// document is re-indexed.
+///
+/// Found the day `zkb://` gained a collection segment: 928 of 932 scheme links
+/// still carried a target computed by the old reading, `maintain` reported them
+/// healthy, and each would have broken silently and separately whenever its
+/// document was next touched. A latent break spread over weeks is worse than a
+/// loud one on the day of the change.
+///
+/// Cheap on purpose — this rewrites the graph, not the index. Re-indexing the
+/// corpus would also do it, at the cost of re-embedding every chunk to fix
+/// something no embedding was involved in.
+pub fn relinkAll(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
+    try db.exec("UPDATE links SET target_doc_id = NULL");
+    return resolveLinks(gpa, db);
+}
+
 pub fn resolveLinks(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
     var resolved: usize = 0;
 

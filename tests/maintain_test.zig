@@ -842,3 +842,53 @@ test "a relative link still means the collection it was written in" {
     try testing.expect(try st.step());
     try testing.expectEqualStrings("docs", st.columnText(0));
 }
+
+test "relink throws away resolutions the old rule produced" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+
+    _ = try addDoc(&s, cid, "a.md", "# A\n");
+    const from = try addDoc(&s, cid, "b.md", "# B\n\n- [x](zkb://nosuch/a.md)\n");
+
+    // Stand in for a resolution computed under a rule that no longer applies:
+    // the link names a collection that does not exist, so nothing should point
+    // at anything — but a stored target keeps `resolveLinks` from ever looking,
+    // because it only considers links with none.
+    {
+        var st = try db.prepare(
+            "UPDATE links SET target_doc_id = (SELECT id FROM docs WHERE rel_path = 'a.md') WHERE doc_id = ?1",
+        );
+        defer st.finalize();
+        try st.bindI64(1, from);
+        _ = try st.step();
+    }
+    _ = try maintain.resolveLinks(gpa, &db);
+    try testing.expectEqual(@as(?i64, 0), try db.queryI64(
+        "SELECT count(*) FROM links WHERE target_doc_id IS NULL",
+    ));
+
+    _ = try maintain.relinkAll(gpa, &db);
+    // Now it is what it always was: a link to a collection that is not there.
+    try testing.expectEqual(@as(?i64, 1), try db.queryI64(
+        "SELECT count(*) FROM links WHERE target_doc_id IS NULL",
+    ));
+}
+
+test "relink keeps the resolutions that are still right" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+
+    _ = try addDoc(&s, cid, "a.md", "# A\n");
+    _ = try addDoc(&s, cid, "b.md", "# B\n\n- [x](zkb://docs/a.md)\n");
+    _ = try maintain.resolveLinks(gpa, &db);
+
+    const n = try maintain.relinkAll(gpa, &db);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(?i64, 0), try db.queryI64(
+        "SELECT count(*) FROM links WHERE target_doc_id IS NULL AND kind != 'external'",
+    ));
+}

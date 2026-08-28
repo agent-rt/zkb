@@ -46,6 +46,7 @@ const usage =
     \\  context list | rm <ref>                  back with every result from it
     \\  collection checks NAME [--off a,b]   checks this corpus declines
     \\  maintain [--since last] [--check NAME] [--collection NAME] [--all] [--json]
+    \\           [--relink]        re-resolve every link, after a scheme change
     \\  bench <fixture.csv> [-k N] [--collection NAME] [--path GLOB] [--json]
     \\                      recall of every retrieval path, against known answers
     \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
@@ -629,6 +630,7 @@ pub fn main(init: std.process.Init) !u8 {
         var selected: [8]zkb.maintain.Check = undefined;
         var n_selected: usize = 0;
         var use_all = false;
+        var relink = false;
         var only: []const u8 = "";
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--since")) {
@@ -638,6 +640,8 @@ pub fn main(init: std.process.Init) !u8 {
                 as_json = true;
             } else if (std.mem.eql(u8, a, "--all")) {
                 use_all = true;
+            } else if (std.mem.eql(u8, a, "--relink")) {
+                relink = true;
             } else if (std.mem.eql(u8, a, "--collection")) {
                 only = args.next() orelse "";
             } else if (std.mem.eql(u8, a, "--check")) {
@@ -661,7 +665,7 @@ pub fn main(init: std.process.Init) !u8 {
             zkb.maintain.Check.all()
         else
             zkb.maintain.Check.default();
-        return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks, only);
+        return maintainCmd(gpa, init.io, init.environ_map, w, since_last, as_json, checks, only, relink);
     }
 
     if (std.mem.eql(u8, cmd, "doctor")) {
@@ -956,6 +960,9 @@ fn maintainCmd(
     as_json: bool,
     checks: []const zkb.maintain.Check,
     only: []const u8,
+    /// Throw away every stored resolution and work them out again. Needed after
+    /// the rule for reading a reference changes; a no-op otherwise.
+    relink: bool,
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
@@ -983,6 +990,13 @@ fn maintainCmd(
             try w.writeAll("zkb status lists them\n");
             return 3;
         };
+    }
+
+    // Before the checks, so the same run reports the graph it just rebuilt
+    // rather than the one it inherited.
+    if (relink) {
+        const n = try zkb.maintain.relinkAll(gpa, &db);
+        try w.print("relinked: {d} link(s) resolved\n\n", .{n});
     }
 
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
