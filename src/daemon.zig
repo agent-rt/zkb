@@ -988,20 +988,7 @@ fn searchAndWrite(
     try w.writeAll("],\"hits\":[");
     for (results.hits, 0..) |h, i| {
         if (i != 0) try w.writeAll(",");
-        try w.print("{{\"chunk_id\":{d},\"score\":{d:.6},", .{ h.chunk_id, h.score });
-        if (h.vec_rank) |r| try w.print("\"vec_rank\":{d},", .{r}) else try w.writeAll("\"vec_rank\":null,");
-        if (h.fts_rank) |r| try w.print("\"fts_rank\":{d},", .{r}) else try w.writeAll("\"fts_rank\":null,");
-        try w.writeAll("\"collection\":");
-        try std.json.Stringify.value(h.collection, .{}, w);
-        try w.writeAll(",\"path\":");
-        try std.json.Stringify.value(h.rel_path, .{}, w);
-        try w.writeAll(",\"title\":");
-        try std.json.Stringify.value(h.title, .{}, w);
-        try w.writeAll(",\"heading_path\":");
-        try std.json.Stringify.value(h.heading_path, .{}, w);
-        try w.writeAll(",\"text\":");
-        try std.json.Stringify.value(h.text, .{}, w);
-        try w.print(",\"chunk_idx\":{d},\"n_tokens\":{d}}}", .{ h.idx, h.n_tokens });
+        try h.writeJson(w);
     }
     try w.writeAll("]}");
     try proto.finishOk(w);

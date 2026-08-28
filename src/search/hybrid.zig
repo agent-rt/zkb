@@ -60,6 +60,38 @@ pub const Hit = struct {
     n_tokens: i64,
     doc_id: i64,
     idx: i64,
+
+    /// The JSON one hit becomes on the wire and in `--json` output.
+    ///
+    /// One function because it used to be two: `daemon.zig` and `cli/search_cmd.zig`
+    /// each spelled these eleven fields out, byte for byte, and the in-process path
+    /// deliberately hands the daemon's JSON through unchanged so that the two shapes
+    /// cannot drift — which only works while somebody keeps them equal by hand. A
+    /// field added to one and not the other is invisible: the command still answers,
+    /// with the field present or absent depending on whether a daemon happened to be
+    /// running.
+    ///
+    /// Field names are not the struct's: `rel_path` is `path` and `idx` is
+    /// `chunk_idx` on the wire, and `doc_id` is not sent at all. That is why this is
+    /// written out rather than walked with `std.meta.fields` the way
+    /// `roots.Registration` is — the names are a contract with clients, not a
+    /// projection of the type.
+    pub fn writeJson(self: Hit, w: *std.Io.Writer) !void {
+        try w.print("{{\"chunk_id\":{d},\"score\":{d:.6},", .{ self.chunk_id, self.score });
+        if (self.vec_rank) |r| try w.print("\"vec_rank\":{d},", .{r}) else try w.writeAll("\"vec_rank\":null,");
+        if (self.fts_rank) |r| try w.print("\"fts_rank\":{d},", .{r}) else try w.writeAll("\"fts_rank\":null,");
+        try w.writeAll("\"collection\":");
+        try std.json.Stringify.value(self.collection, .{}, w);
+        try w.writeAll(",\"path\":");
+        try std.json.Stringify.value(self.rel_path, .{}, w);
+        try w.writeAll(",\"title\":");
+        try std.json.Stringify.value(self.title, .{}, w);
+        try w.writeAll(",\"heading_path\":");
+        try std.json.Stringify.value(self.heading_path, .{}, w);
+        try w.writeAll(",\"text\":");
+        try std.json.Stringify.value(self.text, .{}, w);
+        try w.print(",\"chunk_idx\":{d},\"n_tokens\":{d}}}", .{ self.idx, self.n_tokens });
+    }
 };
 
 pub const Results = struct {
