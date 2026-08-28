@@ -285,6 +285,27 @@ fn writeGotchas(w: *Writer) !void {
     try w.writeAll(
         \\## Things that are easy to get wrong
         \\
+        \\**A search result is a lead, not the evidence.** `zkb search` prints one
+        \\chunk per hit, cut at 220 bytes — about 73 Chinese characters, one line —
+        \\enough to judge whether the document is the right one, never enough to
+        \\quote, date or reason from.
+        \\Before you state something as the user's, open it: `zkb query <q>` for the
+        \\same question with neighbours pulled in and a token budget, `zkb search
+        \\--full` for the whole chunk, or `zkb path <uri>` and read the file. The
+        \\failure is silent and confident — a snippet that mentions a decision reads
+        \\exactly like a snippet that records one.
+        \\
+        \\**Knowing the exact wording is a reason to use `--mode keyword`.** Vectors
+        \\find the same idea in other words; that is also what makes them smear an
+        \\identifier, an error code or a proper noun across everything that talks
+        \\about the same subject. When the user handed you the literal string —
+        \\a filename, `PJM-1234`, a function name, a quoted phrase — BM25 is the
+        \\path that can be exact about it, and it is also the cheapest of the three
+        \\(retrieval here: 22ms against 69ms for hybrid, before the query is even
+        \\embedded). Reword the question and the ordering flips the other way, so
+        \\this is a rule about what you were handed, not a preference. `zkb bench`
+        \\measures both on a real corpus rather than guessing.
+        \\
         \\**Numbers are not retrievable.** `450000` and `480000` are neighbours in a
         \\1024-dimensional space, so searching for a salary returns prose that
         \\mentions salaries, not the value. Every number lives in a csv column: use
@@ -307,9 +328,14 @@ fn writeGotchas(w: *Writer) !void {
         \\immediately, which hand-editing does not. Documents are the opposite: edit
         \\them with your normal tools, zkb picks the change up within seconds.
         \\
-        \\**Dropped query terms are reported.** If search says a term was not
-        \\searched, the tokenizer could not match it — that result is narrower than
-        \\the question asked.
+        \\**When zkb says the search was narrower, it means it.** Three notices all
+        \\say the same thing — you did not get the search you asked for:
+        \\`dropped terms` means the tokenizer could not match those words at all;
+        \\`model unavailable, falling back to keyword search` and `DEGRADED` mean
+        \\the vector path did not run, so nothing was found by meaning, only by
+        \\spelling. None of them is an error and none changes the exit code, so a
+        \\caller that reads only the hits will report a narrow answer as a complete
+        \\one. Say what was missing, or re-run once the model is back.
         \\
         \\
     );
