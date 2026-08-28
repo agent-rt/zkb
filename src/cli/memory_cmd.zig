@@ -59,6 +59,10 @@ pub fn remember(
     const now_ms = nowMs(io);
     const cid = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);
 
+    // Before the model is resolved: a mistyped label should not cost a 1-2s load
+    // to be told it is mistyped.
+    if (try refuseUnknownScope(gpa, &db, w, opts.scope, opts.force)) return 5;
+
     const found = zkb.model_registry.resolve(gpa, io, env, &layout, opts.model, .q8_0) catch null;
     defer if (found) |f| f.deinit(gpa);
 
@@ -138,6 +142,52 @@ pub fn remember(
 
     try warnIfUnversioned(io, w, layout.data);
     return 0;
+}
+
+/// Refuse a scope no active memory carries. Returns true when it refused.
+///
+/// The same shape as the duplicate check above, and written for the same reason:
+/// a scope is free text, so `--scope zbk` is accepted, stored, and then never
+/// matches anything again — the memory is invisible and nothing reports it. The
+/// skill calls this the one mistake here that does not announce itself, and a
+/// mistake that cannot announce itself has to be refused at the moment it is
+/// made, not detected later.
+///
+/// Creating a scope stays possible, it just stops being accidental: `--force` is
+/// the difference between naming a new project and mistyping an old one. That is
+/// the same bargain `remember` already strikes with near-duplicates.
+///
+/// Reading is never refused. `recall --scope X` for an unknown X returns the
+/// universal memories, because a session must still start; refusing there would
+/// turn a typo into a broken session instead of a thinner one.
+fn refuseUnknownScope(
+    gpa: std.mem.Allocator,
+    db: *zkb.sqlite.Db,
+    w: *Writer,
+    scope: []const u8,
+    force: bool,
+) !bool {
+    if (scope.len == 0 or force) return false;
+
+    const known = try zkb.memory.activeScopes(gpa, db);
+    defer {
+        for (known) |s| gpa.free(s);
+        gpa.free(known);
+    }
+    for (known) |s| {
+        if (std.mem.eql(u8, s, scope)) return false;
+    }
+
+    try w.print("unknown scope \"{s}\"; not recorded\n\n", .{scope});
+    if (known.len == 0) {
+        try w.writeAll("  no memory carries a scope yet\n");
+    } else {
+        try w.writeAll("  in use:");
+        for (known, 0..) |s, i| try w.print("{s} {s}", .{ if (i == 0) "" else ",", s });
+        try w.writeAll("\n");
+    }
+    try w.writeAll("\na scope starts existing by being used — re-run with --force if that is what you mean\n");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +277,7 @@ pub fn rescope(
     w: *Writer,
     rel_path: []const u8,
     scope: []const u8,
+    force: bool,
     model: ?[]const u8,
 ) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
@@ -238,6 +289,16 @@ pub fn rescope(
         try w.print("no such memory: {s}\n", .{path});
         return 3;
     };
+
+    const db_path = try gpa.dupeZ(u8, layout.db);
+    defer gpa.free(db_path);
+    var db = try zkb.store.open(db_path, .read_write);
+    defer db.close();
+
+    // Same gate as `remember`: the label is the thing that goes wrong silently,
+    // and moving a memory to a mistyped scope hides it exactly as writing one
+    // there would.
+    if (try refuseUnknownScope(gpa, &db, w, scope, force)) return 5;
 
     const content = try readAll(gpa, io, path);
     defer gpa.free(content);
@@ -261,10 +322,6 @@ pub fn rescope(
     // Re-indexed here rather than left for the daemon: the whole point is that
     // the next `recall` sees it, and "I moved that memory and it is still in the
     // wrong scope" is how a tool stops being trusted.
-    const db_path = try gpa.dupeZ(u8, layout.db);
-    defer gpa.free(db_path);
-    var db = try zkb.store.open(db_path, .read_write);
-    defer db.close();
     var s = zkb.store.Store.init(&db);
     const now_ms = nowMs(io);
     const cid = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);

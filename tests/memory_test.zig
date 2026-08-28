@@ -584,3 +584,56 @@ fn readWholeFile(io: std.Io, path: []const u8) ![]u8 {
     try r.interface.readSliceAll(buf);
     return buf;
 }
+
+test "activeScopes is the registry, and archived labels drop out of it" {
+    // There is no list of allowed scopes and there should not be one: a second
+    // truth about what is permitted would have to be kept in step with the files,
+    // and the files are the truth. So "is this scope new?" is answered by what
+    // the store already carries — which is also why an archived memory must stop
+    // counting, or a typo made once would be accepted forever.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.ensureCollectionKind("memory", "/tmp/m", .memory, 1000);
+
+    const rows = [_]struct { path: []const u8, scope: []const u8, status: zkb.memory.Status }{
+        .{ .path = "a.md", .scope = "work", .status = .active },
+        .{ .path = "b.md", .scope = "work", .status = .active },
+        .{ .path = "c.md", .scope = "", .status = .active },
+        .{ .path = "d.md", .scope = "retired", .status = .archived },
+    };
+    for (rows, 0..) |r, i| {
+        var sha_buf: [32]u8 = undefined;
+        const did = try s.upsertDocContent(
+            cid,
+            r.path,
+            try std.fmt.bufPrint(&sha_buf, "sha-{d}", .{i}),
+            10,
+            1000,
+        );
+        var vec = dummyVector(@intCast(i));
+        const chunk = try s.insertChunk(cid, did, .{
+            .idx = 0, .heading_path = "", .byte_start = 0, .byte_end = 10,
+            .n_tokens = 5, .text = "记忆正文",
+        }, &vec);
+        try zkb.memory.replaceMeta(&db, did, chunk, .{
+            .type = .project,
+            .status = r.status,
+            .created = "2026-08-28",
+            .source = "t",
+            .subjects = "",
+            .refs = "",
+            .scope = r.scope,
+        });
+    }
+
+    const scopes = try zkb.memory.activeScopes(gpa, &db);
+    defer {
+        for (scopes) |x| gpa.free(x);
+        gpa.free(scopes);
+    }
+    // `work` once despite two memories; the empty one is universal, not a label;
+    // `retired` is gone with its only memory.
+    try testing.expectEqual(@as(usize, 1), scopes.len);
+    try testing.expectEqualStrings("work", scopes[0]);
+}

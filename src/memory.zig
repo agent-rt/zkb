@@ -372,6 +372,32 @@ pub fn recencyRanked(
     return out.toOwnedSlice(gpa);
 }
 
+/// The scopes that active memories actually carry, sorted, deduplicated.
+///
+/// There is no registry of labels and there should not be one: a second list of
+/// what is allowed would be a second truth to keep in step with the files, and
+/// the files are the truth (SPEC §15.3). What exists in the store *is* the
+/// registry, which is what makes "this scope is new" answerable without anyone
+/// maintaining anything.
+///
+/// Active only. A scope whose last memory was archived has stopped being in use,
+/// and keeping it valid forever would mean a typo made once is accepted forever.
+pub fn activeScopes(gpa: std.mem.Allocator, db: *sqlite.Db) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |s| gpa.free(s);
+        out.deinit(gpa);
+    }
+    var st = try db.prepare(
+        \\SELECT DISTINCT scope FROM rec_memory
+        \\WHERE status = 'active' AND scope IS NOT NULL AND scope != ''
+        \\ORDER BY scope
+    );
+    defer st.finalize();
+    while (try st.step()) try out.append(gpa, try gpa.dupe(u8, st.columnText(0)));
+    return out.toOwnedSlice(gpa);
+}
+
 /// Chunk ids of active memories, for restricting a KNN to memories only.
 pub fn activeChunkIds(gpa: std.mem.Allocator, db: *sqlite.Db) ![]i64 {
     var out: std.ArrayList(i64) = .empty;
