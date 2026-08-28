@@ -84,6 +84,24 @@ pub const Check = enum {
     /// No judgment in this one either: the projection is derived from frontmatter
     /// and either covers the indexed documents or does not.
     unprojected_memory,
+    /// A `type: project` memory with no scope.
+    ///
+    /// Recorded types split cleanly on this machine: `feedback`, `reference`,
+    /// `user` and `decision` are lessons and preferences that hold everywhere,
+    /// while `project` states a fact about one project. Measured over 39
+    /// memories, every scoped one was `project` except two `feedback` labelled
+    /// with a tool name — and the two `project` memories left universal were both
+    /// about zkb, opening every unrelated session with it.
+    ///
+    /// So this is not a style rule: an unscoped `project` memory is a label its
+    /// author forgot, and the cost lands on every other project. `zkb rescope`
+    /// is the repair.
+    ///
+    /// Not extended to the other types. A lesson learned *in* one project is
+    /// usually still a lesson — several here are phrased with a project as the
+    /// evidence and the conclusion general, and scoping those by the name in
+    /// their filename would hide exactly what they were written for.
+    unscoped_project_memory,
 
     /// Checks that run by default.
     ///
@@ -97,7 +115,7 @@ pub const Check = enum {
         return &.{
             .index_failed,      .broken_link,  .orphan,         .not_in_index,
             .fragment,          .oversized,    .near_duplicate, .duplicate_content,
-            .orphan_chunk,      .unprojected_memory,
+            .orphan_chunk,      .unprojected_memory, .unscoped_project_memory,
         };
     }
 
@@ -106,7 +124,7 @@ pub const Check = enum {
             .index_failed,      .broken_link, .orphan,          .not_in_index,
             .fragment,          .oversized,   .island,          .near_duplicate,
             .duplicate_content, .stale,       .no_frontmatter,  .orphan_chunk,
-            .unprojected_memory,
+            .unprojected_memory, .unscoped_project_memory,
         };
     }
 
@@ -133,7 +151,7 @@ pub const Check = enum {
             // be missing. Scoped by kind rather than answered `true` so a
             // documents collection cannot be told to re-index over a row it was
             // never supposed to have.
-            .unprojected_memory => kind == .memory,
+            .unprojected_memory, .unscoped_project_memory => kind == .memory,
 
             // Wiki conventions: something links here, an index lists it, links
             // resolve, a topic has neighbours. A memory corpus follows none of
@@ -262,6 +280,7 @@ pub fn run(gpa: std.mem.Allocator, db: *sqlite.Db, opts: Options) !Report {
         .no_frontmatter => try checkNoFrontmatter(gpa, db, &findings),
         .orphan_chunk => try checkOrphanChunks(gpa, db, &findings),
         .unprojected_memory => try checkUnprojectedMemories(gpa, db, &findings),
+        .unscoped_project_memory => try checkUnscopedProjectMemories(gpa, db, &findings),
         // Handled together below: all four read the same KNN pass.
         .near_duplicate, .duplicate_content, .island, .stale => {},
     };
@@ -569,6 +588,41 @@ fn checkUnprojectedMemories(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.Ar
             .{missing},
         );
         try add(gpa, out, .unprojected_memory, cid, key, name, detail);
+    }
+}
+
+/// `type: project` memories with no scope, one finding each.
+///
+/// Per document rather than per collection, unlike `unprojected_memory`: that one
+/// always breaks as a set, this one is a per-memory omission by whoever wrote it,
+/// and the only useful finding is which file to run `zkb rescope` on.
+fn checkUnscopedProjectMemories(gpa: std.mem.Allocator, db: *sqlite.Db, out: *std.ArrayList(Finding)) !void {
+    var st = try db.prepare(
+        \\SELECT d.collection_id, d.rel_path
+        \\FROM rec_memory m
+        \\JOIN docs d ON d.id = m.doc_id
+        \\JOIN collections c ON c.id = d.collection_id
+        \\WHERE c.kind = 'memory' AND m.type = 'project'
+        \\  AND m.status = 'active' AND m.scope IS NULL
+        \\ORDER BY d.rel_path
+    );
+    defer st.finalize();
+
+    while (try st.step()) {
+        const cid = st.columnI64(0);
+        const path = st.columnText(1);
+
+        var kbuf: [256]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kbuf, "unscoped_project_memory:{s}", .{path});
+        try add(
+            gpa,
+            out,
+            .unscoped_project_memory,
+            cid,
+            key,
+            path,
+            "a project memory with no scope opens every other project's session; run: zkb rescope",
+        );
     }
 }
 

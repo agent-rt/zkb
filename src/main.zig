@@ -29,6 +29,7 @@ const usage =
     \\                  [--subjects a,b] [--refs a,b] [--scope NAME] [--force]
     \\  recall [query] [--budget N] [--scope NAME] [--json]
     \\  forget <memory-file>
+    \\  rescope <memory-file> <scope>   move it to another scope; empty means universal
     \\  facts [key] [--history]
     \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
     \\  records [type] [--where EXPR] [--search TEXT] [--agg EXPR]
@@ -307,6 +308,18 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         return memory_cmd.forget(gpa, init.io, init.environ_map, w, target);
+    }
+
+    if (std.mem.eql(u8, cmd, "rescope")) {
+        const target = args.next() orelse {
+            try w.writeAll("usage: zkb rescope <memory-file> <scope>   (empty scope makes it universal)\n");
+            return 2;
+        };
+        const scope = args.next() orelse {
+            try w.writeAll("usage: zkb rescope <memory-file> <scope>   (empty scope makes it universal)\n");
+            return 2;
+        };
+        return memory_cmd.rescope(gpa, init.io, init.environ_map, w, target, scope, null);
     }
 
     if (std.mem.eql(u8, cmd, "recall")) {

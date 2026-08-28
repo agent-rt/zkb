@@ -200,19 +200,138 @@ pub fn forget(
 }
 
 fn setStatusArchived(gpa: std.mem.Allocator, content: []const u8) ![]u8 {
+    return setFrontmatterField(gpa, content, "status", "archived");
+}
+
+// ---------------------------------------------------------------------------
+// rescope
+// ---------------------------------------------------------------------------
+
+/// Move an existing memory to another scope, or to universal with an empty one.
+///
+/// Until this existed there was no way to change a memory's scope at all. The
+/// three things left were: `forget` and re-`remember`, which resets `created` and
+/// so rewrites the recency ranking recall is built on; editing the file by hand,
+/// which the skill and this module both forbid because `remember` is meant to be
+/// the only writer of the data directory; or living with it. A label that cannot
+/// be corrected is a label nobody should be told to apply.
+///
+/// The projection is rebuilt by re-indexing, not by an UPDATE on `rec_memory`.
+/// Writing the row here would be a second path that produces it, and the first
+/// one is `indexer.indexOne` — two writers of the same derived table is the shape
+/// that emptied it once already.
+pub fn rescope(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *Writer,
+    rel_path: []const u8,
+    scope: []const u8,
+    model: ?[]const u8,
+) !u8 {
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    const path = try std.fs.path.join(gpa, &.{ layout.memory, rel_path });
+    defer gpa.free(path);
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch {
+        try w.print("no such memory: {s}\n", .{path});
+        return 3;
+    };
+
+    const content = try readAll(gpa, io, path);
+    defer gpa.free(content);
+    const updated = setFrontmatterField(gpa, content, "scope", scope) catch |err| switch (err) {
+        error.NoFrontmatter => {
+            try w.print("not a memory (no frontmatter): {s}\n", .{path});
+            return 2;
+        },
+        else => return err,
+    };
+    defer gpa.free(updated);
+
+    if (std.mem.eql(u8, content, updated)) {
+        try w.print("unchanged: already {s}\n", .{
+            if (scope.len == 0) "universal" else scope,
+        });
+        return 0;
+    }
+    try writeFile(io, path, updated);
+
+    // Re-indexed here rather than left for the daemon: the whole point is that
+    // the next `recall` sees it, and "I moved that memory and it is still in the
+    // wrong scope" is how a tool stops being trusted.
+    const db_path = try gpa.dupeZ(u8, layout.db);
+    defer gpa.free(db_path);
+    var db = try zkb.store.open(db_path, .read_write);
+    defer db.close();
+    var s = zkb.store.Store.init(&db);
+    const now_ms = nowMs(io);
+    const cid = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);
+
+    const found = zkb.model_registry.resolve(gpa, io, env, &layout, model, .q8_0) catch null;
+    defer if (found) |f| f.deinit(gpa);
+    if (found) |f| {
+        var e = zkb.embed.Embedder.init(gpa, f.path, .{}) catch null;
+        if (e) |*emb| {
+            defer emb.deinit();
+            _ = try zkb.scan.reconcile(gpa, io, &s, cid, layout.memory, zkb.memory.scan_filters, now_ms);
+            _ = try zkb.indexer.indexPending(gpa, io, &s, emb, cid, layout.memory, now_ms, .{});
+        }
+    } else {
+        try w.writeAll("note: model unavailable; the index updates on the next daemon scan\n");
+    }
+
+    if (scope.len == 0) {
+        try w.print("{s} is now universal\n", .{rel_path});
+    } else {
+        try w.print("{s} is now scoped to {s}\n", .{ rel_path, scope });
+    }
+    return 0;
+}
+
+/// Set one frontmatter field, adding it when absent and dropping it when `value`
+/// is empty. The body is returned untouched.
+///
+/// Bounded to the block between the first two `---` lines, which the previous
+/// version was not: it rewrote the first line starting with the key anywhere in
+/// the file, so a memory whose *text* began a line with `status:` would have had
+/// its content edited instead of its metadata. No memory did, but that is a
+/// property of the corpus rather than of the function.
+pub fn setFrontmatterField(
+    gpa: std.mem.Allocator,
+    content: []const u8,
+    key: []const u8,
+    value: []const u8,
+) ![]u8 {
+    if (!std.mem.startsWith(u8, content, "---\n")) return error.NoFrontmatter;
+    // The newline that ends the last field line, immediately before the closing
+    // fence. Searching from 4 skips the opening one.
+    const end = std.mem.indexOfPos(u8, content, 4, "\n---") orelse return error.NoFrontmatter;
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    try out.appendSlice(gpa, "---\n");
+
     var replaced = false;
-    var first = true;
-    while (lines.next()) |line| {
-        if (!first) try out.append(gpa, '\n');
-        first = false;
-        if (!replaced and std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "status:")) {
-            try out.appendSlice(gpa, "status: archived");
+    var it = std.mem.splitScalar(u8, content[4 .. end + 1], '\n');
+    while (it.next()) |line| {
+        // The split leaves an empty final piece after the trailing newline.
+        if (line.len == 0) continue;
+        const t = std.mem.trimStart(u8, line, " \t");
+        const is_key = std.mem.startsWith(u8, t, key) and t.len > key.len and t[key.len] == ':';
+        if (is_key and !replaced) {
             replaced = true;
-        } else try out.appendSlice(gpa, line);
+            if (value.len == 0) continue;
+            try out.print(gpa, "{s}: {s}\n", .{ key, value });
+        } else {
+            try out.appendSlice(gpa, line);
+            try out.append(gpa, '\n');
+        }
     }
+    if (!replaced and value.len != 0) try out.print(gpa, "{s}: {s}\n", .{ key, value });
+
+    try out.appendSlice(gpa, content[end + 1 ..]);
     return out.toOwnedSlice(gpa);
 }
 
@@ -719,4 +838,50 @@ test "recall hands the facts back once, and only the ones in scope" {
         try testing.expect(std.mem.indexOf(u8, w.buffered(), "height") != null);
         try testing.expect(std.mem.indexOf(u8, w.buffered(), "salary") != null);
     }
+}
+
+test "setFrontmatterField edits metadata and never the body" {
+    // The previous rewriter matched the first line starting with the key
+    // *anywhere*, so a memory whose text began a line with `scope:` would have
+    // had its content edited. This body is written to trip exactly that.
+    const doc =
+        \\---
+        \\type: project
+        \\created: 2026-08-18
+        \\status: active
+        \\---
+        \\
+        \\scope: 这行是正文，不是元数据。
+        \\
+    ;
+
+    const set = try setFrontmatterField(testing.allocator, doc, "scope", "zkb");
+    defer testing.allocator.free(set);
+    // Added, because the file had no such field.
+    try testing.expect(std.mem.indexOf(u8, set, "\nscope: zkb\n") != null);
+    // And the body line survived untouched.
+    try testing.expect(std.mem.indexOf(u8, set, "scope: 这行是正文，不是元数据。") != null);
+    try testing.expect(std.mem.indexOf(u8, set, "type: project") != null);
+
+    // Replacing, not appending a second one.
+    const again = try setFrontmatterField(testing.allocator, set, "scope", "aglet");
+    defer testing.allocator.free(again);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, again, "\nscope: aglet\n"));
+    try testing.expect(std.mem.indexOf(u8, again, "scope: zkb") == null);
+
+    // An empty value clears it, which is how a memory goes back to universal.
+    const cleared = try setFrontmatterField(testing.allocator, again, "scope", "");
+    defer testing.allocator.free(cleared);
+    try testing.expect(std.mem.indexOf(u8, cleared, "\nscope: aglet\n") == null);
+    try testing.expect(std.mem.indexOf(u8, cleared, "scope: 这行是正文，不是元数据。") != null);
+    try testing.expect(std.mem.indexOf(u8, cleared, "status: active") != null);
+}
+
+test "setFrontmatterField refuses a file that has no frontmatter" {
+    // Rather than inventing a block: a file without one is not a memory, and
+    // writing metadata into arbitrary text is worse than declining.
+    try testing.expectError(
+        error.NoFrontmatter,
+        setFrontmatterField(testing.allocator, "just prose\n", "scope", "zkb"),
+    );
 }

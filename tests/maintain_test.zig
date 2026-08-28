@@ -740,3 +740,45 @@ test "a projected memory, and any document collection, are left alone" {
     defer report.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), report.count(.unprojected_memory));
 }
+
+test "a project memory with no scope is reported, other types are not" {
+    // Measured over a real store of 39: every scoped memory was `project` bar two
+    // tool-name labels, and the two `project` memories left universal were both
+    // about zkb — opening every unrelated session with it. So an unscoped
+    // `project` memory is a forgotten label, and the cost lands elsewhere.
+    //
+    // The other types stay out on purpose. A lesson learned *in* a project is
+    // usually still a lesson; several in that store name a project as their
+    // evidence and their conclusion is general.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.upsertCollection("memory", "/tmp/memory", .memory, null, null, 1000);
+
+    const cases = [_]struct { path: []const u8, t: zkb.memory.Type, scope: []const u8 }{
+        .{ .path = "unscoped-project.md", .t = .project, .scope = "" },
+        .{ .path = "scoped-project.md", .t = .project, .scope = "zkb" },
+        .{ .path = "unscoped-feedback.md", .t = .feedback, .scope = "" },
+    };
+    for (cases) |c| {
+        const did = try addDoc(&s, cid, c.path, "# X\n\nbody\n");
+        var q = try db.prepare("SELECT id FROM chunks WHERE doc_id = ?1");
+        defer q.finalize();
+        try q.bindI64(1, did);
+        try testing.expect(try q.step());
+        try zkb.memory.replaceMeta(&db, did, q.columnI64(0), .{
+            .type = c.t,
+            .status = .active,
+            .created = "2026-08-28",
+            .source = "t",
+            .subjects = "",
+            .refs = "",
+            .scope = c.scope,
+        });
+    }
+
+    var report = try maintain.run(gpa, &db, .{ .checks = &.{.unscoped_project_memory} });
+    defer report.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), report.count(.unscoped_project_memory));
+    try testing.expectEqualStrings("unscoped-project.md", report.findings[0].path);
+}
