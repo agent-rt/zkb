@@ -146,7 +146,8 @@ rm -rf ~/.zkb/index && zkb index    # every collection comes back
 
 That file is the record; the `collections` table is the projection of it, rebuilt
 on the next scan. Editing it by hand works, and is the way to move a root or
-rename filters without re-running the command.
+rename filters without re-running the command — `zkb doctor` checks what you
+wrote, because a mistyped root indexes nothing and says nothing about why.
 
 ```
 zkb index --collection notes --root ~/notes --ext md
