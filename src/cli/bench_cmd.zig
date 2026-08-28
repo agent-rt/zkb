@@ -18,8 +18,13 @@ pub const Options = struct {
     fixture: []const u8,
     collection: ?[]const u8 = null,
     path: ?[]const u8 = null,
-    /// Result depth, in documents. The same `-k` `zkb search` takes, and the
+    /// Result depth **in chunks** — the same `-k` `zkb search` takes, so the
     /// report describes what that command would have shown.
+    ///
+    /// Not documents: one document may supply up to `search_max_per_doc`
+    /// chunks, so `-k 10` is a median of six documents on a real corpus and
+    /// reaches ten in well under one per cent of queries. The `docs/q` column
+    /// exists so `R@10` is not read as "within ten documents".
     top_k: usize = 10,
     model: ?[]const u8 = null,
     json: bool = false,
@@ -43,6 +48,13 @@ const ModeRun = struct {
     results: []CaseResult,
     overall: zkb.bench.Metrics,
     ms_total: i64,
+    /// Documents the caller actually saw, summed over cases.
+    ///
+    /// `-k` counts chunks, and `search_max_per_doc` lets one document supply
+    /// three of them, so ten chunks are a median of six documents on this
+    /// corpus and reach ten in 0.6% of queries. Without this column `R@10`
+    /// reads as "within ten documents", which is not what was measured.
+    docs_total: usize,
     /// Set when the mode could not run as asked — no model for the vector
     /// paths. Reported instead of quietly scoring zeros, which would read as a
     /// retrieval failure rather than a missing prerequisite.
@@ -171,6 +183,7 @@ pub fn run(
                 .results = results,
                 .overall = .zero,
                 .ms_total = 0,
+                .docs_total = 0,
                 .unavailable = true,
             };
             built += 1;
@@ -226,11 +239,14 @@ pub fn run(
             filled += 1;
         }
 
+        var docs_total: usize = 0;
+        for (results) |r| docs_total += r.docs_returned;
         runs[mi] = .{
             .mode = mode,
             .results = results,
             .overall = acc.mean(),
             .ms_total = ms_total,
+            .docs_total = docs_total,
         };
         built += 1;
     }
@@ -303,19 +319,21 @@ fn printReport(
         const lbl = try std.fmt.bufPrint(&lbl_buf, "R@{d}", .{b});
         try w.print(" {s:>6}", .{lbl});
     }
-    try w.writeAll("    MRR   ms/q\n");
+    try w.writeAll("    MRR  docs/q   ms/q\n");
 
     for (runs) |r| {
         try w.print("{t:<8}", .{r.mode});
         if (r.unavailable) {
             for (buckets) |_| try w.writeAll("      —");
-            try w.writeAll("      —      —\n");
+            try w.writeAll("      —      —      —\n");
             continue;
         }
         const m = r.overall;
         for (buckets) |b| try w.print(" {d:>6.3}", .{recallAt(m, b, opts.top_k)});
+        const n: f64 = @floatFromInt(@max(1, fixture.cases.len));
         const per_q: u64 = @intCast(@max(0, @divTrunc(r.ms_total, @as(i64, @intCast(@max(1, fixture.cases.len))))));
-        try w.print(" {d:>6.3} {d:>6}\n", .{ m.mrr, per_q });
+        const docs_per_q = @as(f64, @floatFromInt(r.docs_total)) / n;
+        try w.print(" {d:>6.3} {d:>6.1} {d:>6}\n", .{ m.mrr, docs_per_q, per_q });
     }
 
     // Per-kind breakdown for the strongest mode that ran. A total that moved
@@ -474,8 +492,8 @@ fn printJson(
         try w.print("\"recall_at_1\":{d:.6},\"recall_at_3\":{d:.6},\"recall_at_5\":{d:.6},", .{
             m.recall_at_1, m.recall_at_3, m.recall_at_5,
         });
-        try w.print("\"recall_at_k\":{d:.6},\"mrr\":{d:.6},\"ms_total\":{d},", .{
-            m.recall_at_k, m.mrr, r.ms_total,
+        try w.print("\"recall_at_k\":{d:.6},\"mrr\":{d:.6},\"ms_total\":{d},\"docs_total\":{d},", .{
+            m.recall_at_k, m.mrr, r.ms_total, r.docs_total,
         });
         try w.writeAll("\"cases\":[");
         for (fixture.cases, r.results, 0..) |c, cr, j| {

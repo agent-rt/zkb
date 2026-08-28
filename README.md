@@ -86,6 +86,31 @@ reading — under a handful of documents every term appears in most of them, IDF
 collapses, and BM25 stops ranking. Write one against a collection you already
 have.
 
+If your corpus keeps index pages — a page per directory listing what is under
+it, one line each — you already have several hundred (query, answer) pairs that
+nobody wrote while looking at a score:
+
+```
+python3 scripts/fixture-from-index-pages.py ~/docs docs > fixture.csv
+zkb bench fixture.csv --collection docs
+```
+
+494 cases out of this corpus, and the shape it measures is real:
+
+```
+mode        R@1    R@3    R@5   R@10    MRR  docs/q   ms/q
+keyword   0.117  0.822  0.877  0.893  0.471    6.3     60
+vector    0.741  0.883  0.911  0.915  0.812    6.2     57
+hybrid    0.652  0.901  0.933  0.955  0.778    6.1    111
+```
+
+Fusion beats either path alone at depth, by more than the two paths differ from
+each other. Two columns keep that from being read as more than it is. `docs/q`
+says `-k 10` returned a median of six *documents* — `-k` counts chunks, and one
+document may supply three — so `R@10` means "within about six". And `R@1` is not
+usable from a fixture built this way at all: the query is copied verbatim off an
+index page, so on the keyword path that page is a perfect lexical match and
+outranks the document it points at in 23 of 40 sampled cases.
 
 `bench` runs in-process and never through the daemon: elsewhere the CLI prefers
 the daemon because its model is already resident, but a measurement whose
