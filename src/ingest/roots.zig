@@ -21,6 +21,7 @@ const memory = @import("../memory.zig");
 const facts = @import("../facts.zig");
 const paths = @import("../util/paths.zig");
 const csvmod = @import("csv.zig");
+const contexts = @import("../contexts.zig");
 
 pub const Root = struct {
     id: i64,
@@ -38,7 +39,15 @@ pub fn baseFilters(kind: store.Store.Kind) scan.Filters {
     return switch (kind) {
         .documents => .{},
         .memory => memory.scan_filters,
-        .records => facts.scan_filters,
+        // zkb's own two config files live in `data/`, which is this
+        // collection's root. They are configuration, not records.
+        .records => .{
+            .extensions = facts.scan_filters.extensions,
+            .skip_dirs = facts.scan_filters.skip_dirs,
+            .include = facts.scan_filters.include,
+            .max_file_bytes = facts.scan_filters.max_file_bytes,
+            .skip_files = &.{ registry_file, contexts.registry_file },
+        },
     };
 }
 
@@ -385,7 +394,7 @@ pub const Registration = struct {
 /// Only collections a caller registered are written here. `memory` and
 /// `numbers` are not: their roots come from the layout, so a file recording
 /// them could only ever disagree with it.
-const registry_file = "collections.csv";
+pub const registry_file = "collections.csv";
 
 /// `kind` is deliberately absent. Every registration that reaches this file is
 /// a documents collection, and a hand-edited `kind` would be a way to turn one

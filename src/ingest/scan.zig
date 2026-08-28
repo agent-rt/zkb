@@ -66,6 +66,21 @@ pub const Filters = struct {
     /// mean "allow nothing": a collection with no patterns must scan everything,
     /// or every existing caller would silently index zero files.
     include: []const []const u8 = &.{},
+    /// Basenames this collection must never treat as documents.
+    ///
+    /// zkb's own configuration lives in `data/`, which is also the root of the
+    /// `numbers` collection — so `collections.csv` and `contexts.csv` are csv
+    /// files sitting inside a scanned tree. Without this they are picked up,
+    /// found to be neither `facts.csv` nor under `records/`, and marked failed
+    /// forever: `zkb status` then reports `1 failed` on a healthy index, which
+    /// is worse than useless because it trains the reader to ignore the number.
+    /// Found exactly that way — the count was printed a dozen times in one
+    /// session before anyone looked at it.
+    ///
+    /// Not an ignore pattern: a corpus may legitimately hold a document called
+    /// `contexts.csv`, and `.zkbignore` is the corpus's to control. This is
+    /// structural, and belongs to the kind rather than to the corpus.
+    skip_files: []const []const u8 = &.{},
     /// Hard ceiling per file. Larger files are skipped: a multi-megabyte single
     /// document is not prose, and chunking it would flood the index.
     max_file_bytes: u64 = 4 * 1024 * 1024,
@@ -155,6 +170,7 @@ pub fn reconcile(
         }
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
+        if (inList(entry.basename, filters.skip_files)) continue;
 
         // A symbolic link is indexed as the file it points at, so it can carry
         // content from outside the collection into the index — and from there

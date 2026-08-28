@@ -432,3 +432,56 @@ test "a dangling link is skipped, not counted as readable" {
         }
     }.run);
 }
+
+test "zkb's own config files in data/ are not documents" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            // The shape that produced a permanently failing document: `data/` is
+            // the root of the `numbers` collection, and zkb keeps its own two
+            // csv files there. Scanned as records they are neither `facts.csv`
+            // nor under `records/`, so every pass marks them failed and
+            // `zkb status` reports `1 failed` on a healthy index.
+            try tree.write("facts.csv", "key,value,at\nx,1,2026-01-01\n");
+            try tree.write("collections.csv", "name,root,extensions,include\n");
+            try tree.write("contexts.csv", "collection,prefix,text\ndocs,,x\n");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("numbers", tree.root, 1000);
+
+            const filters = zkb.roots.baseFilters(.records);
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, filters, 1000);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const paths = try pathsIn(&db, arena_state.allocator(), cid);
+            try testing.expectEqual(@as(usize, 1), paths.len);
+            try testing.expectEqualStrings("facts.csv", paths[0]);
+        }
+    }.run);
+}
+
+test "a corpus may still hold a document called contexts.csv" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+            try tree.write("contexts.csv", "a,b\n1,2\n");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            // The skip belongs to the records kind, not to every collection: it
+            // is structural, and a `.zkbignore` is the corpus's to control.
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{ .extensions = &.{".csv"} }, 1000);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+        }
+    }.run);
+}

@@ -31,7 +31,7 @@ const std = @import("std");
 const csvmod = @import("ingest/csv.zig");
 const paths = @import("util/paths.zig");
 
-const registry_file = "contexts.csv";
+pub const registry_file = "contexts.csv";
 
 const columns = [_][]const u8{ "collection", "prefix", "text" };
 
