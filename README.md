@@ -289,10 +289,17 @@ Pipe it wherever your agent reads skills from.
 
 ## Links between documents
 
-`zkb://projects/x/REQ.md` in a markdown link is rooted at the collection rather
-than at the linking document's directory. Any scheme that is not `http`, `https`,
-`file`, `ftp` or `data` is treated the same way, so a corpus written against
-another tool's URI scheme keeps working. `zkb maintain` reports links that do not
+`zkb://docs/projects/x/REQ.md` in a markdown link names a collection and a path
+inside it — not a path relative to the linking document's directory. Any scheme
+that is not `http`, `https`, `file`, `ftp` or `data` is read the same way, so a
+corpus written against another tool's scheme keeps working, and reads its
+collection correctly.
+
+**The first segment is the collection name.** That is what makes a reference
+unambiguous — `index.md` exists in three collections here — and what lets a link
+reach into another one at all: link resolution matches inside the collection the
+link names, or, for a relative link that names none, inside the one it was
+written in. `zkb maintain` reports links that do not
 resolve, distinguishing "the target is not an indexed document" from "the target
 does not exist" — the two need different fixes.
 

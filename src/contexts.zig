@@ -229,11 +229,16 @@ fn write(
 /// Split a `zkb://collection/prefix` reference — or a bare `collection/prefix` —
 /// into its two halves.
 ///
-/// The scheme is accepted because that is the form these paths take everywhere
-/// else in zkb, and a caller holding one should not have to take it apart.
+/// The same split `paths.parseUri` performs, and it must stay the same one: a
+/// `zkb://` written into a document and a `zkb://` typed at `context add` are
+/// the same kind of reference, and two functions that disagree about where the
+/// collection ends is how a description ends up attached to a path nobody meant.
+/// The bare form is accepted because `context add docs/research` is a
+/// reasonable thing to type.
 pub fn splitRef(raw: []const u8) struct { collection: []const u8, prefix: []const u8 } {
-    const rel = paths.relFromUri(raw);
-    const i = std.mem.indexOfScalar(u8, rel, '/') orelse
-        return .{ .collection = rel, .prefix = "" };
-    return .{ .collection = rel[0..i], .prefix = std.mem.trim(u8, rel[i + 1 ..], "/") };
+    const u = paths.parseUri(raw);
+    if (u.collection) |c| return .{ .collection = c, .prefix = std.mem.trim(u8, u.rel, "/") };
+    const i = std.mem.indexOfScalar(u8, u.rel, '/') orelse
+        return .{ .collection = u.rel, .prefix = "" };
+    return .{ .collection = u.rel[0..i], .prefix = std.mem.trim(u8, u.rel[i + 1 ..], "/") };
 }

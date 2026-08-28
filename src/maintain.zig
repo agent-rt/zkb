@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const sqlite = @import("db/sqlite.zig");
+const paths = @import("util/paths.zig");
 const store = @import("db/store.zig");
 const schema = @import("db/schema.zig");
 const maintain_vec = @import("maintain_vec.zig");
@@ -876,10 +877,20 @@ pub fn resolveLinks(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
     );
     defer st.finalize();
 
-    const Pending = struct { id: i64, target: []u8, collection_id: i64 };
+    const Pending = struct {
+        id: i64,
+        target: []u8,
+        /// The collection the link named, or null to mean "the one the linking
+        /// document is in".
+        named: ?[]u8,
+        collection_id: i64,
+    };
     var pending: std.ArrayList(Pending) = .empty;
     defer {
-        for (pending.items) |p| gpa.free(p.target);
+        for (pending.items) |p| {
+            gpa.free(p.target);
+            if (p.named) |n| gpa.free(n);
+        }
         pending.deinit(gpa);
     }
 
@@ -891,20 +902,32 @@ pub fn resolveLinks(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
         if (target) |t| {
             try pending.append(gpa, .{
                 .id = st.columnI64(0),
-                .target = t,
+                .target = t.rel,
+                .named = if (t.collection) |c| try gpa.dupe(u8, c) else null,
                 .collection_id = st.columnI64(4),
             });
         }
     }
 
     for (pending.items) |p| {
-        var find = try db.prepare(
-            \\SELECT id FROM docs
-            \\WHERE collection_id = ?1 AND (rel_path = ?2 OR rel_path LIKE '%/' || ?2)
-            \\ORDER BY length(rel_path) LIMIT 1
-        );
+        // A link that named a collection is resolved in that collection — which
+        // is the whole reason the scheme carries one. Before this the query was
+        // always scoped to the *linking* document's collection, so a reference
+        // across collections could not resolve at all and was reported broken.
+        var find = if (p.named) |_|
+            try db.prepare(
+                \\SELECT d.id FROM docs d JOIN collections c ON c.id = d.collection_id
+                \\WHERE c.name = ?1 AND (d.rel_path = ?2 OR d.rel_path LIKE '%/' || ?2)
+                \\ORDER BY length(d.rel_path) LIMIT 1
+            )
+        else
+            try db.prepare(
+                \\SELECT id FROM docs
+                \\WHERE collection_id = ?1 AND (rel_path = ?2 OR rel_path LIKE '%/' || ?2)
+                \\ORDER BY length(rel_path) LIMIT 1
+            );
         defer find.finalize();
-        try find.bindI64(1, p.collection_id);
+        if (p.named) |n| try find.bindText(1, n) else try find.bindI64(1, p.collection_id);
         try find.bindText(2, p.target);
         if (try find.step()) {
             const target_id = find.columnI64(0);
@@ -919,6 +942,16 @@ pub fn resolveLinks(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
     return resolved;
 }
 
+/// Where a link points: which collection, and the path under it.
+///
+/// `collection` is null for a relative or wiki link, which means "the one I am
+/// already in" — the only reading that makes sense for a reference that never
+/// named one.
+pub const Target = struct {
+    collection: ?[]const u8,
+    rel: []u8,
+};
+
 /// Turn a raw link into a collection-relative path, or null when it cannot be
 /// one (anchors, mail, absolute URLs).
 fn normalizeTarget(
@@ -930,19 +963,27 @@ fn normalizeTarget(
     /// nothing — `[[SKILL]]` in projects/x/index.md means skills/y/SKILL.md, not
     /// projects/x/SKILL.md.
     is_wiki: bool,
-) !?[]u8 {
+) !?Target {
     var t = raw;
-    // A custom URI scheme is rooted at the collection, not relative to the
-    // document that mentions it: `zkb://projects/x/REQ.md` means exactly that
-    // path. Knowledge-base tools commonly define one, and resolving it as a
-    // relative path is the single largest source of false "broken link"
-    // findings — measured at 288 of 348 on one corpus.
+    // A custom URI scheme names a collection and a path under it:
+    // `zkb://docs/projects/x/REQ.md` is the collection `docs`, not a path
+    // relative to the document that mentions it. Knowledge-base tools commonly
+    // define such a scheme, and resolving one as a relative path is the single
+    // largest source of false "broken link" findings — measured at 288 of 348
+    // on one corpus.
     //
     // Generic on purpose: any scheme that is not a network or filesystem URL is
-    // treated this way, so no tool's name is hardcoded here.
+    // read this way, so no tool's name is hardcoded here.
     const scheme_end = std.mem.indexOf(u8, t, "://");
     const is_collection_uri = if (scheme_end) |e| !isExternalScheme(t[0..e]) else false;
-    if (is_collection_uri) t = t[scheme_end.? + 3 ..];
+    var named_collection: ?[]const u8 = null;
+    if (is_collection_uri) {
+        const u = paths.parseUri(t);
+        named_collection = u.collection;
+        t = u.rel;
+        // `zkb://docs` with no path names a collection, not a document.
+        if (t.len == 0) return null;
+    }
     if (t.len == 0) return null;
     // A pure anchor points inside the same document; not a link between files.
     if (t[0] == '#') return null;
@@ -957,10 +998,11 @@ fn normalizeTarget(
 
     if (is_collection_uri or t[0] == '/') {
         const abs = std.mem.trimStart(u8, t, "/");
-        return if (needs_ext)
+        const rel = if (needs_ext)
             try std.fmt.allocPrint(gpa, "{s}.md", .{abs})
         else
             try gpa.dupe(u8, abs);
+        return .{ .collection = named_collection, .rel = rel };
     }
 
     // Relative to the linking document's directory — except wikilinks, which are
@@ -977,7 +1019,7 @@ fn normalizeTarget(
 
     const normalized = try normalizeDots(gpa, joined.items);
     joined.deinit(gpa);
-    return normalized;
+    return .{ .collection = null, .rel = normalized };
 }
 
 /// Collapse `.` and `..` segments. Done here rather than with a path API because

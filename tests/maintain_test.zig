@@ -226,7 +226,7 @@ test "relative, absolute, collection-uri and wiki targets all resolve" {
         \\
         \\- [req](./REQ.md)
         \\- [spec](SPEC.md)
-        \\- zkb://skills/y/SKILL.md
+        \\- zkb://docs/skills/y/SKILL.md
         \\- [[SKILL]]
         \\
     );
@@ -673,7 +673,7 @@ test "a namespace convention file is content, and has to be linked like content"
     _ = try addDoc(&s, cid, "projects/a/index.md",
         \\# A
         \\
-        \\| [zkb.md](zkb://projects/a/zkb.md) | 本命名空间约定 |
+        \\| [zkb.md](zkb://docs/projects/a/zkb.md) | 本命名空间约定 |
         \\
     );
     _ = try addDoc(&s, cid, "projects/a/zkb.md", "# projects/a 命名空间约定\n");
@@ -781,4 +781,64 @@ test "a project memory with no scope is reported, other types are not" {
     defer report.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), report.count(.unscoped_project_memory));
     try testing.expectEqualStrings("unscoped-project.md", report.findings[0].path);
+}
+
+test "a link may name another collection, and resolves there" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const docs = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const aglet = try s.ensureCollection("aglet", "/tmp/aglet", 1000);
+
+    _ = try addDoc(&s, aglet, "README.md", "# aglet\n");
+    // The same rel_path in both, which is what made the old whole-corpus
+    // lookup ambiguous — `index.md` existed in three collections on the real
+    // one. Naming the collection is what removes the ambiguity.
+    _ = try addDoc(&s, docs, "README.md", "# docs\n");
+    _ = try addDoc(&s, docs, "notes.md",
+        \\# Notes
+        \\
+        \\- [other project](zkb://aglet/README.md)
+        \\
+    );
+
+    _ = try maintain.resolveLinks(gpa, &db);
+
+    var st = try db.prepare(
+        \\SELECT c.name FROM links l
+        \\JOIN docs d ON d.id = l.target_doc_id
+        \\JOIN collections c ON c.id = d.collection_id
+        \\JOIN docs src ON src.id = l.doc_id
+        \\WHERE src.rel_path = 'notes.md'
+    );
+    defer st.finalize();
+    try testing.expect(try st.step());
+    // Before this it resolved inside the *linking* document's collection, so
+    // this landed on docs/README.md — the wrong file, silently — or on nothing.
+    try testing.expectEqualStrings("aglet", st.columnText(0));
+}
+
+test "a relative link still means the collection it was written in" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const docs = try s.ensureCollection("docs", "/tmp/docs", 1000);
+    const aglet = try s.ensureCollection("aglet", "/tmp/aglet", 1000);
+
+    _ = try addDoc(&s, aglet, "README.md", "# aglet\n");
+    _ = try addDoc(&s, docs, "README.md", "# docs\n");
+    _ = try addDoc(&s, docs, "notes.md", "# Notes\n\n- [here](README.md)\n");
+
+    _ = try maintain.resolveLinks(gpa, &db);
+
+    var st = try db.prepare(
+        \\SELECT c.name FROM links l
+        \\JOIN docs d ON d.id = l.target_doc_id
+        \\JOIN collections c ON c.id = d.collection_id
+        \\JOIN docs src ON src.id = l.doc_id
+        \\WHERE src.rel_path = 'notes.md'
+    );
+    defer st.finalize();
+    try testing.expect(try st.step());
+    try testing.expectEqualStrings("docs", st.columnText(0));
 }

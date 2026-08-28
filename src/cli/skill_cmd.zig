@@ -91,18 +91,41 @@ fn writeUriScheme(w: *Writer) !void {
     try w.writeAll(
         \\## `zkb://` — the references inside these documents
         \\
-        \\Documents in this knowledge base cite each other as `zkb://projects/x/REQ.md`,
-        \\and so do the work items in `wip`. You will meet the scheme in output long
-        \\before anyone explains it: one ordinary `zkb query` returned 14 of them, and
-        \\the corpus holds 847.
+        \\Documents in this knowledge base cite each other as
+        \\`zkb://docs/projects/x/REQ.md`, and so do the work items in `wip`. You will
+        \\meet the scheme in output long before anyone explains it: one ordinary
+        \\`zkb query` returned 14 of them, and the corpus holds over a thousand.
         \\
-        \\**It is rooted at the collection, not relative to the document quoting it.**
-        \\`zkb://projects/x/REQ.md` means that exact path under the collection's root —
-        \\resolving it as a relative path is the single largest source of false
-        \\"broken link" findings, measured at 288 of 348 on this corpus.
+        \\**The first segment is the collection; the rest is the path inside it.**
+        \\Not relative to the document quoting it — resolving it as a relative path is
+        \\the single largest source of false "broken link" findings, measured at 288 of
+        \\348 on this corpus.
         \\
         \\```bash
-        \\zkb path zkb://projects/agent-rt/zkb/SPEC.md   # → /Users/…/docs/projects/…
+        \\zkb path zkb://docs/projects/agent-rt/zkb/SPEC.md   # → /Users/…/docs/projects/…
+        \\zkb path zkb://aglet/APP_LIFECYCLE.md               # → another collection entirely
+        \\```
+        \\
+        \\Naming the collection is what makes both of those possible. `index.md` exists
+        \\in three collections here, so a reference that omits the name cannot say
+        \\which one it means — and a link could not reach outside its own collection at
+        \\all.
+        \\
+        \\**Writing one.** The collection is the name in `zkb status`, not the directory
+        \\the file sits in. A document at `~/docs/projects/x/REQ.md` is
+        \\`zkb://docs/projects/x/REQ.md`: `docs` is the collection, `projects/x/REQ.md`
+        \\is its path inside it. If you are unsure which collection a file belongs to,
+        \\`zkb search` prints `collection/path` on every hit.
+        \\
+        \\**A relative link is still relative.** `[x](./REQ.md)` and `[[SKILL]]` name
+        \\nothing outside the collection they were written in, and they never had to.
+        \\Only the scheme form carries a collection, because only it can point out.
+        \\
+        \\**Finding references still in the old shape**, which name no collection and
+        \\therefore resolve to nothing:
+        \\
+        \\```bash
+        \\zkb maintain --check broken_link
         \\```
         \\
         \\Then read that path with whatever you normally read files with. **Do not go
@@ -111,8 +134,10 @@ fn writeUriScheme(w: *Writer) !void {
         \\already sitting in the field it was reading. The same lookup is 0.06s here,
         \\and it also answers whether the file is indexed at all.
         \\
-        \\Exit 2 means the path exists in more than one collection and no guess was
-        \\made; exit 3 means the index has never seen it.
+        \\`no such collection: X` means the first segment is not a collection name —
+        \\usually a reference written before the scheme carried one. Exit 3 also
+        \\covers "the index has never seen it"; exit 2 is a reference with no
+        \\collection at all that matches more than one.
         \\
         \\
     );

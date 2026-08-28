@@ -82,20 +82,63 @@ pub const Layout = struct {
     }
 };
 
-/// A `zkb://…` reference (or a bare relative path) reduced to the
-/// collection-relative path it names.
+pub const Uri = struct {
+    /// The collection the reference names, or null when it carried no scheme —
+    /// a relative or wiki link, which means "whichever collection I am in".
+    collection: ?[]const u8,
+    /// Path under that collection's root. Empty when the reference names the
+    /// collection itself (`zkb://docs`).
+    rel: []const u8,
+};
+
+/// Split a `zkb://collection/path` reference into its two halves.
 ///
-/// Any scheme is stripped, not just `zkb://`: `maintain` treats every
-/// non-network scheme as collection-rooted rather than relative to the document
-/// that mentions it, and a second rule here would make the resolver and the
-/// broken-link check disagree about what the same link means.
+/// **The first segment after the scheme is the collection name.** That is what
+/// the scheme is for: a collection is an identity, and an identity has to be
+/// sayable. Before this, everything after `://` was one path, looked up by
+/// `rel_path` across every collection at once. Three consequences, all
+/// measured on this corpus:
 ///
-/// Leading slashes go too — `zkb:///x.md` and `zkb://x.md` name the same
-/// document, and a caller assembling the string from parts will produce both.
-pub fn relFromUri(raw: []const u8) []const u8 {
+///   * `zkb://index.md` was ambiguous — `index.md` exists in `docs`, `synap`
+///     and `mitemite`, so it resolved to nothing and said "ambiguous".
+///   * A link could not name a document in another collection at all:
+///     `resolveLinks` matched inside the linking document's own collection, so
+///     a cross-collection reference was structurally a broken link.
+///   * A reference that resolved today could become ambiguous tomorrow, when an
+///     unrelated collection gained a file with the same relative path. Nothing
+///     about the link changed; the corpus around it did.
+///
+/// No fallback to the old reading. "Try collection first, then path" would
+/// resolve every existing link here — the eight collection names share nothing
+/// with any top-level directory in this corpus — and would silently flip the
+/// meaning of every `zkb://projects/…` the day somebody registers a collection
+/// called `projects`. `zkb path` already refuses to guess between two
+/// collections; guessing between two *readings* is worse, because that guess
+/// changes underneath a link that was written correctly.
+///
+/// Any scheme that is not a network or filesystem URL is read this way, so a
+/// corpus written against another tool's scheme keeps working — and now works
+/// *correctly*, since `qmd://notes/x.md` names the collection `notes` there too.
+///
+/// Leading slashes are dropped: `zkb:///docs/x.md` and `zkb://docs/x.md` name
+/// the same document, and a caller assembling the string from parts makes both.
+pub fn parseUri(raw: []const u8) Uri {
     var t = raw;
-    if (std.mem.indexOf(u8, t, "://")) |i| t = t[i + 3 ..];
-    return std.mem.trimStart(u8, t, "/");
+    var had_scheme = false;
+    if (std.mem.indexOf(u8, t, "://")) |i| {
+        had_scheme = true;
+        t = t[i + 3 ..];
+    }
+    t = std.mem.trimStart(u8, t, "/");
+    if (!had_scheme) return .{ .collection = null, .rel = t };
+    if (t.len == 0) return .{ .collection = null, .rel = "" };
+
+    const slash = std.mem.indexOfScalar(u8, t, '/') orelse
+        return .{ .collection = t, .rel = "" };
+    return .{
+        .collection = t[0..slash],
+        .rel = std.mem.trimStart(u8, t[slash + 1 ..], "/"),
+    };
 }
 
 pub const Error = error{ NoHomeDirectory, OutOfMemory };

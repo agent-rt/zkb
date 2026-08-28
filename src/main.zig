@@ -772,12 +772,13 @@ fn pathCmd(
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
-    // Any scheme, not just `zkb://`: `maintain` treats every non-network scheme
-    // as collection-rooted, and this must agree with it or the two disagree about
-    // what a link means.
-    const rel = zkb.paths.relFromUri(raw);
-    if (rel.len == 0) {
-        try w.writeAll("usage: zkb path <zkb://path/to/doc.md>\n");
+    // The same parse `maintain` uses on a link inside a document. Two rules for
+    // one scheme is how the resolver and the broken-link check come to disagree
+    // about what the same reference means.
+    const uri = zkb.paths.parseUri(raw);
+    if (uri.rel.len == 0) {
+        try w.writeAll("usage: zkb path <zkb://collection/path/to/doc.md>\n");
+        if (uri.collection) |c| try w.print("(\"{s}\" names a collection; add the path under it)\n", .{c});
         return 2;
     }
 
@@ -790,14 +791,26 @@ fn pathCmd(
     var db = try zkb.store.open(db_path, .read_only);
     defer db.close();
 
-    var st = try db.prepare(
-        \\SELECT col.name, col.root FROM docs d
-        \\JOIN collections col ON col.id = d.collection_id
-        \\WHERE d.rel_path = ?1
-        \\ORDER BY col.name
-    );
+    // With a collection named there is nothing to be ambiguous about, which is
+    // the point of naming it. Without one — a bare `docs/x.md` typed by hand —
+    // the old whole-corpus search is still the useful answer, ambiguity report
+    // and all.
+    var st = if (uri.collection) |_|
+        try db.prepare(
+            \\SELECT col.name, col.root FROM docs d
+            \\JOIN collections col ON col.id = d.collection_id
+            \\WHERE col.name = ?2 AND d.rel_path = ?1
+        )
+    else
+        try db.prepare(
+            \\SELECT col.name, col.root FROM docs d
+            \\JOIN collections col ON col.id = d.collection_id
+            \\WHERE d.rel_path = ?1
+            \\ORDER BY col.name
+        );
     defer st.finalize();
-    try st.bindText(1, rel);
+    try st.bindText(1, uri.rel);
+    if (uri.collection) |c| try st.bindText(2, c);
 
     var found: usize = 0;
     var first_root: []u8 = &.{};
@@ -813,17 +826,39 @@ fn pathCmd(
     }
 
     if (found == 0) {
-        try w.print("not in the index: {s}\n", .{rel});
+        // Which half is wrong decides what to do about it, and the caller cannot
+        // tell them apart from "not in the index". Migrating a corpus to the
+        // collection-qualified form makes this the common failure: every link
+        // still in the old shape names a collection that does not exist, and
+        // saying so is the difference between one edit and a hunt.
+        if (uri.collection) |c| {
+            if (!try collectionExists(&db, c)) {
+                try w.print("no such collection: {s}\n", .{c});
+                try w.writeAll("the first segment after zkb:// is the collection name\n");
+                try w.writeAll("zkb status lists them\n");
+                return 3;
+            }
+            try w.print("not in collection {s}: {s}\n", .{ c, uri.rel });
+        } else {
+            try w.print("not in the index: {s}\n", .{uri.rel});
+        }
         try w.writeAll("the file may exist but be unindexed — run: zkb index\n");
         return 3;
     }
     if (found > 1) {
-        try w.print("ambiguous: {s} exists in {d} collections ({s})\n", .{ rel, found, names.items });
+        try w.print("ambiguous: {s} exists in {d} collections ({s})\n", .{ uri.rel, found, names.items });
         try w.writeAll("no guess is made; name the collection's root yourself\n");
         return 2;
     }
-    try w.print("{s}/{s}\n", .{ first_root, rel });
+    try w.print("{s}/{s}\n", .{ first_root, uri.rel });
     return 0;
+}
+
+fn collectionExists(db: *zkb.sqlite.Db, name: []const u8) !bool {
+    var st = try db.prepare("SELECT 1 FROM collections WHERE name = ?1");
+    defer st.finalize();
+    try st.bindText(1, name);
+    return try st.step();
 }
 
 fn status(

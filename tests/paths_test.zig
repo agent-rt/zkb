@@ -75,17 +75,60 @@ test "the socket path stays well inside the sun_path limit" {
     try testing.expect(l.sock.len < 104);
 }
 
-test "relFromUri strips any collection scheme, and the slashes after it" {
-    // `maintain` treats every non-network scheme as collection-rooted, so this
-    // must too — a second rule would make the resolver and the broken-link check
-    // disagree about the same link.
-    const f = zkb.paths.relFromUri;
-    try testing.expectEqualStrings("projects/x/REQ.md", f("zkb://projects/x/REQ.md"));
-    try testing.expectEqualStrings("projects/x/REQ.md", f("zkb:///projects/x/REQ.md"));
-    try testing.expectEqualStrings("projects/x/REQ.md", f("lore://projects/x/REQ.md"));
-    // A bare path is already what we want.
-    try testing.expectEqualStrings("projects/x/REQ.md", f("projects/x/REQ.md"));
-    try testing.expectEqualStrings("projects/x/REQ.md", f("/projects/x/REQ.md"));
-    // Nothing after the scheme is an empty request, not a root listing.
-    try testing.expectEqualStrings("", f("zkb://"));
+test "parseUri takes the first segment as the collection" {
+    // `maintain` reads a link this way, so this must too — a second rule would
+    // make the resolver and the broken-link check disagree about one link.
+    const f = zkb.paths.parseUri;
+
+    const a = f("zkb://docs/projects/x/REQ.md");
+    try testing.expectEqualStrings("docs", a.collection.?);
+    try testing.expectEqualStrings("projects/x/REQ.md", a.rel);
+
+    // Extra slashes after the scheme name the same thing; a caller assembling
+    // the string from parts produces both.
+    const b = f("zkb:///docs/projects/x/REQ.md");
+    try testing.expectEqualStrings("docs", b.collection.?);
+    try testing.expectEqualStrings("projects/x/REQ.md", b.rel);
+
+    // Any non-network scheme, so a corpus written against another tool's scheme
+    // keeps working — and reads its collection correctly.
+    const c = f("qmd://notes/x.md");
+    try testing.expectEqualStrings("notes", c.collection.?);
+    try testing.expectEqualStrings("x.md", c.rel);
+}
+
+test "a scheme with no path names a collection, not a document" {
+    const u = zkb.paths.parseUri("zkb://docs");
+    try testing.expectEqualStrings("docs", u.collection.?);
+    try testing.expectEqualStrings("", u.rel);
+}
+
+test "a reference with no scheme names no collection" {
+    const f = zkb.paths.parseUri;
+    // A relative or wiki link means "in whichever collection I am already in",
+    // which is the only reading available to a reference that never said one.
+    const a = f("projects/x/REQ.md");
+    try testing.expect(a.collection == null);
+    try testing.expectEqualStrings("projects/x/REQ.md", a.rel);
+
+    const b = f("/projects/x/REQ.md");
+    try testing.expect(b.collection == null);
+    try testing.expectEqualStrings("projects/x/REQ.md", b.rel);
+}
+
+test "nothing after the scheme is an empty request" {
+    const u = zkb.paths.parseUri("zkb://");
+    try testing.expect(u.collection == null);
+    try testing.expectEqualStrings("", u.rel);
+}
+
+test "the old reading is gone, deliberately" {
+    // `zkb://projects/x/REQ.md` used to mean the rel_path `projects/x/REQ.md`
+    // in whichever collection had it. It now means the collection `projects`.
+    // Pinned as a test because the corpus was migrated on this promise: a
+    // fallback that tried both readings would flip meaning the day somebody
+    // registers a collection called `projects`.
+    const u = zkb.paths.parseUri("zkb://projects/x/REQ.md");
+    try testing.expectEqualStrings("projects", u.collection.?);
+    try testing.expectEqualStrings("x/REQ.md", u.rel);
 }
