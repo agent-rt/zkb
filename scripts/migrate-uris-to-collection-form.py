@@ -49,6 +49,8 @@ def collections() -> dict[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true", help="apply; otherwise report only")
+    ap.add_argument("--collection", action="append", default=None,
+                    help="limit to these collections; repeatable. Default: all of them.")
     args = ap.parse_args()
 
     roots = collections()
@@ -75,6 +77,8 @@ def main() -> int:
     per_collection: Counter[str] = Counter()
 
     for coll, rel in docs:
+        if args.collection and coll not in args.collection:
+            continue
         root = roots.get(coll)
         if root is None:
             continue
