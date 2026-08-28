@@ -240,6 +240,7 @@ pub fn run(
     // Printed whenever it is nonzero, not only when nothing was seen: a root that
     // suddenly indexes less deserves the same one-word explanation.
     if (report.ignored != 0) try w.print(", ignored {d}", .{report.ignored});
+    if (report.escaped != 0) try w.print(", symlinks out of root {d}", .{report.escaped});
     try w.writeAll("\n");
     try w.flush();
 

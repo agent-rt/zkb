@@ -15,6 +15,7 @@ const store = @import("../db/store.zig");
 const hash = @import("../util/hash.zig");
 const glob = @import("glob.zig");
 const ignoremod = @import("ignore.zig");
+const paths = @import("../util/paths.zig");
 
 pub const Report = struct {
     seen: usize = 0,
@@ -37,6 +38,14 @@ pub const Report = struct {
     /// silently. Found by putting a test tree under `.zig-cache`, which this
     /// project's own `.gitignore` excludes.
     ignored: usize = 0,
+    /// Symbolic links whose target resolves outside the collection root.
+    ///
+    /// Counted rather than merged into `ignored` because the two mean opposite
+    /// things to whoever reads the number: an ignored file is one the corpus
+    /// asked to leave out, and this is one the corpus asked to pull *in* from
+    /// somewhere it does not own. A non-zero count on a collection you did not
+    /// author is worth looking at.
+    escaped: usize = 0,
 };
 
 pub const Filters = struct {
@@ -83,6 +92,11 @@ pub fn reconcile(
 
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true });
     defer dir.close(io);
+
+    // The root goes through the same resolution as a link's target, or every
+    // link inside a root that is itself reached through one — `/tmp` is
+    // `/private/tmp` on macOS — would look like an escape.
+    const root_real = try paths.realpath(arena, io, root);
 
     // Rules accumulate outermost-first, which is what makes last-match-wins mean
     // "deeper and later overrides": any `.gitignore` between the git repo root
@@ -141,6 +155,30 @@ pub fn reconcile(
         }
 
         if (!hasExtension(entry.basename, filters.extensions)) continue;
+
+        // A symbolic link is indexed as the file it points at, so it can carry
+        // content from outside the collection into the index — and from there
+        // into whatever `search` and `recall` hand an agent. Registering a
+        // cloned repository as a collection is enough to make that somebody
+        // else's choice: one `ln -s ~/.ssh/id_rsa notes.md` committed to the
+        // repository is all it takes.
+        //
+        // Links are still followed inside the root, which is the use this
+        // costs nothing: `~/docs/projects/x -> ~/work/x` keeps working.
+        // Resolution is per component (see `paths.realpath`) because a lexical
+        // check is defeated by a two-link chain.
+        if (entry.kind == .sym_link) {
+            const abs = try std.fs.path.join(arena, &.{ root, entry.path });
+            const real = paths.realpath(arena, io, abs) catch {
+                report.escaped += 1;
+                continue;
+            };
+            if (!paths.isInside(root_real, real)) {
+                report.escaped += 1;
+                continue;
+            }
+        }
+
         if (!glob.matchAny(filters.include, entry.path)) continue;
         if (ignorer.isIgnored(entry.path, false)) {
             report.ignored += 1;

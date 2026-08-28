@@ -207,6 +207,13 @@ pub fn status(
         try w.print("embed    {d} interactive, {d} ingest served; max preempted {d}\n", .{
             intOf(r, "served_interactive"), intOf(r, "served_ingest"), intOf(r, "max_preempted"),
         });
+        // `zkb index` prints this for the run a person watched; the daemon does
+        // most of the scanning, and without it here the same skip is silent for
+        // every scan they did not.
+        const escaped = intOf(r, "escaped_links");
+        if (escaped != 0) {
+            try w.print("symlinks {d} skipped: target resolves outside the collection root\n", .{escaped});
+        }
         if (boolOf(r, "drift")) {
             try w.writeAll("\nWARNING index drift between chunks / fts / vec\n");
             return 1;

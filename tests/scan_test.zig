@@ -56,6 +56,21 @@ const Tree = struct {
     fn remove(self: *Tree, rel: []const u8) !void {
         try self.handle.deleteFile(self.io, rel);
     }
+
+    /// `target` is written into the link verbatim, so a test can choose between
+    /// an absolute escape and a relative `../` one — they take different paths
+    /// through the resolver.
+    fn symlink(self: *Tree, target: []const u8, rel: []const u8) !void {
+        if (std.fs.path.dirname(rel)) |sub| {
+            var d = try self.handle.createDirPathOpen(self.io, sub, .{});
+            d.close(self.io);
+        }
+        try self.handle.symLink(self.io, target, rel, .{});
+    }
+
+    fn join(self: *Tree, arena: std.mem.Allocator, rel: []const u8) ![]u8 {
+        return std.fs.path.join(arena, &.{ self.root, rel });
+    }
 };
 
 fn openMem() !zkb.sqlite.Db {
@@ -245,6 +260,175 @@ test "forget stays irreversible: archive cannot be re-included" {
             const r = try scan.reconcile(gpa, io, &s, cid, tree.root, zkb.memory.scan_filters, 1000);
             try testing.expectEqual(@as(usize, 1), r.seen);
             try testing.expect((try s.findDoc(cid, "archive/forgotten.md")) == null);
+        }
+    }.run);
+}
+
+// ---------------------------------------------------------------------------
+// symbolic links
+//
+// A link is indexed as the file it points at, so before this it could carry
+// content from anywhere on the disk into the index — and from there into what
+// `search` and `recall` hand an agent. Registering a cloned repository as a
+// collection makes that somebody else's choice.
+// ---------------------------------------------------------------------------
+
+test "a link inside the root is followed" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            try tree.write("real.md", "# 真文件\n\n内容在这里。\n");
+            try tree.symlink("real.md", "alias.md");
+            try tree.symlink("../real.md", "sub/deep.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            // The root is under /tmp, which on macOS is itself a link to
+            // /private/tmp. If the root were not resolved the same way as the
+            // target, every one of these would look like an escape.
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 0), r.escaped);
+            try testing.expectEqual(@as(usize, 3), r.seen);
+        }
+    }.run);
+}
+
+test "a link out of the root is skipped and counted" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var outside = try Tree.init(io);
+            defer outside.deinit();
+            try outside.write("secret.md", "# 不该被索引的东西\n");
+
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+            try tree.write("real.md", "# 真文件\n");
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const target = try outside.join(arena_state.allocator(), "secret.md");
+            try tree.symlink(target, "leak.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 1), r.escaped);
+            try testing.expectEqual(@as(usize, 1), r.seen);
+
+            const paths = try pathsIn(&db, arena_state.allocator(), cid);
+            try testing.expectEqual(@as(usize, 1), paths.len);
+            try testing.expectEqualStrings("real.md", paths[0]);
+        }
+    }.run);
+}
+
+test "a relative ../ escape is skipped" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+            // Climbs out of /tmp/zkb-scan-test-*/ entirely.
+            try tree.symlink("../../etc/hosts", "hosts.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 1), r.escaped);
+            try testing.expectEqual(@as(usize, 0), r.seen);
+        }
+    }.run);
+}
+
+test "a two-link chain out of the root is skipped" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var outside = try Tree.init(io);
+            defer outside.deinit();
+            try outside.write("secret.md", "# 不该被索引的东西\n");
+
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const target = try outside.join(arena_state.allocator(), "secret.md");
+
+            // The case a lexical resolver gets wrong: `a.md` points at `b.md`,
+            // which is inside the root, so `std.fs.path.resolve` says the link
+            // stays home. Only following the chain per component sees that it
+            // does not. Two `ln -s` in a repository is no harder than one.
+            try tree.symlink(target, "b.md");
+            try tree.symlink("b.md", "a.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 2), r.escaped);
+            try testing.expectEqual(@as(usize, 0), r.seen);
+        }
+    }.run);
+}
+
+test "a link through a symlinked directory is skipped" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var outside = try Tree.init(io);
+            defer outside.deinit();
+            try outside.write("secret.md", "# 不该被索引的东西\n");
+
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+
+            // `sub` is a link to a directory elsewhere. The walker never
+            // descends into it — a linked directory is not `.directory` — but a
+            // link *through* it would still resolve, if resolution stopped at
+            // the last component.
+            try tree.symlink(outside.root, "sub");
+            try tree.symlink("sub/secret.md", "via.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 1), r.escaped);
+            try testing.expectEqual(@as(usize, 0), r.seen);
+        }
+    }.run);
+}
+
+test "a dangling link is skipped, not counted as readable" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tree = try Tree.init(io);
+            defer tree.deinit();
+            try tree.symlink("nowhere.md", "broken.md");
+
+            var db = try openMem();
+            defer db.close();
+            var s = store.Store.init(&db);
+            const cid = try s.ensureCollection("t", tree.root, 1000);
+
+            // The target does not exist, so it resolves to where it *would* be —
+            // inside the root — and is admitted here, then fails to open. The
+            // point is that it neither crashes nor lands in the index.
+            const r = try scan.reconcile(gpa, io, &s, cid, tree.root, .{}, 1000);
+            try testing.expectEqual(@as(usize, 0), r.queued);
         }
     }.run);
 }

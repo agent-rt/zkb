@@ -197,3 +197,92 @@ pub fn selfExe(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// realpath
+// ---------------------------------------------------------------------------
+
+/// How many links may be followed before the path is called a loop.
+const max_link_hops = 64;
+
+pub const RealpathError = error{ SymLinkLoop, OutOfMemory };
+
+/// Resolve `abs` to an equivalent path containing no symbolic link.
+///
+/// Zig 0.16 dropped `realpath` when the IO model changed, leaving only
+/// `readLink`. The lexical `std.fs.path.resolve` is not a substitute where the
+/// answer is used as a security boundary: it cannot see that `a.md -> b.md ->
+/// /etc/passwd` leaves the tree, nor that `sub` in `sub/c.md` is itself a link
+/// out of it. Each of those is one `ln -s` for whoever wrote the repository
+/// being indexed, so resolution has to be per component, not per path.
+///
+/// A component that does not exist is not an error: it is kept as written and
+/// resolution continues, so a path that is not there still resolves to where it
+/// would be. Callers here are asking "is this inside that tree", and a missing
+/// file has an answer to that question.
+pub fn realpath(arena: std.mem.Allocator, io: std.Io, abs: []const u8) RealpathError![]u8 {
+    // Components still to consume, innermost last so it can be used as a stack.
+    // Following a link pushes the link's own components back on, which is what
+    // makes a chain resolve without recursion.
+    var todo: std.ArrayList([]const u8) = .empty;
+    defer todo.deinit(arena);
+    try pushReversed(arena, &todo, abs);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(arena);
+
+    var hops: usize = 0;
+    var buf: [4096]u8 = undefined;
+
+    while (todo.pop()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".")) continue;
+        if (std.mem.eql(u8, comp, "..")) {
+            if (std.mem.lastIndexOfScalar(u8, out.items, '/')) |i| out.shrinkRetainingCapacity(i);
+            continue;
+        }
+
+        const mark = out.items.len;
+        try out.append(arena, '/');
+        try out.appendSlice(arena, comp);
+
+        const n = std.Io.Dir.readLinkAbsolute(io, out.items, &buf) catch continue;
+        const target = buf[0..n];
+
+        hops += 1;
+        if (hops > max_link_hops) return error.SymLinkLoop;
+
+        // An absolute target restarts the walk; a relative one is taken from the
+        // directory holding the link, which is `out` with this component removed.
+        out.shrinkRetainingCapacity(if (std.fs.path.isAbsolute(target)) 0 else mark);
+        try pushReversed(arena, &todo, target);
+    }
+
+    // "/" itself, and any path that popped its way back to the root.
+    if (out.items.len == 0) return arena.dupe(u8, "/");
+    return out.toOwnedSlice(arena);
+}
+
+/// Push `path`'s components so the leftmost is popped first. The slices are
+/// duped because a link target read into a stack buffer outlives nothing.
+fn pushReversed(arena: std.mem.Allocator, todo: *std.ArrayList([]const u8), path: []const u8) error{OutOfMemory}!void {
+    const start = todo.items.len;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |c| {
+        if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
+        try todo.append(arena, try arena.dupe(u8, c));
+    }
+    std.mem.reverse([]const u8, todo.items[start..]);
+}
+
+/// Is `path` inside `root`, or `root` itself?
+///
+/// The comparison is on a component boundary, so `/a/roots` is not inside
+/// `/a/root`. Both sides are expected to have been through `realpath` already —
+/// this function does no IO and cannot see a link.
+pub fn isInside(root: []const u8, path: []const u8) bool {
+    const r = std.mem.trimEnd(u8, root, "/");
+    if (r.len == 0) return true; // everything is inside "/"
+    if (!std.mem.startsWith(u8, path, r)) return false;
+    if (path.len == r.len) return true;
+    return path[r.len] == '/';
+}

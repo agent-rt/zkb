@@ -137,6 +137,14 @@ pub const State = struct {
     /// load that ingestion is competing, which is worth being able to see.
     starvation_overrides: usize = 0,
 
+    /// Symbolic links skipped this run because their target resolved outside
+    /// the collection root. Surfaced in `stats` because the daemon is how most
+    /// corpora stay fresh: `zkb index` prints the count for the run a person
+    /// watched, and without this the same skip is silent for every scan they
+    /// did not. A collection someone else authored is exactly the one where a
+    /// nonzero number is worth seeing.
+    escaped_links: usize = 0,
+
     running: std.atomic.Value(bool) = .init(true),
     started_ms: i64 = 0,
     conns: std.atomic.Value(usize) = .init(0),
@@ -336,7 +344,9 @@ fn ingestThread(st: *State) void {
 
         for (pass_roots) |r| {
             const cid = r.id;
-            _ = scan.reconcile(st.gpa, st.io, &s, cid, r.path, r.filters, nowMs(st.io)) catch {};
+            if (scan.reconcile(st.gpa, st.io, &s, cid, r.path, r.filters, nowMs(st.io))) |rep| {
+                st.escaped_links += rep.escaped;
+            } else |_| {}
             if (r.kind == .records) {
                 _ = records.reconcileOverrides(st.gpa, st.io, &db, r.path) catch 0;
             }
@@ -631,7 +641,7 @@ fn handleStats(st: *State, db: *sqlite.Db, w: *std.Io.Writer, id: i64) !void {
         "{{\"docs\":{d},\"chunks\":{d},\"pending\":{d},\"failed\":{d}," ++
             "\"fts_rows\":{d},\"vec_rows\":{d},\"drift\":{}," ++
             "\"served_interactive\":{d},\"served_ingest\":{d},\"max_preempted\":{d}," ++
-            "\"scanning\":{},\"starvation_overrides\":{d}}}",
+            "\"scanning\":{},\"starvation_overrides\":{d},\"escaped_links\":{d}}}",
         .{
             c.docs,                                           c.chunks,
             c.pending,                                        c.failed,
@@ -639,6 +649,7 @@ fn handleStats(st: *State, db: *sqlite.Db, w: *std.Io.Writer, id: i64) !void {
             c.chunks != c.fts_rows or c.chunks != c.vec_rows, st.queue.served_interactive,
             st.queue.served_ingest,                           st.queue.max_preempted,
             st.scanning.load(.acquire),          st.starvation_overrides,
+            st.escaped_links,
         },
     );
     try proto.finishOk(w);
