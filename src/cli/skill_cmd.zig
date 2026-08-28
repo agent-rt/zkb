@@ -30,6 +30,7 @@ pub fn run(
     try writeFrontmatter(w);
     try writeOverview(w);
     try writeDecisionTable(w);
+    try writeScope(w);
     try writeLocalState(gpa, io, w, &layout);
     try writeGotchas(w);
     try writeEscapeHatch(w);
@@ -77,8 +78,46 @@ fn writeDecisionTable(w: *Writer) !void {
         \\| What do I know about this user? | `zkb recall [topic]` | Facts snapshot + memories, ranked by relevance *and* recency |
         \\| What is the exact number? | `zkb records <type> --where/--agg` or `zkb facts <key>` | **Numbers are not in the vector index** — search cannot answer them |
         \\
-        \\Start a session with `zkb recall`. It is cheap (1500 tokens) and it is how
-        \\you find out what was already decided.
+        \\Start a session with `zkb recall --scope <project>` (see below). It is
+        \\cheap (1500 tokens) and it is how you find out what was already decided.
+        \\
+        \\
+    );
+}
+
+fn writeScope(w: *Writer) !void {
+    try w.writeAll(
+        \\## Scope — which project this session is in
+        \\
+        \\zkb never guesses this. It does not look at the working directory, because
+        \\guessing wrong leaks one project's memories into another, which is the
+        \\thing scope exists to prevent. You are the caller, so you say it:
+        \\
+        \\```bash
+        \\root=$(git rev-parse --show-toplevel 2>/dev/null || jj workspace root 2>/dev/null || echo "$PWD")
+        \\zkb recall --scope "$(basename "$root")"
+        \\```
+        \\
+        \\**The repository root, not `$PWD`.** Run from a subdirectory the two
+        \\differ, and the failure is silent both ways: a scope of `src` matches
+        \\nothing, a scope of `docs` matches a different project's memories. The
+        \\same rule names a handoff's `project:` field, so the two come from one
+        \\fact rather than two conventions.
+        \\
+        \\**Pass the same string when writing.** `zkb remember --scope <project>`
+        \\for anything true only inside that project; leave it off for what holds
+        \\everywhere. Written under one string and recalled under another, a memory
+        \\is invisible and nothing reports it — this is the one mistake here that
+        \\does not announce itself.
+        \\
+        \\| Call | You get |
+        \\|---|---|
+        \\| `zkb recall` | universal memories only |
+        \\| `zkb recall --scope X` | universal memories, plus those labelled X |
+        \\
+        \\A label is never shown to another label. That is what makes it safe to
+        \\record something project-specific instead of dropping it into universal,
+        \\where it would open every session you have.
         \\
         \\
     );
