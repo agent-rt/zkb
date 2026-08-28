@@ -94,16 +94,41 @@ were keyword-only.
 
 ## Cross-document links
 
-`zkb://projects/x/REQ.md` is rooted at the collection, not at the directory of
-the document that mentions it. Resolving such a URI as a relative path was the
-single largest source of false "broken link" findings — 288 of 348 on one corpus.
+`zkb://docs/projects/x/REQ.md` names a collection and a path inside it, not a
+path relative to the document that mentions it. Resolving such a URI as a
+relative path was the single largest source of false "broken link" findings —
+288 of 348 on one corpus.
+
+**The first segment is the collection**, since 0.0.32. Before that everything
+after `://` was one path, looked up by `rel_path` across every collection at
+once, and three things followed: `zkb://index.md` was ambiguous (three
+collections had one), a link could not name a document outside its own
+collection at all, and a reference that resolved today could become ambiguous
+tomorrow when an unrelated collection gained a file with the same path. No
+fallback to the old reading was kept — "try collection, then path" would resolve
+everything today and flip the meaning of `zkb://projects/…` the day somebody
+registers a collection called `projects`.
 
 **The scheme is not matched.** Anything that is not a network or filesystem URL
-(`http`, `https`, `file`, `ftp`, `data`) is treated as collection-rooted. `zkb://`
-is the documented spelling, but a corpus already written against another tool's
-scheme keeps resolving with no migration — which matters when the links number in
-the hundreds. Wikilinks (`[[name]]`) are global by stem for the same reason:
-resolving one relative to the linking document finds the wrong file, or nothing.
+(`http`, `https`, `file`, `ftp`, `data`) is read as collection-rooted, so a
+corpus written against another tool's scheme keeps resolving with no migration.
+That generosity is for *reading only*. A migration script that rewrote on the
+same rule turned `otrans://auth` into `otrans://docs/auth` and `wss://host` into
+`wss://docs/host` — 38 edits across 19 files, in prose and code samples that
+were never links. An unknown scheme is somebody else's namespace until it is in
+the index; only the reading side may assume otherwise.
+
+Wikilinks (`[[name]]`) are global by stem for the same reason: resolving one
+relative to the linking document finds the wrong file, or nothing.
+
+**A resolver change must invalidate what the old one produced.** `resolveLinks`
+only looks at links with no target yet, so after 0.0.32 shipped, 928 of 932
+scheme links still carried a target computed by the old reading and `maintain`
+reported the index healthy. Each would have broken silently and separately
+whenever its document was next re-indexed. `zkb maintain --relink` exists for
+exactly this, and rewrites the graph rather than the index — re-indexing would
+also fix it, at the cost of re-embedding every chunk over a problem no embedding
+was involved in.
 
 ## Numbers are not retrievable
 

@@ -1007,6 +1007,16 @@ fn normalizeTarget(
     //
     // Generic on purpose: any scheme that is not a network or filesystem URL is
     // read this way, so no tool's name is hardcoded here.
+    //
+    // **The generosity is safe for reading and unsafe for writing.** Guessing
+    // that `otrans://auth` is a collection reference costs one link reported
+    // broken, which a person then ignores. A migration that *rewrote* on the
+    // same rule turned `otrans://auth` into `otrans://docs/auth`, `wss://host`
+    // into `wss://docs/host`, and an `aglet://` deep link into a different one —
+    // 38 edits across 19 files, in prose and code samples that were never links
+    // at all. Whatever reads this comment next and is tempted to reuse the rule
+    // for a rewrite: an unknown scheme is somebody else's namespace until it is
+    // in the index, and only the reading side may assume otherwise.
     const scheme_end = std.mem.indexOf(u8, t, "://");
     const is_collection_uri = if (scheme_end) |e| !isExternalScheme(t[0..e]) else false;
     var named_collection: ?[]const u8 = null;
