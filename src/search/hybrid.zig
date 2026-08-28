@@ -76,7 +76,13 @@ pub const Hit = struct {
     /// written out rather than walked with `std.meta.fields` the way
     /// `roots.Registration` is — the names are a contract with clients, not a
     /// projection of the type.
-    pub fn writeJson(self: Hit, w: *std.Io.Writer) !void {
+    /// `context` is passed in rather than carried on the struct: a `Hit`'s strings
+    /// are owned by the gpa that ran the search and freed by `freeHit`, while a
+    /// description is looked up afterwards out of a caller's arena. Mixing the
+    /// two lifetimes on one type is how a double free gets written. Taking it as
+    /// a parameter also means neither path can emit a hit without having decided
+    /// where its context comes from.
+    pub fn writeJson(self: Hit, w: *std.Io.Writer, context: ?[]const u8) !void {
         try w.print("{{\"chunk_id\":{d},\"score\":{d:.6},", .{ self.chunk_id, self.score });
         if (self.vec_rank) |r| try w.print("\"vec_rank\":{d},", .{r}) else try w.writeAll("\"vec_rank\":null,");
         if (self.fts_rank) |r| try w.print("\"fts_rank\":{d},", .{r}) else try w.writeAll("\"fts_rank\":null,");
@@ -90,7 +96,12 @@ pub const Hit = struct {
         try std.json.Stringify.value(self.heading_path, .{}, w);
         try w.writeAll(",\"text\":");
         try std.json.Stringify.value(self.text, .{}, w);
-        try w.print(",\"chunk_idx\":{d},\"n_tokens\":{d}}}", .{ self.idx, self.n_tokens });
+        try w.print(",\"chunk_idx\":{d},\"n_tokens\":{d}", .{ self.idx, self.n_tokens });
+        if (context) |c| {
+            try w.writeAll(",\"context\":");
+            try std.json.Stringify.value(c, .{}, w);
+        }
+        try w.writeAll("}");
     }
 };
 

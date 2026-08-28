@@ -27,6 +27,7 @@ pub const memory = @import("memory.zig");
 pub const recall = @import("recall.zig");
 pub const records = @import("records.zig");
 pub const bench = @import("bench.zig");
+pub const contexts = @import("contexts.zig");
 pub const expr = @import("query/expr.zig");
 pub const saved_sql = @import("query/saved.zig");
 pub const embed_queue = @import("embed/queue.zig");

@@ -115,8 +115,12 @@ pub fn run(
     var s = zkb.store.Store.init(&db);
     const counts = try s.counts();
 
+    var ctx_arena = std.heap.ArenaAllocator.init(gpa);
+    defer ctx_arena.deinit();
+    const ctx = zkb.contexts.load(ctx_arena.allocator(), io, &layout) catch zkb.contexts.Map.empty;
+
     if (opts.json) {
-        try printJson(w, &results, counts);
+        try printJson(ctx_arena.allocator(), ctx, w, &results, counts);
         return 0;
     }
 
@@ -143,6 +147,11 @@ pub fn run(
         if (h.vec_rank) |r| try w.print(" vec#{d}", .{r});
         if (h.fts_rank) |r| try w.print(" fts#{d}", .{r});
         try w.print(" chunk {d}]\n", .{h.idx});
+        // Before the heading path, because it is the wider fact: what this
+        // subtree is, then where in the document the chunk sits.
+        if (try ctx.joinedForPath(ctx_arena.allocator(), h.collection, h.rel_path)) |c| {
+            try w.print("   ({s})\n", .{c});
+        }
         if (h.heading_path.len != 0) try w.print("   {s}\n", .{h.heading_path});
         try w.writeAll("   ");
         try writeExcerpt(w, h.text, if (opts.full) h.text.len else 220);
@@ -169,7 +178,13 @@ fn writeExcerpt(w: *Writer, text: []const u8, max_bytes: usize) !void {
     if (end < text.len) try w.writeAll(" ...");
 }
 
-fn printJson(w: *Writer, results: *const zkb.hybrid.Results, counts: zkb.store.Store.Counts) !void {
+fn printJson(
+    arena: std.mem.Allocator,
+    ctx: zkb.contexts.Map,
+    w: *Writer,
+    results: *const zkb.hybrid.Results,
+    counts: zkb.store.Store.Counts,
+) !void {
     try w.print("{{\"mode\":\"{t}\",\"fts_skipped\":{},", .{ results.mode, results.fts_skipped });
     try w.print("\"index\":{{\"docs\":{d},\"chunks\":{d},\"pending\":{d},\"failed\":{d},\"complete\":{}}},", .{
         counts.docs,                                counts.chunks, counts.pending, counts.failed,
@@ -183,7 +198,7 @@ fn printJson(w: *Writer, results: *const zkb.hybrid.Results, counts: zkb.store.S
     try w.writeAll("],\"hits\":[");
     for (results.hits, 0..) |h, i| {
         if (i != 0) try w.writeAll(",");
-        try h.writeJson(w);
+        try h.writeJson(w, try ctx.joinedForPath(arena, h.collection, h.rel_path));
     }
     try w.writeAll("]}\n");
 }
@@ -269,6 +284,11 @@ fn renderDaemonResult(w: *Writer, result: std.json.Value, opts: Options) !void {
         if (o.get("vec_rank")) |v| if (v == .integer) try w.print(" vec#{d}", .{v.integer});
         if (o.get("fts_rank")) |v| if (v == .integer) try w.print(" fts#{d}", .{v.integer});
         try w.print(" chunk {d}]\n", .{jsonInt(o, "chunk_idx")});
+        // The daemon put this in the JSON; printing it only on the in-process
+        // path would make the same query show different things depending on
+        // whether a daemon happened to be running.
+        const context = jsonStr(o, "context");
+        if (context.len != 0) try w.print("   ({s})\n", .{context});
         const heading = jsonStr(o, "heading_path");
         if (heading.len != 0) try w.print("   {s}\n", .{heading});
         try w.writeAll("   ");

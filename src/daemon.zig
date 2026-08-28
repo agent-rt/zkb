@@ -24,6 +24,7 @@ const store = @import("db/store.zig");
 const schema = @import("db/schema.zig");
 const scan = @import("ingest/scan.zig");
 const rootsmod = @import("ingest/roots.zig");
+const contexts = @import("contexts.zig");
 const indexer = @import("ingest/indexer.zig");
 const hybrid = @import("search/hybrid.zig");
 const packmod = @import("search/pack.zig");
@@ -969,6 +970,13 @@ fn searchAndWrite(
     var s = store.Store.init(db);
     const c = try s.counts();
 
+    // Loaded per search rather than cached on the daemon: the file is a few
+    // rows, and a cache would go stale exactly when someone has just edited it
+    // to fix a description they saw in a result.
+    var ctx_arena = std.heap.ArenaAllocator.init(st.gpa);
+    defer ctx_arena.deinit();
+    const ctx = contexts.load(ctx_arena.allocator(), st.io, &st.layout) catch contexts.Map.empty;
+
     try proto.beginOk(w, id);
     try w.print("{{\"mode\":\"{t}\",\"fts_skipped\":{},", .{ results.mode, results.fts_skipped });
     try w.print(
@@ -988,7 +996,7 @@ fn searchAndWrite(
     try w.writeAll("],\"hits\":[");
     for (results.hits, 0..) |h, i| {
         if (i != 0) try w.writeAll(",");
-        try h.writeJson(w);
+        try h.writeJson(w, ctx.joinedForPath(ctx_arena.allocator(), h.collection, h.rel_path) catch null);
     }
     try w.writeAll("]}");
     try proto.finishOk(w);

@@ -193,12 +193,29 @@ fn writeLocalState(
         try w.writeAll(".\n\n");
     } else |_| {}
 
-    try writeCollections(gpa, &db, w);
+    try writeCollections(gpa, io, layout, &db, w);
     try writeRecordTypes(gpa, &db, w);
     try writeFactKeys(gpa, io, w, layout);
 }
 
-fn writeCollections(gpa: std.mem.Allocator, db: *zkb.sqlite.Db, w: *Writer) !void {
+/// The collections, with what each one *is* when the corpus says so.
+///
+/// The description column is the whole reason `zkb context` exists: a caller
+/// that has never seen this machine can read `agent-memory` and guess wrong in
+/// several directions at once, and one sentence from the person who made it
+/// costs nothing to carry.
+fn writeCollections(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const zkb.paths.Layout,
+    db: *zkb.sqlite.Db,
+    w: *Writer,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ctx = zkb.contexts.load(arena, io, layout) catch zkb.contexts.Map.empty;
+
     var st = db.prepare(
         \\SELECT c.name, c.root, count(d.id)
         \\FROM collections c LEFT JOIN docs d ON d.collection_id = c.id
@@ -209,13 +226,30 @@ fn writeCollections(gpa: std.mem.Allocator, db: *zkb.sqlite.Db, w: *Writer) !voi
     var any = false;
     while (st.step() catch false) {
         if (!any) {
-            try w.writeAll("| collection | root | docs |\n|---|---|---|\n");
+            try w.writeAll("| collection | root | docs | what it is |\n|---|---|---|---|\n");
             any = true;
         }
-        try w.print("| {s} | `{s}` | {d} |\n", .{ st.columnText(0), st.columnText(1), st.columnI64(2) });
+        const name = st.columnText(0);
+        // The collection-wide description only: a deeper one describes a subtree,
+        // and putting it on the collection row would claim it of the whole thing.
+        var whole: []const u8 = "";
+        for (ctx.entries) |e| {
+            if (e.prefix.len == 0 and std.mem.eql(u8, e.collection, name)) whole = e.text;
+        }
+        try w.print("| {s} | `{s}` | {d} | {s} |\n", .{ name, st.columnText(1), st.columnI64(2), whole });
     }
     if (any) try w.writeAll("\n");
-    _ = gpa;
+
+    var deep = false;
+    for (ctx.entries) |e| {
+        if (e.prefix.len == 0) continue;
+        if (!deep) {
+            try w.writeAll("Subtrees with a description of their own — these come back attached to\nany result from inside them:\n\n");
+            deep = true;
+        }
+        try w.print("- `zkb://{s}/{s}` — {s}\n", .{ e.collection, e.prefix, e.text });
+    }
+    if (deep) try w.writeAll("\n");
 }
 
 /// The part an agent cannot guess and would otherwise discover by trial: which

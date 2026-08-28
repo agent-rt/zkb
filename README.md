@@ -86,6 +86,7 @@ reading — under a handful of documents every term appears in most of them, IDF
 collapses, and BM25 stops ranking. Write one against a collection you already
 have.
 
+
 `bench` runs in-process and never through the daemon: elsewhere the CLI prefers
 the daemon because its model is already resident, but a measurement whose
 subject depends on which build happens to be running in the background is not a
@@ -157,6 +158,40 @@ zkb search "where did I leave off" --path 'agents/handoffs/**'
 The filter is exact rather than a post-filter on a global top-k: the document set
 is resolved by glob, BM25 restricts inside its own query, and the vector side
 scores that subset directly.
+
+## Context — what a subtree is
+
+A result is a path and a paragraph. The caller reading it has never seen this
+corpus, so `agent-memory/…/feedback_verify_the_instrument.md` could be a note, a
+decision, a draft, or somebody else's document quoted in passing. One sentence
+from the person who made the tree settles it, and it is knowledge only they have:
+
+```
+zkb context add zkb://docs "我自己的知识库：技术笔记、项目文档、会议记录"
+zkb context add zkb://docs/research "技术调研与外部资料摘录，多为一次性的实测报告"
+zkb context list
+```
+
+```
+1. docs/research/qmd-teardown.md  [score 0.041 vec#2 fts#1 chunk 7]
+   (我自己的知识库：技术笔记、项目文档、会议记录 · 技术调研与外部资料摘录…)
+   qmd 拆解 > A 级：直接可抄 > 四后端消融基准
+```
+
+**Every matching prefix applies, widest first** — not only the deepest. "These
+are my notes" and "this subtree is one-off measurements" are both true, and
+neither implies the other. Prefixes match on component boundaries, so
+`research` never describes `research-notes/`.
+
+**It never reaches ranking.** A description belongs to a whole subtree, so
+scoring with it would lift every document in a described tree above every
+document in an undescribed one — a collection-level bias wearing the clothes of
+relevance. It is attached after retrieval, for the reader.
+
+Descriptions live in `~/.zkb/data/contexts.csv` beside the collection
+registrations, for the same reason: they are authored, not derived. `zkb skill`
+prints them too, so an agent reading it starts out knowing what each collection
+holds.
 
 ## Ignoring files
 
@@ -241,6 +276,7 @@ does not exist" — the two need different fixes.
 ~/.zkb/
 ├── data/      memory/ facts.csv records/   ← the only irreplaceable directory
 │           collections.csv                 ← which roots are registered
+│           contexts.csv                    ← what each subtree is
 ├── index/     zkb.db                       ← rebuild: zkb index
 ├── models/    *.gguf                       ← rebuild: zkb model pull
 └── run/       socket, pid, log, trace

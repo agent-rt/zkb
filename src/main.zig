@@ -11,6 +11,7 @@ const records_cmd = @import("cli/records_cmd.zig");
 const skill_cmd = @import("cli/skill_cmd.zig");
 const collection_cmd = @import("cli/collection_cmd.zig");
 const bench_cmd = @import("cli/bench_cmd.zig");
+const context_cmd = @import("cli/context_cmd.zig");
 
 const usage =
     \\zkb — Agent memory + personal knowledge base
@@ -41,6 +42,8 @@ const usage =
     \\  path <zkb://doc.md>          absolute path of a document, from the index
     \\  status
     \\  collection rm NAME           drop a collection; the files are untouched
+    \\  context add <zkb://coll/prefix> <text>   say what a subtree is; it comes
+    \\  context list | rm <ref>                  back with every result from it
     \\  collection checks NAME [--off a,b]   checks this corpus declines
     \\  maintain [--since last] [--check NAME] [--collection NAME] [--all] [--json]
     \\  bench <fixture.csv> [-k N] [--collection NAME] [--path GLOB] [--json]
@@ -176,6 +179,36 @@ pub fn main(init: std.process.Init) !u8 {
         opts.extensions = ext_list.items;
         opts.include = include_list.items;
         return index_cmd.run(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "context")) {
+        const sub = args.next() orelse {
+            try w.writeAll("usage: zkb context add <zkb://coll/prefix> <text> | list | rm <ref>\n");
+            return 2;
+        };
+        if (std.mem.eql(u8, sub, "list"))
+            return context_cmd.list(gpa, init.io, init.environ_map, w);
+        if (std.mem.eql(u8, sub, "add")) {
+            const ref = args.next() orelse {
+                try w.writeAll("usage: zkb context add <zkb://coll/prefix> <text>\n");
+                return 2;
+            };
+            const text = args.next() orelse {
+                try w.writeAll("usage: zkb context add <zkb://coll/prefix> <text>\n");
+                try w.writeAll("(quote the text)\n");
+                return 2;
+            };
+            return context_cmd.add(gpa, init.io, init.environ_map, w, ref, text);
+        }
+        if (std.mem.eql(u8, sub, "rm") or std.mem.eql(u8, sub, "remove")) {
+            const ref = args.next() orelse {
+                try w.writeAll("usage: zkb context rm <zkb://coll/prefix>\n");
+                return 2;
+            };
+            return context_cmd.rm(gpa, init.io, init.environ_map, w, ref);
+        }
+        try w.print("unknown context subcommand: {s}\n", .{sub});
+        return 2;
     }
 
     if (std.mem.eql(u8, cmd, "bench")) {
