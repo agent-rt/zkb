@@ -310,7 +310,7 @@ fn ingestThread(st: *State) void {
     var s = store.Store.init(&db);
 
     const now_ms = nowMs(st.io);
-    rootsmod.ensureOwn(&s, &st.layout, now_ms) catch return;
+    rootsmod.ensureOwn(st.gpa, st.io, &s, &st.layout, now_ms) catch return;
     _ = rootsmod.ensureDocs(&s, st.opts.collection, st.root, st.opts.root != null, now_ms) catch return;
     st.collection_id = s.findCollection(st.opts.collection) catch return orelse return;
 
@@ -452,7 +452,7 @@ fn applyRegistrations(st: *State, s: *store.Store) void {
     defer st.gpa.free(taken);
     for (taken) |r| {
         defer r.deinit(st.gpa);
-        _ = r.apply(s, .documents, nowMs(st.io)) catch {};
+        _ = r.apply(st.gpa, st.io, &st.layout, s, .documents, nowMs(st.io)) catch {};
     }
 }
 
@@ -480,7 +480,7 @@ fn applyDrops(st: *State, s: *store.Store) void {
     for (taken) |name| {
         defer st.gpa.free(name);
         const id = s.findCollection(name) catch continue orelse continue;
-        _ = s.deleteCollection(st.gpa, id) catch {};
+        _ = rootsmod.dropCollection(st.gpa, st.io, &st.layout, s, name, id) catch {};
     }
 }
 
@@ -1073,7 +1073,7 @@ pub fn run(
         var db = try store.open(db_path_z, .read_write);
         defer db.close();
         var s = store.Store.init(&db);
-        rootsmod.ensureOwn(&s, &layout, nowMs(io)) catch {};
+        rootsmod.ensureOwn(gpa, io, &s, &layout, nowMs(io)) catch {};
         _ = rootsmod.ensureDocs(&s, opts.collection, root, opts.root != null, nowMs(io)) catch {};
     }
 

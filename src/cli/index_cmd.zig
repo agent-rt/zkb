@@ -213,7 +213,7 @@ pub fn run(
     var s = zkb.store.Store.init(&db);
 
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
-    const cid = try reg.apply(&s, .documents, now_ms);
+    const cid = try reg.apply(gpa, io, &layout, &s, .documents, now_ms);
     const filters = try reg.filters(arena, cid, .documents);
 
     if (opts.force) {
@@ -438,7 +438,7 @@ fn otherRoots(
     docs_cid: i64,
     now_ms: i64,
 ) ![]KbRoot {
-    try zkb.roots.ensureOwn(s, layout, now_ms);
+    try zkb.roots.ensureOwn(arena, io, s, layout, now_ms);
     const rs = try zkb.roots.list(arena, io, s);
     var out: std.ArrayList(KbRoot) = .empty;
     for (rs) |r| {

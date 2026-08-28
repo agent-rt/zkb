@@ -20,6 +20,7 @@ const store = @import("../db/store.zig");
 const memory = @import("../memory.zig");
 const facts = @import("../facts.zig");
 const paths = @import("../util/paths.zig");
+const csvmod = @import("csv.zig");
 
 pub const Root = struct {
     id: i64,
@@ -150,14 +151,44 @@ fn componentCount(path: []const u8) usize {
     return n;
 }
 
-/// The two collections zkb writes itself. Rows like any other, so the scan loop
-/// needs no special case for them; this only guarantees they exist.
+/// Everything that must exist in `collections` before anything reads it: the two
+/// zkb writes itself, then every registration recorded in `data/`.
 ///
-/// Their roots are fixed by the layout, so there is nothing for a caller to
-/// override and nothing to update on a later run.
-pub fn ensureOwn(s: *store.Store, layout: *const paths.Layout, now_ms: i64) !void {
+/// The built-ins are rows like any other, so the scan loop needs no special case
+/// for them; their roots are fixed by the layout, so there is nothing for a
+/// caller to override and nothing to update on a later run.
+///
+/// The replay is folded in here rather than given its own function on purpose.
+/// All three callers — `zkb index`, the daemon's ingest thread, the daemon's
+/// startup — already call this before listing roots, so folding it in costs no
+/// new call site and leaves no fourth place that could forget. A registration
+/// that is only replayed on some paths is worse than one that is never
+/// replayed: it comes back or not depending on which command ran first.
+///
+/// A registration whose row already exists is upserted, not skipped, so a hand
+/// edit to `collections.csv` takes effect on the next scan — the file is the
+/// record, and the table is the projection.
+pub fn ensureOwn(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    s: *store.Store,
+    layout: *const paths.Layout,
+    now_ms: i64,
+) !void {
     _ = try s.ensureCollectionKind("memory", layout.memory, .memory, now_ms);
     _ = try s.ensureCollectionKind("numbers", layout.data, .records, now_ms);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A malformed registration file must not stop zkb from running: the index is
+    // still usable, and refusing to start is a worse answer than starting with
+    // whatever the table already holds.
+    const rows = loadRegistry(arena, io, layout) catch return;
+    for (rows) |r| {
+        _ = s.upsertCollection(r.collection, r.root, .documents, r.extensions, r.include, now_ms) catch continue;
+    }
 }
 
 /// Guarantee the documents collection exists.
@@ -287,15 +318,31 @@ pub const Registration = struct {
         return r;
     }
 
-    /// Write the collection row and return its id. The one place either path
-    /// turns a registration into stored state.
+    /// Write the collection row, record the registration in `data/`, and return
+    /// the id. The one place either path turns a registration into stored state.
+    ///
+    /// The file write lives here for the reason the whole struct exists: two
+    /// call sites, and a second step next to each of them is a step one of them
+    /// eventually does not take. `gpa`, `io` and `layout` are not optional for
+    /// the same reason — a caller with nowhere to record is a caller whose
+    /// registration disappears the next time the index is rebuilt, and that was
+    /// the bug.
+    ///
+    /// The row is written even if recording fails: a registration the index can
+    /// act on now, that a later reset loses, still beats one that never
+    /// happened. The error is returned so the caller can say so.
     pub fn apply(
         self: Registration,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        layout: *const paths.Layout,
         s: *store.Store,
         kind: store.Store.Kind,
         now_ms: i64,
     ) !i64 {
-        return s.upsertCollection(self.collection, self.root, kind, self.extensions, self.include, now_ms);
+        const id = try s.upsertCollection(self.collection, self.root, kind, self.extensions, self.include, now_ms);
+        try recordRegistration(gpa, io, layout, self);
+        return id;
     }
 
     /// The scan filters this registration implies, on top of its kind's defaults.
@@ -315,3 +362,191 @@ pub const Registration = struct {
         });
     }
 };
+
+// ---------------------------------------------------------------------------
+// The registration file
+// ---------------------------------------------------------------------------
+
+/// `~/.zkb/data/collections.csv` — what a collection registration *is*.
+///
+/// Until this existed, a registration lived only in the index, and DESIGN.md's
+/// first sentence ("everything in SQLite is a projection of files that are
+/// still on disk") was false for the one row that decides which files get
+/// projected at all. Measured on a scratch home: register `notes` and `proj`,
+/// run the reset the README puts in its opening lines —
+///
+///     rm -rf ~/.zkb/index && zkb index
+///
+/// — and afterwards only `docs`, `memory` and `numbers` exist. Both user
+/// collections are gone, nothing says so, and the exit code is 0. On a real
+/// machine that is five of eight collections, after which `recall --scope` and
+/// `search --collection agent-memory` answer emptily and plausibly.
+///
+/// Only collections a caller registered are written here. `memory` and
+/// `numbers` are not: their roots come from the layout, so a file recording
+/// them could only ever disagree with it.
+const registry_file = "collections.csv";
+
+/// `kind` is deliberately absent. Every registration that reaches this file is
+/// a documents collection, and a hand-edited `kind` would be a way to turn one
+/// into a `memory` collection — precisely the transition `upsertCollection`
+/// refuses to make, for reasons written there.
+const registry_columns = [_][]const u8{ "name", "root", "extensions", "include" };
+
+pub fn registryPath(arena: std.mem.Allocator, layout: *const paths.Layout) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ layout.data, registry_file });
+}
+
+/// Everything the file says, in the order it says it. Missing file is not an
+/// error: a machine that has only ever used the default collection has nothing
+/// to record yet.
+pub fn loadRegistry(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
+) ![]Registration {
+    const path = try registryPath(arena, layout);
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return &.{};
+    defer file.close(io);
+
+    const size = (try file.stat(io)).size;
+    const src = try arena.alloc(u8, @intCast(size));
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    try reader.interface.readSliceAll(src);
+
+    var table = try csvmod.parse(arena, src);
+    const name_col = table.columnIndex("name") orelse return &.{};
+    const root_col = table.columnIndex("root") orelse return &.{};
+    const ext_col = table.columnIndex("extensions");
+    const inc_col = table.columnIndex("include");
+
+    var out: std.ArrayList(Registration) = .empty;
+    for (table.rows) |row| {
+        const name = std.mem.trim(u8, row[name_col], " \t");
+        const root = std.mem.trim(u8, row[root_col], " \t");
+        if (name.len == 0 or root.len == 0) continue;
+        out.append(arena, .{
+            .collection = try arena.dupe(u8, name),
+            .root = try arena.dupe(u8, root),
+            // An empty cell is "the caller did not say", which is the NULL the
+            // column means — not "match nothing". `joinList` draws the same
+            // line, and the two have to agree or a reset would narrow a
+            // collection to zero extensions without anyone asking.
+            .extensions = try optionalCell(arena, ext_col, row),
+            .include = try optionalCell(arena, inc_col, row),
+        }) catch return error.OutOfMemory;
+    }
+    return out.items;
+}
+
+fn optionalCell(
+    arena: std.mem.Allocator,
+    col: ?usize,
+    row: []const []const u8,
+) !?[]const u8 {
+    const i = col orelse return null;
+    const v = std.mem.trim(u8, row[i], " \t");
+    if (v.len == 0) return null;
+    return try arena.dupe(u8, v);
+}
+
+/// Record one registration, replacing any row with the same name.
+///
+/// The whole file is rewritten through a temporary and renamed, the way
+/// `facts` migrates its own: a dozen rows is not worth an in-place edit, and a
+/// half-written registration file would take the collections with it.
+pub fn recordRegistration(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
+    reg: Registration,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rows = std.ArrayList(Registration).fromOwnedSlice(try loadRegistry(arena, io, layout));
+    var replaced = false;
+    for (rows.items) |*r| {
+        if (std.mem.eql(u8, r.collection, reg.collection)) {
+            r.* = reg;
+            replaced = true;
+        }
+    }
+    if (!replaced) try rows.append(arena, reg);
+    try writeRegistry(arena, io, layout, rows.items);
+}
+
+/// Drop a registration. Silent when it was not there: `collection rm` on
+/// something only the index knew about must still leave the file consistent.
+pub fn forgetRegistration(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
+    name: []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try loadRegistry(arena, io, layout);
+    var keep: std.ArrayList(Registration) = .empty;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.collection, name)) continue;
+        try keep.append(arena, r);
+    }
+    if (keep.items.len == rows.len) return;
+    try writeRegistry(arena, io, layout, keep.items);
+}
+
+fn writeRegistry(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
+    rows: []const Registration,
+) !void {
+    const path = try registryPath(arena, layout);
+    const tmp = try std.fmt.allocPrint(arena, "{s}.writing", .{path});
+    {
+        var out = try std.Io.Dir.createFileAbsolute(io, tmp, .{ .truncate = true });
+        defer out.close(io);
+        var buf: [4096]u8 = undefined;
+        var writer = out.writer(io, &buf);
+        const w = &writer.interface;
+        try csvmod.writeRow(w, &registry_columns);
+        for (rows) |r| {
+            try csvmod.writeRow(w, &.{
+                r.collection,
+                r.root,
+                r.extensions orelse "",
+                r.include orelse "",
+            });
+        }
+        try w.flush();
+    }
+    try std.Io.Dir.renameAbsolute(tmp, path, io);
+}
+
+/// Drop a collection from both places it is recorded.
+///
+/// Registration has one funnel (`Registration.apply`); removal had two — the
+/// CLI's direct path and the daemon's queued one — and a second step beside
+/// each is a step one of them eventually does not take. Here the shape is the
+/// worse direction of the bug this file exists to fix: a collection dropped
+/// through the daemon but left in `collections.csv` would come back at the next
+/// `ensureOwn`, which reads as the removal silently failing.
+///
+/// Returns the number of documents that were unindexed with it.
+pub fn dropCollection(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
+    s: *store.Store,
+    name: []const u8,
+    id: i64,
+) !usize {
+    const n = try s.deleteCollection(gpa, id);
+    try forgetRegistration(gpa, io, layout, name);
+    return n;
+}

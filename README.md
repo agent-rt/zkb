@@ -109,9 +109,18 @@ file to `archive/` and drops it from the index; nothing is ever deleted.
 
 ## Collections
 
-A collection is a root plus the filters that select files under it. Both live in
-the database, so the daemon keeps every collection fresh — registering one is not
-a one-off import.
+A collection is a root plus the filters that select files under it. Registering
+one writes it to `~/.zkb/data/collections.csv` and to the index, so the daemon
+keeps every collection fresh — registering one is not a one-off import — and the
+registration survives the index being thrown away:
+
+```
+rm -rf ~/.zkb/index && zkb index    # every collection comes back
+```
+
+That file is the record; the `collections` table is the projection of it, rebuilt
+on the next scan. Editing it by hand works, and is the way to move a root or
+rename filters without re-running the command.
 
 ```
 zkb index --collection notes --root ~/notes --ext md
@@ -231,6 +240,7 @@ does not exist" — the two need different fixes.
 ```
 ~/.zkb/
 ├── data/      memory/ facts.csv records/   ← the only irreplaceable directory
+│           collections.csv                 ← which roots are registered
 ├── index/     zkb.db                       ← rebuild: zkb index
 ├── models/    *.gguf                       ← rebuild: zkb model pull
 └── run/       socket, pid, log, trace

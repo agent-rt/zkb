@@ -255,3 +255,196 @@ test "a request that names only a root registers it under the default collection
     try testing.expectEqualStrings("docs", got.collection);
     try testing.expectEqualStrings("/Users/x/docs", got.root);
 }
+
+// ---------------------------------------------------------------------------
+// The registration file
+//
+// Registrations used to live only in the index, which made DESIGN.md's first
+// sentence false for the one row that decides which files get projected at all:
+// `rm -rf ~/.zkb/index && zkb index` — the reset the README opens with — left
+// only the built-ins behind, silently and with exit 0.
+// ---------------------------------------------------------------------------
+
+/// A `Layout` pointing at a throwaway directory. Only `data` is used here, but
+/// the whole struct is built so this exercises the real `paths.resolve` rather
+/// than a hand-made literal that could drift from it.
+const Home = struct {
+    io: std.Io,
+    root: []u8,
+    layout: zkb.paths.Layout,
+    env: std.process.Environ.Map,
+
+    fn init(io: std.Io) !Home {
+        var seed: usize = @intFromPtr(&io);
+        seed ^= @as(usize, @bitCast(@as(isize, @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds))));
+        const root = try std.fmt.allocPrint(testing.allocator, "/tmp/zkb-registry-test-{x}", .{seed});
+        var env: std.process.Environ.Map = .init(testing.allocator);
+        try env.put("ZKB_HOME", root);
+        var layout = try zkb.paths.resolve(testing.allocator, &env);
+        try layout.ensureDirs(io);
+        return .{ .io = io, .root = root, .layout = layout, .env = env };
+    }
+
+    fn deinit(self: *Home) void {
+        self.layout.deinit(testing.allocator);
+        self.env.deinit();
+        std.Io.Dir.cwd().deleteTree(self.io, self.root) catch {};
+        testing.allocator.free(self.root);
+    }
+};
+
+fn withIo(comptime f: fn (std.Io) anyerror!void) !void {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    try f(threaded.io());
+}
+
+test "a registration round-trips through the file with every field intact" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{
+                .collection = "notes",
+                .root = "/home/u/notes",
+                .extensions = ".md",
+                .include = "a/**\nb/**",
+            });
+
+            const rows = try roots.loadRegistry(arena(&a), io, &home.layout);
+            try testing.expectEqual(@as(usize, 1), rows.len);
+            try testing.expectEqualStrings("notes", rows[0].collection);
+            try testing.expectEqualStrings("/home/u/notes", rows[0].root);
+            try testing.expectEqualStrings(".md", rows[0].extensions.?);
+            // A list separated by newlines survives a csv round trip: the cell is
+            // quoted on the way out and unescaped on the way back, which is the
+            // reason not to invent a second separator for this file.
+            try testing.expectEqualStrings("a/**\nb/**", rows[0].include.?);
+        }
+    }.run);
+}
+
+test "a field the caller never named stays null, not empty" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{
+                .collection = "plain",
+                .root = "/home/u/plain",
+            });
+
+            const rows = try roots.loadRegistry(arena(&a), io, &home.layout);
+            // Null means "the kind's default". An empty string would mean
+            // "match nothing", and a reset that narrowed a collection to zero
+            // extensions would index nothing while looking fine.
+            try testing.expect(rows[0].extensions == null);
+            try testing.expect(rows[0].include == null);
+        }
+    }.run);
+}
+
+test "recording the same name twice replaces the row rather than appending" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{
+                .collection = "notes",
+                .root = "/first",
+            });
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{
+                .collection = "notes",
+                .root = "/second",
+            });
+
+            const rows = try roots.loadRegistry(arena(&a), io, &home.layout);
+            try testing.expectEqual(@as(usize, 1), rows.len);
+            try testing.expectEqualStrings("/second", rows[0].root);
+        }
+    }.run);
+}
+
+test "forgetting a registration removes only that row" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{ .collection = "a", .root = "/a" });
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{ .collection = "b", .root = "/b" });
+            try roots.forgetRegistration(testing.allocator, io, &home.layout, "a");
+
+            const rows = try roots.loadRegistry(arena(&a), io, &home.layout);
+            try testing.expectEqual(@as(usize, 1), rows.len);
+            try testing.expectEqualStrings("b", rows[0].collection);
+        }
+    }.run);
+}
+
+test "forgetting something that was never recorded is not an error" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            // `collection rm` on a collection only the index knew about must
+            // still leave the file consistent rather than failing the command.
+            try roots.forgetRegistration(testing.allocator, io, &home.layout, "never");
+        }
+    }.run);
+}
+
+test "no file at all reads as no registrations" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+            const rows = try roots.loadRegistry(arena(&a), io, &home.layout);
+            try testing.expectEqual(@as(usize, 0), rows.len);
+        }
+    }.run);
+}
+
+test "ensureOwn replays the file into an index that has never seen it" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var home = try Home.init(io);
+            defer home.deinit();
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+
+            try roots.recordRegistration(testing.allocator, io, &home.layout, .{
+                .collection = "notes",
+                .root = "/home/u/notes",
+                .extensions = ".md",
+            });
+
+            // A fresh database stands in for the index having just been deleted.
+            var db = try zkb.store.open(":memory:", .read_write);
+            defer db.close();
+            var s = zkb.store.Store.init(&db);
+            try roots.ensureOwn(testing.allocator, io, &s, &home.layout, 1000);
+
+            const row = (try s.collectionByName(arena(&a), "notes")) orelse
+                return error.RegistrationWasNotReplayed;
+            try testing.expectEqualStrings("/home/u/notes", row.root);
+            try testing.expectEqualStrings(".md", row.extensions.?);
+            // And the built-ins are still there beside it.
+            try testing.expect((try s.findCollection("memory")) != null);
+            try testing.expect((try s.findCollection("numbers")) != null);
+        }
+    }.run);
+}

@@ -30,6 +30,22 @@ directory boundary rather than a convention:
 
 A convention would be violated the first time anybody typed `rm -rf ~/.zkb`.
 
+The claim was false for one row until 2026-08-28. A collection's registration —
+its root and filters, the thing that decides which files get projected at all —
+lived only in `collections`, and nothing on disk recorded it. Measured on a
+scratch home: register `notes` and `proj`, run the reset above, and afterwards
+only `docs`, `memory` and `numbers` exist. Both user collections are gone,
+nothing says so, and the exit code is 0. On the machine this was found on that
+would have been five of eight collections, after which `recall --scope` and
+`search --collection agent-memory` answer emptily and plausibly.
+
+Registrations now live in `data/collections.csv` and the table is replayed from
+it. The replay is folded into `roots.ensureOwn` rather than given a function of
+its own: all three callers already invoke that before listing roots, so there is
+no fourth place that could forget, and a registration replayed on only some
+paths would be worse than one never replayed — it would come back or not
+depending on which command ran first.
+
 ## Retrieval fuses ranks, not scores
 
 Vector distance and BM25 are different units. Combining them with a weight

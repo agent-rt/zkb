@@ -56,7 +56,7 @@ pub fn rm(
         return 2;
     }
 
-    const n = try s.deleteCollection(gpa, id);
+    const n = try zkb.roots.dropCollection(gpa, io, &layout, &s, opts.name, id);
     try w.print("removed collection {s} ({d} document(s) unindexed)\n", .{ opts.name, n });
     // Said plainly, because "removed" reads as destructive and this is not.
     try w.writeAll("the files themselves are untouched\n");
