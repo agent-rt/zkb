@@ -30,6 +30,7 @@ pub fn run(
     try writeFrontmatter(w);
     try writeOverview(w);
     try writeDecisionTable(w);
+    try writeUriScheme(w);
     try writeScope(w);
     try writeLocalState(gpa, io, w, &layout);
     try writeGotchas(w);
@@ -77,9 +78,41 @@ fn writeDecisionTable(w: *Writer) !void {
         \\| I need context to answer with | `zkb query <q>` | Pulls in neighbours, groups per document, fits a token budget |
         \\| What do I know about this user? | `zkb recall [topic]` | Facts snapshot + memories, ranked by relevance *and* recency |
         \\| What is the exact number? | `zkb records <type> --where/--agg` or `zkb facts <key>` | **Numbers are not in the vector index** — search cannot answer them |
+        \\| I am holding a `zkb://…` | `zkb path <uri>` | Prints the file it names; nothing else resolves the scheme |
         \\
         \\Start a session with `zkb recall --scope <project>` (see below). It is
         \\cheap (1500 tokens) and it is how you find out what was already decided.
+        \\
+        \\
+    );
+}
+
+fn writeUriScheme(w: *Writer) !void {
+    try w.writeAll(
+        \\## `zkb://` — the references inside these documents
+        \\
+        \\Documents in this knowledge base cite each other as `zkb://projects/x/REQ.md`,
+        \\and so do the work items in `wip`. You will meet the scheme in output long
+        \\before anyone explains it: one ordinary `zkb query` returned 14 of them, and
+        \\the corpus holds 847.
+        \\
+        \\**It is rooted at the collection, not relative to the document quoting it.**
+        \\`zkb://projects/x/REQ.md` means that exact path under the collection's root —
+        \\resolving it as a relative path is the single largest source of false
+        \\"broken link" findings, measured at 288 of 348 on this corpus.
+        \\
+        \\```bash
+        \\zkb path zkb://projects/agent-rt/zkb/SPEC.md   # → /Users/…/docs/projects/…
+        \\```
+        \\
+        \\Then read that path with whatever you normally read files with. **Do not go
+        \\looking for the file.** A session once spent 15 seconds on
+        \\`fd -H … ~/ --max-depth 8` hunting for two documents whose full location was
+        \\already sitting in the field it was reading. The same lookup is 0.06s here,
+        \\and it also answers whether the file is indexed at all.
+        \\
+        \\Exit 2 means the path exists in more than one collection and no guess was
+        \\made; exit 3 means the index has never seen it.
         \\
         \\
     );
