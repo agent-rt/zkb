@@ -74,3 +74,18 @@ test "the socket path stays well inside the sun_path limit" {
     defer l.deinit(gpa);
     try testing.expect(l.sock.len < 104);
 }
+
+test "relFromUri strips any collection scheme, and the slashes after it" {
+    // `maintain` treats every non-network scheme as collection-rooted, so this
+    // must too — a second rule would make the resolver and the broken-link check
+    // disagree about the same link.
+    const f = zkb.paths.relFromUri;
+    try testing.expectEqualStrings("projects/x/REQ.md", f("zkb://projects/x/REQ.md"));
+    try testing.expectEqualStrings("projects/x/REQ.md", f("zkb:///projects/x/REQ.md"));
+    try testing.expectEqualStrings("projects/x/REQ.md", f("lore://projects/x/REQ.md"));
+    // A bare path is already what we want.
+    try testing.expectEqualStrings("projects/x/REQ.md", f("projects/x/REQ.md"));
+    try testing.expectEqualStrings("projects/x/REQ.md", f("/projects/x/REQ.md"));
+    // Nothing after the scheme is an empty request, not a root listing.
+    try testing.expectEqualStrings("", f("zkb://"));
+}

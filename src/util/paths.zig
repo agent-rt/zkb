@@ -82,6 +82,22 @@ pub const Layout = struct {
     }
 };
 
+/// A `zkb://…` reference (or a bare relative path) reduced to the
+/// collection-relative path it names.
+///
+/// Any scheme is stripped, not just `zkb://`: `maintain` treats every
+/// non-network scheme as collection-rooted rather than relative to the document
+/// that mentions it, and a second rule here would make the resolver and the
+/// broken-link check disagree about what the same link means.
+///
+/// Leading slashes go too — `zkb:///x.md` and `zkb://x.md` name the same
+/// document, and a caller assembling the string from parts will produce both.
+pub fn relFromUri(raw: []const u8) []const u8 {
+    var t = raw;
+    if (std.mem.indexOf(u8, t, "://")) |i| t = t[i + 3 ..];
+    return std.mem.trimStart(u8, t, "/");
+}
+
 pub const Error = error{ NoHomeDirectory, OutOfMemory };
 
 /// Resolve the layout from $ZKB_HOME, else $HOME/.zkb. The environment is

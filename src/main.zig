@@ -37,6 +37,7 @@ const usage =
     \\                 [--window "avg(f) over N by f"] [--schema] [-n N] [--json]
     \\  sql <select ...> [--json]
     \\
+    \\  path <zkb://doc.md>          absolute path of a document, from the index
     \\  status
     \\  collection rm NAME           drop a collection; the files are untouched
     \\  collection checks NAME [--off a,b]   checks this corpus declines
@@ -337,6 +338,14 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         return memory_cmd.retype(gpa, init.io, init.environ_map, w, target, t, null);
+    }
+
+    if (std.mem.eql(u8, cmd, "path")) {
+        const target = args.next() orelse {
+            try w.writeAll("usage: zkb path <zkb://path/to/doc.md>\n");
+            return 2;
+        };
+        return pathCmd(gpa, init.io, init.environ_map, w, target);
     }
 
     if (std.mem.eql(u8, cmd, "recall")) {
@@ -660,6 +669,89 @@ fn printList(w: *std.Io.Writer, label: []const u8, stored: []const u8, noun: []c
         try w.writeAll(part);
         first = false;
     }
+}
+
+/// `zkb path <zkb://... | rel/path.md>` — a URI or collection-relative path into
+/// an absolute one.
+///
+/// zkb defines the `zkb://` scheme, resolves it inside `maintain`, and prints it
+/// throughout `search`, `query` and every document in the corpus — but nothing
+/// turned one back into a path. Measured 2026-08-28: a session spent 15 seconds
+/// on `fd -H ... ~/ --max-depth 8` hunting for two files whose exact location was
+/// already written in the `doc:` field it was reading, as `zkb://...`. A known
+/// path had become a search problem.
+///
+/// Looked up in the index rather than assembled by string surgery. Replacing
+/// `zkb://` with the docs root would work — every one of the 846 collection_uri
+/// links in this corpus resolves into `docs` — but it cannot answer whether the
+/// file exists, and it hard-codes one collection's root into the caller. The
+/// index answers both, and costs one query.
+///
+/// Ambiguity is reported, never guessed: two collections may hold the same
+/// rel_path, and picking one silently is how a caller ends up reading the wrong
+/// project's file.
+fn pathCmd(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *std.Io.Writer,
+    raw: []const u8,
+) !u8 {
+    var layout = try zkb.paths.resolve(gpa, env);
+    defer layout.deinit(gpa);
+
+    // Any scheme, not just `zkb://`: `maintain` treats every non-network scheme
+    // as collection-rooted, and this must agree with it or the two disagree about
+    // what a link means.
+    const rel = zkb.paths.relFromUri(raw);
+    if (rel.len == 0) {
+        try w.writeAll("usage: zkb path <zkb://path/to/doc.md>\n");
+        return 2;
+    }
+
+    std.Io.Dir.accessAbsolute(io, layout.db, .{}) catch {
+        try w.print("no index at {s}\nrun: zkb index\n", .{layout.db});
+        return 3;
+    };
+    const db_path = try gpa.dupeZ(u8, layout.db);
+    defer gpa.free(db_path);
+    var db = try zkb.store.open(db_path, .read_only);
+    defer db.close();
+
+    var st = try db.prepare(
+        \\SELECT col.name, col.root FROM docs d
+        \\JOIN collections col ON col.id = d.collection_id
+        \\WHERE d.rel_path = ?1
+        \\ORDER BY col.name
+    );
+    defer st.finalize();
+    try st.bindText(1, rel);
+
+    var found: usize = 0;
+    var first_root: []u8 = &.{};
+    defer gpa.free(first_root);
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(gpa);
+
+    while (try st.step()) {
+        found += 1;
+        if (found == 1) first_root = try gpa.dupe(u8, st.columnText(1));
+        if (names.items.len != 0) try names.appendSlice(gpa, ", ");
+        try names.appendSlice(gpa, st.columnText(0));
+    }
+
+    if (found == 0) {
+        try w.print("not in the index: {s}\n", .{rel});
+        try w.writeAll("the file may exist but be unindexed — run: zkb index\n");
+        return 3;
+    }
+    if (found > 1) {
+        try w.print("ambiguous: {s} exists in {d} collections ({s})\n", .{ rel, found, names.items });
+        try w.writeAll("no guess is made; name the collection's root yourself\n");
+        return 2;
+    }
+    try w.print("{s}/{s}\n", .{ first_root, rel });
+    return 0;
 }
 
 fn status(
