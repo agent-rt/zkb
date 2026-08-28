@@ -177,6 +177,32 @@ pub fn build(b: *std.Build) void {
     // since — under load, after forced rebuilds, on a clean tree. No mechanism
     // was found and nothing was changed for it. If it comes back, keep the
     // stderr of the failing run; that is the piece nobody has yet.
+    //
+    // 2026-08-28, one such run, kept because the line above asked for it. This
+    // is a *different* shape from the one above — a real test failure, with a
+    // count of 279/280 rather than a green suite and a red exit code:
+    //
+    //     276/280 daemon_test.test.health carries the daemon's build, and it
+    //             is the build that is running...FAIL (ConnectionClosed)
+    //     std/Io/net.zig:1310  readVec                 -> error.EndOfStream
+    //     std/Io/Reader.zig:1135 fillMore
+    //     std/Io/Reader.zig:831  peekDelimiterInclusive
+    //     std/Io/Reader.zig:803  takeDelimiterInclusive
+    //     src/ipc/client.zig:149 call  -> error.ConnectionClosed
+    //     tests/daemon_test.zig:191    var resp = try client.call(gpa, .health, "{}")
+    //
+    // So the connection `waitReady` handed back was accepted and then closed
+    // before it answered. Seen once, in a run started while other zkb binaries
+    // were using the machine; ~15 direct runs of the same artifact since have
+    // been green, and it has not been reproduced under deliberate load.
+    //
+    // Unverified hypothesis, written down as a hypothesis: `Server.waitReady`
+    // returns as soon as `connect` succeeds, and on a unix socket that happens
+    // at `listen`, not at `accept` — the connection can sit in the backlog of a
+    // server that is not serving yet. That would make the wait a test of the
+    // wrong thing. Nobody has shown it is the mechanism, and nothing has been
+    // changed for it: a fix without a reproduction would only move where the
+    // silence is.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/root.zig"),
