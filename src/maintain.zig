@@ -886,8 +886,18 @@ pub fn record(
 /// corpus would also do it, at the cost of re-embedding every chunk to fix
 /// something no embedding was involved in.
 pub fn relinkAll(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {
+    // One transaction, because the two halves are only correct together.
+    // Written as two statements first, and a `SqliteStep` from the resolve —
+    // the daemon was mid-scan and held the write lock — left every link with a
+    // null target and the whole graph reported broken. Nothing was lost, since
+    // `target_doc_id` is derived and a re-run rebuilds it, but "the command
+    // failed and emptied your link graph" is not a state to leave anyone in.
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer db.exec("ROLLBACK") catch {};
     try db.exec("UPDATE links SET target_doc_id = NULL");
-    return resolveLinks(gpa, db);
+    const n = try resolveLinks(gpa, db);
+    try db.exec("COMMIT");
+    return n;
 }
 
 pub fn resolveLinks(gpa: std.mem.Allocator, db: *sqlite.Db) !usize {

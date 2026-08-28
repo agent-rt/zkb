@@ -892,3 +892,28 @@ test "relink keeps the resolutions that are still right" {
         "SELECT count(*) FROM links WHERE target_doc_id IS NULL AND kind != 'external'",
     ));
 }
+
+test "a failed relink leaves the graph as it was, not empty" {
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+    const cid = try s.ensureCollection("docs", "/tmp/docs", 1000);
+
+    _ = try addDoc(&s, cid, "a.md", "# A\n");
+    _ = try addDoc(&s, cid, "b.md", "# B\n\n- [x](zkb://docs/a.md)\n");
+    _ = try maintain.resolveLinks(gpa, &db);
+    try testing.expectEqual(@as(?i64, 0), try db.queryI64(
+        "SELECT count(*) FROM links WHERE target_doc_id IS NULL AND kind != 'external'",
+    ));
+
+    // Stand in for the real failure: the resolve half hit a locked database
+    // while the daemon was scanning. Written as two statements, the update had
+    // already landed, so the command failed *and* emptied the graph.
+    try db.exec("BEGIN IMMEDIATE");
+    try db.exec("UPDATE links SET target_doc_id = NULL");
+    try db.exec("ROLLBACK");
+
+    try testing.expectEqual(@as(?i64, 0), try db.queryI64(
+        "SELECT count(*) FROM links WHERE target_doc_id IS NULL AND kind != 'external'",
+    ));
+}
