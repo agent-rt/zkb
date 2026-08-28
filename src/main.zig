@@ -10,6 +10,7 @@ const memory_cmd = @import("cli/memory_cmd.zig");
 const records_cmd = @import("cli/records_cmd.zig");
 const skill_cmd = @import("cli/skill_cmd.zig");
 const collection_cmd = @import("cli/collection_cmd.zig");
+const bench_cmd = @import("cli/bench_cmd.zig");
 
 const usage =
     \\zkb — Agent memory + personal knowledge base
@@ -42,6 +43,8 @@ const usage =
     \\  collection rm NAME           drop a collection; the files are untouched
     \\  collection checks NAME [--off a,b]   checks this corpus declines
     \\  maintain [--since last] [--check NAME] [--collection NAME] [--all] [--json]
+    \\  bench <fixture.csv> [-k N] [--collection NAME] [--path GLOB] [--json]
+    \\                      recall of every retrieval path, against known answers
     \\  skill                        emit zkb's SKILL.md (pipe it where your agent reads skills)
     \\  doctor [--model PATH]
     \\  model pull [--quant q8_0|f16]
@@ -173,6 +176,42 @@ pub fn main(init: std.process.Init) !u8 {
         opts.extensions = ext_list.items;
         opts.include = include_list.items;
         return index_cmd.run(gpa, init.io, init.environ_map, w, opts);
+    }
+
+    if (std.mem.eql(u8, cmd, "bench")) {
+        var fixture: ?[]const u8 = null;
+        var opts: bench_cmd.Options = .{ .fixture = "" };
+        while (args.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "-")) {
+                if (fixture == null) fixture = a else {
+                    try w.print("unexpected extra argument: {s}\n", .{a});
+                    return 2;
+                }
+            } else if (std.mem.eql(u8, a, "-k")) {
+                const v = args.next() orelse break;
+                opts.top_k = std.fmt.parseInt(usize, v, 10) catch 10;
+            } else if (std.mem.eql(u8, a, "--collection")) {
+                opts.collection = args.next();
+            } else if (std.mem.eql(u8, a, "--path")) {
+                opts.path = args.next() orelse {
+                    try w.writeAll("--path needs a glob, e.g. --path 'agents/handoffs/**'\n");
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, a, "--model")) {
+                opts.model = args.next();
+            } else if (std.mem.eql(u8, a, "--json")) {
+                opts.json = true;
+            } else {
+                try w.print("unknown option: {s}\n", .{a});
+                return 2;
+            }
+        }
+        opts.fixture = fixture orelse {
+            try w.writeAll("usage: zkb bench <fixture.csv> [-k N] [--collection NAME]\n");
+            try w.writeAll("fixture columns: query,expected  (optional: id,kind)\n");
+            return 2;
+        };
+        return bench_cmd.run(gpa, init.io, init.environ_map, w, opts);
     }
 
     if (std.mem.eql(u8, cmd, "search")) {

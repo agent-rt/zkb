@@ -42,6 +42,55 @@ tokenizer (`src/db/fts5_cjk.c`): overlapping bigrams for Han, kana and Hangul,
 whole words for Latin. Measured keyword recall@10 went from 0.525 to 0.793 on
 the same queries.
 
+## Measuring retrieval
+
+Both numbers above are claims about recall, and a claim that cannot be re-run
+cannot catch a regression. `zkb bench` takes a fixture of queries with known
+answers and reports what each retrieval path returns for them:
+
+```
+zkb bench fixture.csv --collection docs
+```
+
+```
+mode        R@1    R@3    R@5   R@10    MRR   ms/q
+keyword   0.750  0.917  0.917  0.917  0.833     25
+vector    0.917  1.000  1.000  1.000  0.958     57
+hybrid    0.917  1.000  1.000  1.000  0.944     76
+```
+
+Every mode runs over every case, because the value is the comparison: whether
+the vector path earns its 609 MiB, whether a change to the chunker moved
+keyword recall, whether fusion beat both. Below the table are a per-kind
+breakdown and, for each case, the expected documents that never came back — a
+score that dropped says nothing about what got lost.
+
+The fixture is csv, like everything else zkb reads by hand:
+
+```csv
+id,kind,query,expected
+mqtt-idle,exact,curl 订阅 MQTT 空闲 121 秒被断开,research/scriptc-mqtt-subscribe.md
+clip-softmax,semantic,分类模型的 softmax 输出不能当置信度用,research/fashion-clip-classification.md
+```
+
+`query` and `expected` are required; `id` and `kind` are optional. `expected`
+holds one or more paths separated by `;`, matched against the returned path at
+a component boundary — so `DESIGN.md` matches `docs/DESIGN.md`, and never
+`docs/xDESIGN.md`. `kind` is a free-form label used only to group the report,
+so a drop can be attributed to a kind of query rather than to "the score went
+down".
+
+No fixture ships with zkb. A fixture is ground truth about a particular corpus,
+and zkb's own repository holds too few documents to produce a number worth
+reading — under a handful of documents every term appears in most of them, IDF
+collapses, and BM25 stops ranking. Write one against a collection you already
+have.
+
+`bench` runs in-process and never through the daemon: elsewhere the CLI prefers
+the daemon because its model is already resident, but a measurement whose
+subject depends on which build happens to be running in the background is not a
+measurement. The model is loaded once for the whole run.
+
 ## Memory
 
 ```
