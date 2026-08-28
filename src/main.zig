@@ -30,6 +30,7 @@ const usage =
     \\  recall [query] [--budget N] [--scope NAME] [--json]
     \\  forget <memory-file>
     \\  rescope <memory-file> <scope> [--force]   move it; empty scope means universal
+    \\  retype  <memory-file> <type>             type decides whether recall injects it
     \\  facts [key] [--history]
     \\  remember-fact <key> <value> [--at YYYY-MM-DD] [--note TEXT]
     \\  records [type] [--where EXPR] [--search TEXT] [--agg EXPR]
@@ -324,6 +325,18 @@ pub fn main(init: std.process.Init) !u8 {
             if (std.mem.eql(u8, a, "--force")) force = true;
         }
         return memory_cmd.rescope(gpa, init.io, init.environ_map, w, target, scope, force, null);
+    }
+
+    if (std.mem.eql(u8, cmd, "retype")) {
+        const target = args.next() orelse {
+            try w.writeAll("usage: zkb retype <memory-file> <user|feedback|decision|project|reference>\n");
+            return 2;
+        };
+        const t = args.next() orelse {
+            try w.writeAll("usage: zkb retype <memory-file> <user|feedback|decision|project|reference>\n");
+            return 2;
+        };
+        return memory_cmd.retype(gpa, init.io, init.environ_map, w, target, t, null);
     }
 
     if (std.mem.eql(u8, cmd, "recall")) {

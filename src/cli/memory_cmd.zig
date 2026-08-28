@@ -280,6 +280,55 @@ pub fn rescope(
     force: bool,
     model: ?[]const u8,
 ) !u8 {
+    return amendField(gpa, io, env, w, rel_path, .scope, scope, force, model);
+}
+
+/// Retype a memory. `type` decides whether `recall` injects it at session start
+/// (`memory.recencyRanked` excludes `reference`), so a mis-typed memory is not a
+/// cosmetic problem — it either opens every session with a pointer, or hides a
+/// behavioural rule until someone queries for it.
+pub fn retype(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *Writer,
+    rel_path: []const u8,
+    type_name: []const u8,
+    model: ?[]const u8,
+) !u8 {
+    // Validated against the enum, unlike a scope: `type` is a closed set, and an
+    // unknown one would parse back as nothing and quietly change how the memory
+    // is treated.
+    _ = zkb.memory.Type.parse(type_name) orelse {
+        try w.print("unknown type \"{s}\"; expected one of: user feedback decision project reference\n", .{type_name});
+        return 2;
+    };
+    return amendField(gpa, io, env, w, rel_path, .type, type_name, true, model);
+}
+
+/// Which frontmatter field an amend touches. One implementation, one place where
+/// the file is rewritten and re-indexed — a second field must not become a second
+/// copy of this function.
+const Field = enum {
+    scope,
+    type,
+
+    fn key(self: Field) []const u8 {
+        return @tagName(self);
+    }
+};
+
+fn amendField(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    w: *Writer,
+    rel_path: []const u8,
+    field: Field,
+    value: []const u8,
+    force: bool,
+    model: ?[]const u8,
+) !u8 {
     var layout = try zkb.paths.resolve(gpa, env);
     defer layout.deinit(gpa);
 
@@ -298,11 +347,11 @@ pub fn rescope(
     // Same gate as `remember`: the label is the thing that goes wrong silently,
     // and moving a memory to a mistyped scope hides it exactly as writing one
     // there would.
-    if (try refuseUnknownScope(gpa, &db, w, scope, force)) return 5;
+    if (field == .scope and try refuseUnknownScope(gpa, &db, w, value, force)) return 5;
 
     const content = try readAll(gpa, io, path);
     defer gpa.free(content);
-    const updated = setFrontmatterField(gpa, content, "scope", scope) catch |err| switch (err) {
+    const updated = setFrontmatterField(gpa, content, field.key(), value) catch |err| switch (err) {
         error.NoFrontmatter => {
             try w.print("not a memory (no frontmatter): {s}\n", .{path});
             return 2;
@@ -313,7 +362,7 @@ pub fn rescope(
 
     if (std.mem.eql(u8, content, updated)) {
         try w.print("unchanged: already {s}\n", .{
-            if (scope.len == 0) "universal" else scope,
+            if (value.len == 0) "universal" else value,
         });
         return 0;
     }
@@ -339,10 +388,12 @@ pub fn rescope(
         try w.writeAll("note: model unavailable; the index updates on the next daemon scan\n");
     }
 
-    if (scope.len == 0) {
+    if (value.len == 0) {
         try w.print("{s} is now universal\n", .{rel_path});
+    } else if (field == .scope) {
+        try w.print("{s} is now scoped to {s}\n", .{ rel_path, value });
     } else {
-        try w.print("{s} is now scoped to {s}\n", .{ rel_path, scope });
+        try w.print("{s} is now type {s}\n", .{ rel_path, value });
     }
     return 0;
 }
