@@ -60,14 +60,24 @@ def main() -> int:
     docs = sql("select c.name, d.rel_path from docs d"
                " join collections c on c.id = d.collection_id")
 
-    # The safety check the docstring promises, made before anything is written.
+    # The safety check the docstring promises, made before anything is written —
+    # and scoped to what is being migrated. Checking the whole corpus made the
+    # script single-use: once one collection was done, its own migrated links
+    # tripped the guard for every collection after it.
+    scope = ""
+    if args.collection:
+        names_sql = ",".join("'" + c.replace("'", "''") + "'" for c in args.collection)
+        scope = (" and l.doc_id in (select d.id from docs d"
+                 " join collections c on c.id = d.collection_id"
+                 f" where c.name in ({names_sql}))")
     already = sql(
-        "select count(*) from links where raw like '%://%'"
-        " and substr(replace(replace(raw,'zkb://',''),'lore://',''),1,"
-        "   instr(replace(replace(raw,'zkb://',''),'lore://','')||'/','/')-1)"
-        "   in (select name from collections)")
+        "select count(*) from links l where l.raw like '%://%'"
+        " and substr(replace(replace(l.raw,'zkb://',''),'lore://',''),1,"
+        "   instr(replace(replace(l.raw,'zkb://',''),'lore://','')||'/','/')-1)"
+        "   in (select name from collections)" + scope)
     if already and already[0][0] not in ("0", ""):
-        print(f"{already[0][0]} link(s) already begin with a collection name.\n"
+        where = " in " + ", ".join(args.collection) if args.collection else ""
+        print(f"{already[0][0]} link(s){where} already begin with a collection name.\n"
               "Cannot tell an already-migrated link from an old-form one that happens\n"
               "to start with a collection's name. Migrate those by hand first.",
               file=sys.stderr)
