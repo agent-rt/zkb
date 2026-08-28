@@ -637,3 +637,57 @@ test "activeScopes is the registry, and archived labels drop out of it" {
     try testing.expectEqual(@as(usize, 1), scopes.len);
     try testing.expectEqualStrings("work", scopes[0]);
 }
+
+test "recency injects what shapes the work, not the reference material" {
+    // Measured 2026-08-28: a frontend project's session opened with lore's
+    // architecture post-mortem and synap's EAV and vector-distance lessons. All
+    // true, none of them about that project, and `reference` held 5 of the 20
+    // candidate slots. Its own definition is "a pointer to something external" —
+    // a pointer is not what a session should open with.
+    //
+    // The line is not useful/useless, it is injected-unasked / retrieved-when-
+    // asked-for. So this covers the recency path only; relevance still searches
+    // every memory, and `search_test` holds that end.
+    var db = try store.open(":memory:", .read_write);
+    defer db.close();
+    var s = store.Store.init(&db);
+
+    const cid = try s.ensureCollectionKind("memory", "/tmp/m", .memory, 1000);
+    const cases = [_]struct { path: []const u8, t: zkb.memory.Type }{
+        .{ .path = "how-to-work.md", .t = .feedback },
+        .{ .path = "who-they-are.md", .t = .user },
+        .{ .path = "project-is-dead.md", .t = .decision },
+        .{ .path = "eav-lesson.md", .t = .reference },
+    };
+    var kept: [3]i64 = undefined;
+    var n: usize = 0;
+    for (cases, 0..) |c, i| {
+        var sha: [24]u8 = undefined;
+        const did = try s.upsertDocContent(cid, c.path, try std.fmt.bufPrint(&sha, "sha-{d}", .{i}), 10, 1000);
+        var v = dummyVector(@intCast(i));
+        const chunk = try s.insertChunk(cid, did, .{
+            .idx = 0, .heading_path = "", .byte_start = 0, .byte_end = 5, .n_tokens = 5, .text = "x",
+        }, &v);
+        try zkb.memory.replaceMeta(&db, did, chunk, .{
+            .type = c.t, .status = .active, .created = "2026-08-18",
+            .source = "t", .subjects = "", .refs = "", .scope = "",
+        });
+        if (c.t != .reference) {
+            kept[n] = chunk;
+            n += 1;
+        }
+    }
+
+    const ranked = try zkb.memory.recencyRanked(gpa, &db, 10, null);
+    defer gpa.free(ranked);
+
+    // The three that decide how the session acts, and not the fourth.
+    try testing.expectEqual(@as(usize, 3), ranked.len);
+    for (kept) |want| {
+        var found = false;
+        for (ranked) |got| {
+            if (got == want) found = true;
+        }
+        try testing.expect(found);
+    }
+}

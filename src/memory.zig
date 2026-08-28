@@ -331,6 +331,23 @@ fn isCjk(bytes: []const u8) bool {
 ///
 /// Only used by `recall`. In `search` the user asked for something specific, and
 /// letting the newest memory outrank the relevant one would be wrong.
+///
+/// **`reference` is excluded.** Its own definition is "a pointer to something
+/// external", and a pointer is not something to open every session with. Measured
+/// on 2026-08-28: a frontend project's session began with lore's architecture
+/// post-mortem and synap's EAV and vector-distance lessons — all true, all
+/// irrelevant there, and `reference` held 5 of the 20 candidate slots. Dropping
+/// them let `feedback` and `decision` take those slots instead.
+///
+/// This is the recency path only. With a query, relevance still searches every
+/// memory: asking about EAV must still return the EAV lesson. The distinction is
+/// not "useful" against "useless", it is *injected unasked* against *retrieved
+/// when asked for*.
+///
+/// The other types stay. The test is whether not seeing it would make the session
+/// act wrongly: `user` and `feedback` decide how the work is done, `decision`
+/// records that a project is dead and must not be worked on. A `reference` unseen
+/// costs an argument, and the argument is one query away.
 /// Is this chunk's memory visible in `scope`?
 ///
 /// A chunk that is not a memory at all answers true: the caller may be fusing
@@ -361,6 +378,7 @@ pub fn recencyRanked(
     var st = try db.prepare(
         \\SELECT chunk_id FROM rec_memory
         \\WHERE status = 'active'
+        \\  AND type != 'reference'
         \\  AND (scope IS NULL OR scope = ?2)
         \\ORDER BY created DESC, chunk_id DESC
         \\LIMIT ?1
