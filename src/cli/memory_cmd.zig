@@ -528,7 +528,7 @@ pub fn recall(
         }
     }
 
-    var r = try zkb.recall.assemble(gpa, &db, opts.query, vec, .{
+    var r = try zkb.recall.assemble(gpa, io, &layout, &db, opts.query, vec, .{
         .budget_tokens = opts.budget,
         .candidates = opts.candidates,
         .recency_depth = opts.recency_depth,

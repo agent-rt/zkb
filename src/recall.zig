@@ -24,6 +24,7 @@ const store = @import("db/store.zig");
 const hybrid = @import("search/hybrid.zig");
 const rrf = @import("search/rrf.zig");
 const packmod = @import("search/pack.zig");
+const paths = @import("util/paths.zig");
 const memory = @import("memory.zig");
 const facts = @import("facts.zig");
 
@@ -69,6 +70,8 @@ pub const Result = struct {
 /// unavailable; the keyword path still works.
 pub fn assemble(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
     db: *sqlite.Db,
     query: []const u8,
     query_vec: ?[]const f32,
@@ -143,7 +146,7 @@ pub fn assemble(
     };
     errdefer ranked.deinit(gpa);
 
-    const p = try packmod.assemble(gpa, db, query, &ranked, .{
+    const p = try packmod.assemble(gpa, io, layout, db, query, &ranked, .{
         .budget_tokens = cfg.budget_tokens,
         // Memories are short and self-contained; expanding to neighbours would
         // mostly pull in *other* memories, which the ranking already declined.

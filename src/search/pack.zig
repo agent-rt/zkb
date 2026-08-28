@@ -19,6 +19,8 @@
 const std = @import("std");
 const sqlite = @import("../db/sqlite.zig");
 const hybrid = @import("hybrid.zig");
+const contexts = @import("../contexts.zig");
+const paths = @import("../util/paths.zig");
 
 pub const Config = struct {
     /// Chunks to retrieve before grouping. Larger than the final document count
@@ -61,6 +63,14 @@ pub const DocGroup = struct {
     score: f64,
     spans: []Span,
     n_tokens: usize,
+    /// What the subtree this document sits in *is*, when the corpus says so.
+    ///
+    /// `search` returns leads for a person to open; this is the pack a model
+    /// answers from, so it is the place a one-line description of the tree is
+    /// worth its tokens. It was attached to `search` first and not here, which
+    /// had it on the path that does not need it and missing from the one that
+    /// does.
+    context: ?[]const u8 = null,
 };
 
 pub const Omitted = struct {
@@ -85,6 +95,7 @@ pub const Pack = struct {
             gpa.free(g.collection);
             gpa.free(g.rel_path);
             gpa.free(g.title);
+            if (g.context) |c| gpa.free(c);
             for (g.spans) |s| {
                 gpa.free(s.heading_path);
                 gpa.free(s.text);
@@ -100,14 +111,39 @@ pub const Pack = struct {
     }
 };
 
+/// Roughly how many tokens a short string costs.
+///
+/// Deliberately crude, and crude in the safe direction. Everything else in this
+/// file uses `chunks.n_tokens`, measured at index time by the embedding model's
+/// own tokenizer; a description is not in the index and there is no tokenizer
+/// here to ask. One token per three bytes over-charges Latin (~4 bytes a token)
+/// and roughly matches CJK (3 bytes a character, about a token each), so a pack
+/// comes in under budget rather than over. Same spirit as
+/// `per_doc_overhead_tokens`, which is a flat 24 for the same reason.
+fn estimateTokens(s: []const u8) usize {
+    return (s.len + 2) / 3;
+}
+
 /// Takes ownership of nothing; `results` stays the caller's to free.
+/// `io` and `layout` are here only to read the descriptions in `data/`, and they
+/// are not optional for the reason `ensureOwn` folds its replay in: three call
+/// sites, and a `Config` field defaulting to empty is a field two of them
+/// eventually forget to set. A pack assembled without them would silently be a
+/// pack the model reads less well.
 pub fn assemble(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    layout: *const paths.Layout,
     db: *sqlite.Db,
     query: []const u8,
     results: *const hybrid.Results,
     cfg: Config,
 ) !Pack {
+    var ctx_arena = std.heap.ArenaAllocator.init(gpa);
+    defer ctx_arena.deinit();
+    // A corpus with no descriptions must assemble exactly as it did before this
+    // existed, so a missing or malformed file is empty rather than an error.
+    const ctx = contexts.load(ctx_arena.allocator(), io, layout) catch contexts.Map.empty;
     // ---- 1. group hits by document, keeping the best score per document
     const Acc = struct {
         doc_id: i64,
@@ -195,6 +231,12 @@ pub fn assemble(
             spans.deinit(gpa);
         }
 
+        // Charged before the fit check, not after: a description that pushed the
+        // pack over budget would otherwise be free, and the budget is the one
+        // promise this function makes.
+        const ctx_text = try ctx.joinedForPath(ctx_arena.allocator(), a.collection, a.rel_path);
+        if (ctx_text) |t| group.tokens += estimateTokens(t);
+
         if (spans.items.len == 0 or used + group.tokens > cfg.budget_tokens) {
             freeSpans(gpa, spans.items);
             spans.deinit(gpa);
@@ -214,6 +256,7 @@ pub fn assemble(
             .score = a.score,
             .spans = try spans.toOwnedSlice(gpa),
             .n_tokens = group.tokens,
+            .context = if (ctx_text) |t| try gpa.dupe(u8, t) else null,
         });
     }
 
@@ -412,6 +455,9 @@ pub fn renderMarkdown(w: *std.Io.Writer, pack: *const Pack) !void {
 
     for (pack.groups) |g| {
         try w.print("\n## {s}/{s}\n", .{ g.collection, g.rel_path });
+        // Before the spans, because it frames everything under it: what this
+        // subtree is, then what the document says.
+        if (g.context) |c| try w.print("*{s}*\n", .{c});
         for (g.spans) |s| {
             if (s.heading_path.len != 0) try w.print("> {s}\n", .{s.heading_path});
             try w.print("\n{s}\n", .{s.text});
@@ -482,6 +528,10 @@ pub fn renderJson(w: *std.Io.Writer, pack: *const Pack) !void {
         try std.json.Stringify.value(g.rel_path, .{}, w);
         try w.writeAll(",\"title\":");
         try std.json.Stringify.value(g.title, .{}, w);
+        if (g.context) |c| {
+            try w.writeAll(",\"context\":");
+            try std.json.Stringify.value(c, .{}, w);
+        }
         try w.print(",\"score\":{d:.6},\"n_tokens\":{d},\"spans\":[", .{ g.score, g.n_tokens });
         for (g.spans, 0..) |s, j| {
             if (j != 0) try w.writeAll(",");
@@ -553,6 +603,12 @@ pub fn fromJson(arena: std.mem.Allocator, v: std.json.Value) !Pack {
             .collection = jsonStr(d, "collection"),
             .rel_path = jsonStr(d, "path"),
             .title = jsonStr(d, "title"),
+            // Empty and absent are the same thing here: the daemon omits the key
+            // when the corpus says nothing about this subtree.
+            .context = blk: {
+                const c = jsonStr(d, "context");
+                break :blk if (c.len == 0) null else c;
+            },
             .score = jsonFloat(d, "score"),
             .spans = spans,
             .n_tokens = jsonUsize(d, "n_tokens"),

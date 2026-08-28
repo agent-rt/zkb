@@ -17,6 +17,27 @@ const gpa = testing.allocator;
 
 const dim: usize = @intCast(schema.embedding_dim);
 
+/// `pack.assemble` reads `data/contexts.csv` to attach what each subtree is.
+/// These tests are about grouping and budget, and have no such file: the layout
+/// points at a directory that does not exist, `contexts.load` returns empty, and
+/// the pack is exactly what it was before descriptions existed. Contexts have
+/// their own tests in `contexts_test.zig`.
+fn assembleNoContexts(
+    db: *sqlite.Db,
+    query: []const u8,
+    results: *const hybrid.Results,
+    cfg: pack.Config,
+) !pack.Pack {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("ZKB_HOME", "/tmp/zkb-pack-test-no-such-home");
+    var layout = try zkb.paths.resolve(gpa, &env);
+    defer layout.deinit(gpa);
+    return pack.assemble(gpa, threaded.io(), &layout, db, query, results, cfg);
+}
+
 fn vec(n: u8) [dim]f32 {
     var v: [dim]f32 = @splat(0);
     v[@as(usize, n) % dim] = 1.0;
@@ -102,7 +123,7 @@ test "hits from one document collapse into a single group" {
     var results = try hitsFor(&db, &.{ 1, 4, 7 }, &.{ 0.9, 0.5, 0.3 });
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 0 });
     defer p.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 1), p.groups.len);
@@ -123,7 +144,7 @@ test "neighbour expansion merges adjacent hits into one continuous span" {
     var results = try hitsFor(&db, &.{ 4, 6 }, &.{ 0.9, 0.8 });
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 1 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 1 });
     defer p.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 1), p.groups.len);
@@ -143,7 +164,7 @@ test "distant hits stay separate spans rather than swallowing the gap" {
     var results = try hitsFor(&db, &.{ 1, 15 }, &.{ 0.9, 0.8 });
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 1 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 1 });
     defer p.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 2), p.groups[0].spans.len);
@@ -160,7 +181,7 @@ test "documents are ordered by their best score" {
     var results = try hitsFor(&db, &.{ 1, 7 }, &.{ 0.4, 0.95 });
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 0 });
     defer p.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 2), p.groups.len);
@@ -177,7 +198,7 @@ test "the budget keeps the best documents and lists what it dropped" {
     defer results.deinit(gpa);
 
     // Room for two documents (500 tokens each plus overhead), not four.
-    var p = try pack.assemble(gpa, &db, "q", &results, .{
+    var p = try assembleNoContexts(&db, "q", &results, .{
         .neighbors = 0,
         .budget_tokens = 1100,
         .per_doc_overhead_tokens = 20,
@@ -202,7 +223,7 @@ test "a single document larger than the budget keeps its strongest span" {
     var results = try hitsFor(&db, &.{ 1, 5, 9 }, &.{ 0.9, 0.8, 0.7 });
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{
+    var p = try assembleNoContexts(&db, "q", &results, .{
         .neighbors = 0,
         .budget_tokens = 700,
         .per_doc_overhead_tokens = 20,
@@ -224,7 +245,7 @@ test "an empty result set renders without claiming to have found anything" {
     var results = try hitsFor(&db, &.{}, &.{});
     defer results.deinit(gpa);
 
-    var p = try pack.assemble(gpa, &db, "q", &results, .{});
+    var p = try assembleNoContexts(&db, "q", &results, .{});
     defer p.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), p.groups.len);
 
@@ -241,7 +262,7 @@ test "markdown output states the token count as approximate" {
 
     var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
     defer results.deinit(gpa);
-    var p = try pack.assemble(gpa, &db, "how does it work", &results, .{ .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "how does it work", &results, .{ .neighbors = 0 });
     defer p.deinit(gpa);
 
     var buf: [8192]u8 = undefined;
@@ -263,7 +284,7 @@ test "json output is parseable and carries the same documents" {
 
     var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
     defer results.deinit(gpa);
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 0 });
     defer p.deinit(gpa);
 
     var buf: [16384]u8 = undefined;
@@ -292,7 +313,7 @@ test "an empty pack says whether the corpus was silent or the budget was" {
     defer results.deinit(gpa);
 
     // Small enough that the per-document ceiling admits nothing.
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
     defer p.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), p.groups.len);
     try testing.expect(p.omitted.len != 0);
@@ -353,7 +374,7 @@ test "the daemon's json renders to the same markdown as the pack it came from" {
 
     var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
     defer results.deinit(gpa);
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .neighbors = 0 });
     defer p.deinit(gpa);
 
     try testing.expect(p.groups.len != 0);
@@ -370,7 +391,7 @@ test "a pack emptied by the budget survives the round trip with its omitted list
 
     var results = try hitsFor(&db, &.{ 1, 3 }, &.{ 0.9, 0.5 });
     defer results.deinit(gpa);
-    var p = try pack.assemble(gpa, &db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
+    var p = try assembleNoContexts(&db, "q", &results, .{ .budget_tokens = 20, .neighbors = 0 });
     defer p.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 0), p.groups.len);

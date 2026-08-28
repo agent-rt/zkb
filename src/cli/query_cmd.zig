@@ -192,7 +192,7 @@ fn inProcess(
         tw.record(gpa, opts.query, &results, now - trace_t0);
     }
 
-    var p = try zkb.pack.assemble(gpa, &db, opts.query, &results, .{
+    var p = try zkb.pack.assemble(gpa, io, layout, &db, opts.query, &results, .{
         .budget_tokens = opts.budget,
         .neighbors = opts.neighbors,
         .candidates = opts.candidates,

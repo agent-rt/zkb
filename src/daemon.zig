@@ -694,7 +694,7 @@ fn handleQuery(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto.
     defer results.deinit(st.gpa);
     st.trace.record(st.gpa, query, &results, nowMs(st.io) - t0);
 
-    var p = packmod.assemble(st.gpa, db, query, &results, cfg) catch
+    var p = packmod.assemble(st.gpa, st.io, &st.layout, db, query, &results, cfg) catch
         return proto.writeError(w, req.id, .internal, "pack assembly failed", null);
     defer p.deinit(st.gpa);
 
@@ -729,7 +729,7 @@ fn handleRecall(st: *State, db: *sqlite.Db, w: *std.Io.Writer, req: *const proto
         st.gpa.free(current);
     }
 
-    var r = recallmod.assemble(st.gpa, db, query, vec, cfg) catch
+    var r = recallmod.assemble(st.gpa, st.io, &st.layout, db, query, vec, cfg) catch
         return proto.writeError(w, req.id, .internal, "recall failed", null);
     defer r.deinit(st.gpa);
 
